@@ -1,0 +1,247 @@
+{
+  "metadata": {
+    "model": "meta-llama/Llama-3.1-8B-Instruct",
+    "api_base": "http://127.0.0.1:8000",
+    "timestamp": "unknown"
+  },
+  "tasks": {
+    "easy": {
+      "episodes": [
+        {
+          "task_id": "easy",
+          "seed": 1000,
+          "final_score": 0.35416666666666663,
+          "total_reward": 0.35416666666666663,
+          "avg_reward": 0.11805555555555554,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.35416666666666663
+          ],
+          "steps": 3,
+          "success": true
+        },
+        {
+          "task_id": "easy",
+          "seed": 1001,
+          "final_score": 1.0,
+          "total_reward": 1.0,
+          "avg_reward": 0.25,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "steps": 4,
+          "success": true
+        },
+        {
+          "task_id": "easy",
+          "seed": 1002,
+          "final_score": 1.0,
+          "total_reward": 1.0,
+          "avg_reward": 0.2,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          "steps": 5,
+          "success": true
+        }
+      ],
+      "statistics": {
+        "final_scores": {
+          "mean": 0.7847222222222222,
+          "min": 0.35416666666666663,
+          "max": 1.0,
+          "values": [
+            0.35416666666666663,
+            1.0,
+            1.0
+          ]
+        },
+        "total_rewards": {
+          "mean": 0.7847222222222222,
+          "total": 2.3541666666666665,
+          "values": [
+            0.35416666666666663,
+            1.0,
+            1.0
+          ]
+        },
+        "success_rate": 1.0
+      }
+    },
+    "medium": {
+      "episodes": [
+        {
+          "task_id": "medium",
+          "seed": 1000,
+          "final_score": 0.20000000000000015,
+          "total_reward": 0.20000000000000015,
+          "avg_reward": 0.02857142857142859,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.20000000000000015
+          ],
+          "steps": 7,
+          "success": true
+        },
+        {
+          "task_id": "medium",
+          "seed": 1001,
+          "final_score": 0.038741025574214445,
+          "total_reward": 0.038741025574214445,
+          "avg_reward": 0.0064568375957024075,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.038741025574214445
+          ],
+          "steps": 6,
+          "success": true
+        },
+        {
+          "task_id": "medium",
+          "seed": 1002,
+          "final_score": 0.038741025574214445,
+          "total_reward": 0.038741025574214445,
+          "avg_reward": 0.0064568375957024075,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.038741025574214445
+          ],
+          "steps": 6,
+          "success": true
+        }
+      ],
+      "statistics": {
+        "final_scores": {
+          "mean": 0.09249401704947635,
+          "min": 0.038741025574214445,
+          "max": 0.20000000000000015,
+          "values": [
+            0.20000000000000015,
+            0.038741025574214445,
+            0.038741025574214445
+          ]
+        },
+        "total_rewards": {
+          "mean": 0.09249401704947635,
+          "total": 0.27748205114842905,
+          "values": [
+            0.20000000000000015,
+            0.038741025574214445,
+            0.038741025574214445
+          ]
+        },
+        "success_rate": 1.0
+      }
+    },
+    "hard": {
+      "episodes": [
+        {
+          "task_id": "hard",
+          "seed": 1000,
+          "final_score": 0.1396363636363641,
+          "total_reward": 0.1396363636363641,
+          "avg_reward": 0.01396363636363641,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.1396363636363641
+          ],
+          "steps": 10,
+          "success": true
+        },
+        {
+          "task_id": "hard",
+          "seed": 1001,
+          "final_score": 0.1396363636363641,
+          "total_reward": 0.1396363636363641,
+          "avg_reward": 0.01396363636363641,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.1396363636363641
+          ],
+          "steps": 10,
+          "success": true
+        },
+        {
+          "task_id": "hard",
+          "seed": 1002,
+          "final_score": 0.1396363636363641,
+          "total_reward": 0.1396363636363641,
+          "avg_reward": 0.01396363636363641,
+          "step_rewards": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.1396363636363641
+          ],
+          "steps": 10,
+          "success": true
+        }
+      ],
+      "statistics": {
+        "final_scores": {
+          "mean": 0.1396363636363641,
+          "min": 0.1396363636363641,
+          "max": 0.1396363636363641,
+          "values": [
+            0.1396363636363641,
+            0.1396363636363641,
+            0.1396363636363641
+          ]
+        },
+        "total_rewards": {
+          "mean": 0.1396363636363641,
+          "total": 0.41890909090909234,
+          "values": [
+            0.1396363636363641,
+            0.1396363636363641,
+            0.1396363636363641
+          ]
+        },
+        "success_rate": 1.0
+      }
+    }
+  }
+}
