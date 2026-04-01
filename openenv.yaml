@@ -1,0 +1,323 @@
+---
+# OpenEnv Specification for SME B2B Contract Negotiation Environment
+# Meta-PyTorch Hackathon 2026
+# Real-world task: Automated negotiation between SMEs and corporate buyers
+
+metadata:
+  name: "SME B2B Contract Negotiation"
+  version: "1.0.0"
+  author: "OpenEnv Submission"
+  description: |
+    Real-world B2B contract negotiation environment simulating interactions between
+    small-medium enterprises (SMEs) and corporate buyers. Agents must optimize price
+    and payment terms while respecting financial constraints and regulatory requirements.
+  
+  domain: "Business Process Automation"
+  task_type: "Negotiation / Multi-objective Optimization"
+  
+  # Real-world relevance
+  real_world_relevance: |
+    SMEs in India face significant working capital challenges due to 45-day payment
+    mandates (MSMED Act Section 43B). This environment simulates actual negotiation
+    dynamics where agents learn optimal pricing and payment term strategies. The
+    TReDS (Trade Receivables Discounting System) platform is a real solution for
+    liquidity management that agents can leverage.
+
+environment:
+  # API Configuration
+  api:
+    base_url: "http://localhost:8000"
+    endpoints:
+      reset: "/reset"
+      step: "/step"
+      health: "/health"
+    timeout: 30
+    
+  # State/Observation Space
+  observation_space:
+    type: "gymnasium.spaces.Dict"
+    spaces:
+      # Opponent's current proposal
+      p_opp:
+        type: "Box"
+        dtype: "float32"
+        shape: []
+        bounds: [0.0, 10000.0]
+        description: "Current price offered by buyer (₹/unit)"
+      
+      d_opp:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [1, 365]
+        description: "Current payment days offered by buyer"
+      
+      v_opp:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [1, 100000]
+        description: "Volume of goods/services (units)"
+      
+      treds_opp:
+        type: "Discrete"
+        n: 2
+        description: "Buyer's TReDS platform willingness (0=no, 1=yes)"
+      
+      # SME Constraints (known to agent)
+      c_sme:
+        type: "Box"
+        dtype: "float32"
+        shape: []
+        bounds: [0.0, 10000.0]
+        description: "SME's production cost (₹/unit)"
+      
+      l_sme:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [1, 365]
+        description: "SME's liquidity threshold (days before cash crisis)"
+      
+      r_discount:
+        type: "Box"
+        dtype: "float32"
+        shape: []
+        bounds: [0.0, 1.0]
+        description: "Market discount rate for TReDS (fraction)"
+      
+      # Temporal context
+      t_elapsed:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [0, 20]
+        description: "Negotiation rounds completed"
+      
+      t_max:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [1, 20]
+        description: "Maximum rounds allowed"
+      
+      # History
+      history:
+        type: "Sequence"
+        element_type: "Dict"
+        max_length: 20
+        description: |
+          Chronological negotiation history. Each record contains:
+          - round: int
+          - proposed_price: float
+          - proposed_days: int
+          - request_treds: bool
+          - justification: str
+          - party: str ("agent" or "buyer")
+      
+      task_id:
+        type: "Discrete"
+        n: 3
+        description: "Task difficulty (0=easy, 1=medium, 2=hard)"
+      
+      episode_seed:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [0, 2147483647]
+        description: "Deterministic seed for reproducibility"
+
+  # Action Space
+  action_space:
+    type: "gymnasium.spaces.Dict"
+    spaces:
+      action_type:
+        type: "Discrete"
+        n: 3
+        description: "Action type: 0=PROPOSE, 1=ACCEPT, 2=REJECT"
+      
+      proposed_price:
+        type: "Box"
+        dtype: "float32"
+        shape: []
+        bounds: [0.0, 10000.0]
+        description: "Proposed unit price (required for PROPOSE)"
+        optional: true
+      
+      proposed_days:
+        type: "Box"
+        dtype: "int32"
+        shape: []
+        bounds: [1, 365]
+        description: "Proposed payment days (required for PROPOSE)"
+        optional: true
+      
+      request_treds:
+        type: "Discrete"
+        n: 2
+        description: "Request TReDS platform processing (0=no, 1=yes)"
+      
+      justification:
+        type: "Text"
+        max_length: 500
+        description: "Natural language justification for proposal"
+        optional: true
+
+  # Reward Function
+  reward_space:
+    type: "Box"
+    dtype: "float32"
+    shape: []
+    bounds: [0.0, 1.0]
+    description: |
+      Normalized NPV-based reward (0.0-1.0).
+      Combines financial metrics with regulatory compliance signals.
+      Provides partial progress rewards during negotiation.
+
+tasks:
+  easy:
+    id: "easy"
+    name: "Price Negotiation (Fixed Terms)"
+    description: |
+      Entry-level task: negotiate price only with fixed 30-day payment terms.
+      Focus: Test agent's ability to find profitable price points.
+    difficulty: 1
+    parameters:
+      initial_price: 100.0
+      initial_days: 30
+      volume: 1000
+      max_rounds: 5
+      buyer_cooperation: "cooperative"
+      sme_liquidity_threshold: 45
+    grader:
+      type: "DeterministicGrader"
+      config:
+        sme_cost: 80.0
+        volume: 1000
+        market_rate: 0.08
+        time_value_factor: 1.0
+    examples:
+      - description: "Win with good price"
+        price: 105.0
+        days: 30
+        expected_reward: 0.75
+      - description: "Accept fair offer"
+        price: 100.0
+        days: 30
+        expected_reward: 0.624
+  
+  medium:
+    id: "medium"
+    name: "Price & Terms Negotiation"
+    description: |
+      Intermediate task: negotiate both price and payment days.
+      Focus: Multi-dimensional optimization with regulatory constraints (45-day threshold).
+    difficulty: 2
+    parameters:
+      initial_price: 100.0
+      initial_days: 90
+      volume: 1000
+      max_rounds: 8
+      buyer_cooperation: "neutral"
+      sme_liquidity_threshold: 60
+    grader:
+      type: "DeterministicGrader"
+      config:
+        sme_cost: 80.0
+        volume: 1000
+        market_rate: 0.08
+        regulatory_threshold: 45
+  
+  hard:
+    id: "hard"
+    name: "Advanced Multi-dimensional Negotiation"
+    description: |
+      Expert task: negotiate with extreme constraints, TReDS platform required.
+      Focus: Complex decision-making under severe liquidity pressure.
+      Strategy: Use TReDS for immediate liquidity, offset with price optimization.
+    difficulty: 3
+    parameters:
+      initial_price: 95.0
+      initial_days: 120
+      volume: 5000
+      max_rounds: 12
+      buyer_cooperation: "aggressive"
+      sme_liquidity_threshold: 30
+    grader:
+      type: "DeterministicGrader"
+      config:
+        sme_cost: 70.0
+        volume: 5000
+        market_rate: 0.08
+        regulatory_threshold: 45
+        treds_friction_cost: 0.02
+
+graders:
+  DeterministicGrader:
+    description: |
+      Deterministic grading based on Net Present Value (NPV) calculation.
+      Rewards profitable deals that respect financial constraints.
+      
+      Formula:
+        base_npv = (price - cost) * volume * discount_factor
+        discount_factor = 1 / (1 + rate)^(days/365)
+        
+        liquidity_penalty = exp(-max(0, days - liquidity_threshold) / 10)
+        if treds_used: liquidity_penalty = 1.0 (restored)
+        
+        final_score = normalize(base_npv * liquidity_penalty)
+    
+    deterministic: true
+    reproducible: true
+    scoring_range: [0.0, 1.0]
+
+inference:
+  baseline:
+    script: "inference.py"
+    model: "gpt-4o"
+    timeout: 300
+    required_env_vars:
+      - "OPENAI_API_KEY"
+      - "API_BASE_URL"
+      - "MODEL_NAME"
+    expected_scores:
+      easy: 0.75
+      medium: 0.85
+      hard: 0.70
+
+deployment:
+  containerization:
+    base_image: "python:3.10-slim"
+    port: 7860  # HF Spaces-compatible port
+    health_check:
+      endpoint: "/health"
+      interval: 30
+      timeout: 10
+  
+  platforms:
+    - name: "Hugging Face Spaces"
+      requirements: "Dockerfile in root"
+      port: 7860
+      env_variables:
+        - "OPENAI_API_KEY"
+        - "PORT=7860"
+
+validation:
+  pre_submission:
+    - name: "Space Deployment"
+      check: "HF Space URL responds with 200 on /health"
+    - name: "OpenEnv Spec Compliance"
+      check: "All typed models valid, endpoints functional"
+    - name: "Docker Build"
+      check: "docker build succeeds in < 300s"
+    - name: "Baseline Inference"
+      check: "inference.py runs in < 1200s, produces scores 0.0-1.0"
+    - name: "Task Graders"
+      check: "All 3 graders produce deterministic scores"
+
+compliance:
+  openenv_version: "0.1.0"
+  spec_compliance: "full"
+  typing: "pydantic-v2"
+  determinism: "guaranteed"
+  reproducibility: "seed-based"

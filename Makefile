@@ -6,6 +6,7 @@ help:
 	@echo "Setup:"
 	@echo "  make install          Install dependencies"
 	@echo "  make install-dev      Install with dev tools"
+	@echo "  make diagnostic       Verify installation and connectivity"
 	@echo ""
 	@echo "Development:"
 	@echo "  make test             Run tests"
@@ -16,6 +17,7 @@ help:
 	@echo ""
 	@echo "Running:"
 	@echo "  make server           Start FastAPI server"
+	@echo "  make baseline         Run baseline inference with OpenAI (requires OPENAI_API_KEY)"
 	@echo "  make examples         Run example scripts"
 	@echo ""
 	@echo "Docker:"
@@ -69,6 +71,12 @@ server:
 
 examples:
 	python examples/01_basic_usage.py
+
+baseline:
+	python inference.py
+
+diagnostic:
+	python run_diagnostics.py
 
 docker-build:
 	docker build -f docker/Dockerfile -t openenv-sme-negotiator:latest .

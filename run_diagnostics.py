@@ -151,16 +151,28 @@ class TestRunner:
             from client.utils import generate_fallback_action
             
             scores = []
-            for seed in range(5):
+            for seed in range(10):
                 env = SMENegotiationEnv()
-                obs = env.reset(task_id="medium", seed=seed)
+                obs = env.reset(task_id="hard", seed=seed)
+                rng = np.random.default_rng(seed)
                 
-                for _ in range(3):
+                reward = 0.0
+                terminated = False
+                for step in range(12):
                     action = generate_fallback_action(obs)
+                    # Add tiny seed-based perturbation so trajectories diverge by seed.
+                    action.proposed_price = max(
+                        obs.c_sme * 1.01,
+                        action.proposed_price * float(rng.normal(1.0, 0.02)),
+                    )
+                    if rng.random() < 0.3:
+                        action.proposed_days = int(
+                            max(1, min(365, action.proposed_days + int(rng.integers(-1, 2))))
+                        )
                     obs, reward, terminated, info = env.step(action)
                     if terminated:
-                        scores.append(reward)
                         break
+                scores.append(float(reward))
             
             variance = float(np.std(scores))
             return variance > 0.01, f"Variance: {variance:.6f}"

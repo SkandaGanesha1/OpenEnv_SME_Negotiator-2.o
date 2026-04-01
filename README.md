@@ -69,6 +69,114 @@ Where:
 
 **Use Case**: Test complex multi-hop financial reasoning and legal/regulatory knowledge
 
+## Advanced RL Mechanisms
+
+### PPO (Proximal Policy Optimization) Analysis
+
+The environment includes sophisticated PPO analysis tools for policy gradient optimization:
+
+**Key Components:**
+- **Generalized Advantage Estimation (GAE)**: Low-variance advantage estimates using temporal smoothing
+- **Clipped Policy Loss**: Trust region enforcement via probability ratio clipping (epsilon=0.2)
+- **Entropy Regularization**: Exploration encouragement through action entropy bonus
+- **Value Function Decomposition**: Separate critic network for better credit assignment
+
+**Usage:**
+```python
+from src.rl.advanced_mechanisms import PPOAnalyzer, PPOConfig
+
+config = PPOConfig(
+    learning_rate=1e-4,
+    clip_ratio=0.2,
+    gae_lambda=0.95,  # Advantage smoothing
+    entropy_coeff=0.01,
+)
+
+analyzer = PPOAnalyzer(config)
+advantages, returns = analyzer.compute_gae(rewards, values)
+policy_loss, metrics = analyzer.compute_policy_loss(old_probs, new_probs, advantages)
+```
+
+### Advanced Data Structures
+
+#### 1. Negotiation Graph (MCTS-Style)
+Graph-based history of negotiation trajectory with value propagation:
+```python
+from src.data_structures import NegotiationGraph
+
+graph = NegotiationGraph("episode_001")
+graph.add_state("s0", round=0, p_opp=100.0, d_opp=30, v_opp=100, reward=0.0)
+graph.add_state("s1", round=1, p_opp=95.0, d_opp=30, v_opp=100, reward=0.1, 
+                parent_state="s0", action_taken="PROPOSE")
+
+critical_path = graph.get_critical_path()  # Highest-reward trajectory
+stats = graph.get_statistics()
+```
+
+#### 2. Offer Priority Queue
+Intelligent ranking of historical offers by NPV score:
+```python
+from src.data_structures import OfferPriorityQueue
+
+queue = OfferPriorityQueue(max_size=100)
+queue.add_offer(round=1, price=95.0, days=30, 
+                discount_factor=0.99, npv_score=0.45)
+
+best_offer = queue.pop_best_offer()  # Retrieves highest NPV
+top_k = queue.get_top_k(5)  # Top 5 offers
+```
+
+#### 3. Temporal Offer Buffer
+Experience replay buffer with trajectory analytics:
+```python
+from src.data_structures import OfferBuffer
+
+buffer = OfferBuffer(max_buffer_size=1000)
+buffer.add_experience(offer, reward, state)
+
+best_trajectories = buffer.get_best_trajectories(k=5)
+statistics = buffer.compute_offer_statistics()
+```
+
+#### 4. State Similarity Matching
+K-NN style state retrieval for few-shot learning:
+```python
+from src.data_structures import StateComparator
+
+similar = StateComparator.find_similar_states(
+    query_state, 
+    all_states, 
+    k=3,  # Return 3 most similar
+    threshold=50.0  # Distance threshold
+)
+```
+
+## Reward Visibility & Logging
+
+All step-by-step rewards are now **visible and logged** at three levels:
+
+1. **Episode Level**: Each step prints instantaneous reward
+2. **Cumulative Level**: Running total reward shown after each action
+3. **Summary Level**: Complete reward breakdown in JSON results file
+
+Example output:
+```
+📍 ROUND 1/12
+   Action: PROPOSE       | Price: ₹95.00   | Days: 30  | TReDS: False
+   ✓ Step Reward:     +0.102347
+   ✓ Cumulative:      0.102347
+   → Buyer Counter:   ₹98.00/unit @ 32 days
+───────────────────────────────────────────────────────────────────────
+
+📊 EPISODE SUMMARY
+═══════════════════════════════════════════════════════════════════════
+💰 REWARD BREAKDOWN:
+  Final Round Score:     0.458923
+  Cumulative Reward:     1.240567  ← TOTAL EARNED
+  Average Reward/Step:   0.155071
+  Reward History:        [0.102347, 0.145289, 0.124568, 0.145290, 0.156890, 0.165203]
+```
+
 ## Installation
 
 ```bash
@@ -280,6 +388,131 @@ Contributions welcome! Please:
 1. Fork the repository
 2. Create a feature branch
 3. Submit a pull request with clear descriptions
+
+## Running Baseline Inference with OpenAI's GPT
+
+The `inference.py` script provides a complete baseline agent using OpenAI's LLM (GPT-4, GPT-4o, etc.) to negotiate in the SME environment.
+
+### Setup
+
+1. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Set environment variables**:
+   ```bash
+   export OPENAI_API_KEY="your-api-key-here"
+   export API_BASE_URL="http://localhost:8000"  # or your server URL
+   export MODEL_NAME="gpt-4o"                    # gpt-4, gpt-4o, etc.
+   ```
+
+3. **Start the server** (in another terminal):
+   ```bash
+   python -m uvicorn src.server:app --host 0.0.0.0 --port 8000 --reload
+   ```
+
+### Running Inference
+
+Execute the baseline:
+
+```bash
+python inference.py
+```
+
+This will:
+- Connect to the SME negotiation environment server
+- Run 3 episodes each on Easy, Medium, and Hard tasks
+- Use GPT-4o (or your configured model) to generate negotiation actions
+- Output step-by-step decisions and final scores
+
+### Example Output
+
+```
+============================================================
+  OPENENV SME NEGOTIATION - BASELINE INFERENCE
+============================================================
+
+✓ Connected to server at http://localhost:8000
+
+============================================================
+Episode: EASY, Seed: 1000
+============================================================
+
+Step 1:
+  Action: PROPOSE
+    Price: ₹98
+    Days: 30
+    TReDS: False
+  Reward: 0.0000
+
+Step 2:
+  Action: ACCEPT
+  Reward: 0.87
+
+...
+
+============================================================
+  BASELINE INFERENCE SUMMARY
+============================================================
+
+EASY     | Avg: 0.8712 | Episodes: 3 | Scores: ['0.8712', '0.8650', '0.8875']
+MEDIUM   | Avg: 0.6245 | Episodes: 3 | Scores: ['0.6100', '0.6345', '0.6390']
+HARD     | Avg: 0.0850 | Episodes: 3 | Scores: ['0.0000', '0.1200', '0.1450']
+
+Overall Average Score: 0.5269
+Total Episodes: 9
+
+============================================================
+✓ Baseline inference complete
+============================================================
+```
+
+### How It Works
+
+1. **System Prompt**: Instructs GPT to act as an SME business manager
+2. **State Representation**: Converts environment state to natural language
+3. **LLM Action Generation**: Asks GPT to generate JSON negotiation actions
+4. **Environment Interaction**: Sends actions to server, receives rewards
+5. **Episode Loop**: Continues until termination or max steps
+
+### Key Features
+
+- **Task Aware**: Different prompts for Easy/Medium/Hard tasks
+- **Conversation History**: Includes prior rounds for contextual reasoning
+- **TReDS Awareness**: Explicitly teaches the model about TReDS financing
+- **Fallback Handling**: Safe JSON parsing with fallback actions
+- **Async Ready**: Can be extended with parallel episodes
+
+### Expected Performance
+
+Baseline performance with GPT-4o:
+- **Easy**: 0.85-0.95 (straightforward price negotiation)
+- **Medium**: 0.50-0.70 (requires multi-dimensional reasoning)
+- **Hard**: 0.00-0.20 (very few models find TReDS solution)
+
+### Customization
+
+To run different models or configurations:
+
+```bash
+# Use GPT-4 Turbo
+MODEL_NAME="gpt-4-turbo" python inference.py
+
+# Use local LLM via OpenAI-compatible API
+API_BASE_URL="http://localhost:8000/v1" python inference.py
+
+# Run more episodes per task (modify agent.py)
+```
+
+### Performance Analysis
+
+After running inference, you can analyze:
+
+1. **Score distribution**: Are scores consistent or variable?
+2. **Decision patterns**: What strategy did GPT discover?
+3. **Failure modes**: Where did Hard task negotiations break down?
+4. **Financial validity**: Do proposed prices respect cost constraints?
 
 ## Contact & Support
 
