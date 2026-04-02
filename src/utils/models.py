@@ -1,8 +1,10 @@
 """Data models for SME Negotiation environment."""
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 from enum import Enum
 import numpy as np
+from pydantic import ConfigDict, Field
+from openenv.core.env_server.types import Action, Observation
 
 
 class ActionType(Enum):
@@ -72,18 +74,17 @@ class NegotiationTerms:
         )
 
 
-@dataclass
-class NegotiationAction:
+class NegotiationAction(Action):
     """Action taken in negotiation."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
     action_type: str  # "PROPOSE", "ACCEPT", "REJECT"
     proposed_price: Optional[float] = None  # Proposed price (₹/unit)
     proposed_days: Optional[int] = None     # Proposed payment terms (days)
     request_treds: bool = False              # Request TReDS financing
     justification: Optional[str] = None      # Text justification
-
-    def model_dump(self) -> Dict[str, Any]:
-        """Pydantic-compatible model_dump method for serialization."""
-        return self.to_dict()
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     
     def validate_action(self) -> Tuple[bool, str]:
         """
@@ -120,13 +121,7 @@ class NegotiationAction:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
-            'action_type': self.action_type,
-            'proposed_price': float(self.proposed_price) if self.proposed_price else None,
-            'proposed_days': int(self.proposed_days) if self.proposed_days else None,
-            'request_treds': bool(self.request_treds),
-            'justification': self.justification
-        }
+        return self.model_dump()
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'NegotiationAction':
@@ -178,9 +173,11 @@ class OfferRecord:
         )
 
 
-@dataclass
-class NegotiationState:
+class NegotiationState(Observation):
     """Current state of negotiation."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
     task_id: str = ""
     t_elapsed: int = 0  # Elapsed rounds
     t_max: int = 10     # Maximum rounds allowed
@@ -200,14 +197,20 @@ class NegotiationState:
     r_discount: float = 0.08  # 8% discount rate
     
     # Negotiation history
-    history: List[OfferRecord] = field(default_factory=list)
+    history: List[OfferRecord] = Field(default_factory=list)
     
     # Status
     done: bool = False
+    reward: float = 0.0
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    def model_dump(self) -> Dict[str, Any]:
-        """Pydantic-compatible model_dump method for serialization."""
-        return self.to_dict()
+    def __iter__(self):
+        """Backwards compatibility for callers unpacking step() into 4 values."""
+
+        yield self
+        yield float(self.reward)
+        yield bool(self.done)
+        yield dict(self.metadata)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert state to dictionary for serialization."""
@@ -224,6 +227,8 @@ class NegotiationState:
             'l_sme': float(self.l_sme),
             'r_discount': float(self.r_discount),
             'done': bool(self.done),
+            'reward': float(self.reward),
+            'metadata': dict(self.metadata),
             'history': [o.to_dict() for o in self.history]
         }
     
@@ -247,6 +252,8 @@ class NegotiationState:
             l_sme=float(data.get('l_sme', 100.0)),
             r_discount=float(data.get('r_discount', 0.08)),
             done=bool(data.get('done', False)),
+            reward=float(data.get('reward', 0.0)),
+            metadata=dict(data.get('metadata', {})),
             history=history
         )
 

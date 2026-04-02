@@ -2,6 +2,7 @@
 import numpy as np
 from typing import Dict, Tuple, Optional
 from dataclasses import dataclass
+from openenv.core.env_server.interfaces import Environment
 
 from src.utils.models import (
 	NegotiationState, NegotiationAction, NegotiationTerms, EpisodeResult, OfferRecord
@@ -35,7 +36,7 @@ class TaskConfig:
 	buyer_semantic_susceptibility: float
 
 
-class SMENegotiationEnv:
+class SMENegotiationEnv(Environment):
 	"""
 	OpenEnv-compliant SME B2B Contract Negotiation environment.
     
@@ -108,7 +109,12 @@ class SMENegotiationEnv:
 		self.grader_u_min: float = 0.0
 		self.rng: Optional[np.random.Generator] = None
     
-	def reset(self, task_id: str = "easy", seed: Optional[int] = None) -> NegotiationState:
+	def reset(
+		self,
+		seed: Optional[int] = None,
+		episode_id: Optional[str] = None,
+		**kwargs,
+	) -> NegotiationState:
 		"""
 		Reset environment for new episode (Gymnasium-style).
         
@@ -120,10 +126,15 @@ class SMENegotiationEnv:
 			Initial observation (NegotiationState)
 		"""
         
+		task_id = kwargs.get("task_id") or episode_id or "easy"
+
 		if task_id not in self.TASKS:
 			raise ValueError(f"Unknown task_id: {task_id}")
         
 		self.task_config = self.TASKS[task_id]
+
+		if seed is None and "seed" in kwargs and kwargs["seed"] is not None:
+			seed = int(kwargs["seed"])
         
 		# Initialize using numpy RNG (CRITICAL for reproducibility)
 		if seed is not None:
@@ -187,8 +198,10 @@ class SMENegotiationEnv:
     
 	def step(
 		self,
-		action: NegotiationAction
-	) -> Tuple[NegotiationState, float, bool, Dict]:
+		action: NegotiationAction,
+		timeout_s: Optional[float] = None,
+		**kwargs,
+	) -> NegotiationState:
 		"""
 		Execute one step in the negotiation (Gymnasium-style).
         
@@ -205,12 +218,7 @@ class SMENegotiationEnv:
 		# Validate action
 		is_valid, error_msg = action.validate_action()
 		if not is_valid:
-			return (
-				self.current_state,
-				0.0,
-				True,
-				{"error": error_msg, "success": False}
-			)
+			return self._to_observation(0.0, True, {"error": error_msg, "success": False})
         
 		info = {"action_type": action.action_type}
         
@@ -222,19 +230,14 @@ class SMENegotiationEnv:
 				failure_reason="Agent rejected negotiation",
 				round_completed=self.current_state.t_elapsed,
 			)
-			return (self.current_state, 0.0, True, episode_result.model_dump())
+			return self._to_observation(0.0, True, episode_result.model_dump())
         
 		# Handle ACCEPT: check if it aligns with opponent's last offer
 		if action.action_type == "ACCEPT":
 			# Agent must accept the exact opponent's last offer
 			if (action.proposed_price is None or
 				action.proposed_days is None):
-				return (
-					self.current_state,
-					0.0,
-					True,
-					{"error": "ACCEPT requires parameters", "success": False}
-				)
+				return self._to_observation(0.0, True, {"error": "ACCEPT requires parameters", "success": False})
             
 			# Check if acceptance matches opponent's offer
 			if (abs(action.proposed_price - self.current_state.p_opp) < 0.01 and
@@ -247,16 +250,11 @@ class SMENegotiationEnv:
 					final_volume=self.current_state.v_opp,
 					treds_utilized=action.request_treds or self.current_state.treds_opp,
 				)
-				return (
-					self.current_state,
-					episode_result.score,
-					True,
-					episode_result.model_dump()
-				)
+				return self._to_observation(episode_result.score, True, episode_result.model_dump())
 			else:
 				info["error"] = "ACCEPT parameters don't match opponent's offer"
 				info["success"] = False
-				return (self.current_state, 0.0, True, info)
+				return self._to_observation(0.0, True, info)
         
 		# Handle PROPOSE: generate counter-offer
 		if action.action_type == "PROPOSE":
@@ -268,7 +266,7 @@ class SMENegotiationEnv:
 					failure_reason="Maximum rounds exceeded",
 					round_completed=self.current_state.t_elapsed,
 				)
-				return (self.current_state, 0.0, True, episode_result.model_dump())
+				return self._to_observation(0.0, True, episode_result.model_dump())
             
 			# Check if agent's proposal is acceptable to buyer
 			# For easy task, require at least 2 rounds before accepting to ensure negotiation occurs
@@ -287,12 +285,7 @@ class SMENegotiationEnv:
 					final_volume=self.current_state.v_opp,
 					treds_utilized=action.request_treds,
 				)
-				return (
-					self.current_state,
-					episode_result.score,
-					True,
-					episode_result.model_dump()
-				)
+				return self._to_observation(episode_result.score, True, episode_result.model_dump())
             
 			# Generate buyer counter-offer
 			justification_quality = self._evaluate_justification_quality(
@@ -338,9 +331,23 @@ class SMENegotiationEnv:
 			info["counter_days"] = counter_days
             
 			# Intermediate reward is always 0.0 (long-term credit assignment)
-			return (self.current_state, 0.0, False, info)
+			return self._to_observation(0.0, False, info)
         
-		return (self.current_state, 0.0, False, info)
+		return self._to_observation(0.0, False, info)
+
+	def _to_observation(self, reward: float, terminated: bool, info: Dict) -> NegotiationState:
+		"""Populate OpenEnv observation fields and return current state."""
+
+		self.current_state.reward = float(reward)
+		self.current_state.done = bool(terminated)
+		self.current_state.metadata = dict(info)
+		return self.current_state
+
+	@property
+	def state(self) -> Optional[NegotiationState]:
+		"""Return the current observation state for the active episode."""
+
+		return self.current_state
     
 	def _finalize_deal(
 		self,
