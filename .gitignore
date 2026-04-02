@@ -74,6 +74,7 @@ docker-compose.override.yml
 *.log
 .mypy_cache/
 .ruff_cache/
+inference_results.json
 
 # HF Spaces
 README_SPACES.md

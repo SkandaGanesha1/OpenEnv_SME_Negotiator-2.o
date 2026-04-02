@@ -186,7 +186,10 @@ def calculate_buyer_counter_offer(
     """
     
     # Time-dependent concession factor (linear)
-    time_factor = (round_number - 1) / (max_rounds - 1)
+    if max_rounds <= 1:
+        time_factor = 1.0
+    else:
+        time_factor = (round_number - 1) / (max_rounds - 1)
     
     # Semantic acceleration of concession
     semantic_acceleration = buyer_profile.semantic_susceptibility * justification_quality

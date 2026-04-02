@@ -152,7 +152,7 @@ def build_environment_schema(env: Any) -> Dict[str, Any]:
             "name": "SME B2B Contract Negotiation",
             "version": "0.1.0",
             "description": "Deterministic OpenEnv-style negotiation environment for SME contract pricing and payment terms.",
-            "author": "Scaler",
+            "author": "Omkarchaithanya",
         },
         "endpoints": {
             "health": "/health",

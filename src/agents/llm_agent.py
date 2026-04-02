@@ -1,6 +1,9 @@
 """Baseline agent for SME Negotiation Environment - LLM-based negotiator."""
 import json
+import os
 from typing import Optional
+
+from openai import OpenAI
 from src.utils.models import NegotiationState, NegotiationAction
 
 
@@ -23,6 +26,7 @@ class LLMNegotiationAgent:
         """
         self.model_name = model_name
         self.llm = None  # Will be loaded on-demand
+        self._client = None
     
     def generate_system_prompt(self, state: NegotiationState) -> str:
         """
@@ -118,13 +122,56 @@ Example valid JSON:
         
         system_prompt = self.generate_system_prompt(state)
         observation_prompt = self.generate_observation_prompt(state)
-        
-        # In production, this would call:
-        # response = self.llm.generate(system_prompt, observation_prompt)
-        # action_json = self._extract_json_action(response)
-        
-        # For now, return a mock action for demonstration
+
+        llm_action = self._call_llm(system_prompt, observation_prompt)
+        if llm_action is not None:
+            return llm_action
+
         return self._generate_fallback_action(state)
+
+    def _get_client(self) -> Optional[OpenAI]:
+        """Create an OpenAI-compatible client if credentials are available."""
+
+        if self._client is not None:
+            return self._client
+
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            return None
+
+        base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("LLM_BASE_URL") or None
+        try:
+            self._client = OpenAI(api_key=api_key, base_url=base_url)
+        except Exception:
+            return None
+
+        return self._client
+
+    def _call_llm(self, system_prompt: str, observation_prompt: str) -> Optional[NegotiationAction]:
+        """Call an OpenAI-compatible model and parse a JSON action response."""
+
+        client = self._get_client()
+        if client is None:
+            return None
+
+        try:
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": observation_prompt},
+                ],
+                temperature=0.2,
+                response_format={"type": "json_object"},
+            )
+            content = response.choices[0].message.content or ""
+            action = self._extract_json_action(content)
+            if action is not None:
+                return action
+        except Exception:
+            return None
+
+        return None
     
     def _generate_fallback_action(self, state: NegotiationState) -> NegotiationAction:
         """

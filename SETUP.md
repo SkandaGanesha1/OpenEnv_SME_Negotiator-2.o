@@ -1,6 +1,6 @@
 # OpenEnv SME Negotiator - Hackathon Setup Guide
 
-Quick start guide for Scaler hackathon participants.
+Quick start guide for project participants.
 
 ## Prerequisites
 
@@ -12,7 +12,7 @@ Quick start guide for Scaler hackathon participants.
 ## 1. Clone & Navigate
 
 ```bash
-git clone https://github.com/scaler/openenv-sme-negotiator.git
+git clone https://github.com/Omkarchaithanya/meta-2.git
 cd openenv-sme-negotiator
 ```
 
@@ -268,7 +268,7 @@ def get_cached_llm_action(state_hash, prompt_hash):
 
 - **Questions**: Check GitHub Issues
 - **Documentation**: See README.md for full details
-- **Community**: Join Scaler forums
+- **Community**: Join the project forums
 
 ---
 

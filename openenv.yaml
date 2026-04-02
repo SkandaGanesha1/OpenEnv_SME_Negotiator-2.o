@@ -2,7 +2,7 @@ api_version: "1.0"
 metadata:
   name: "SME B2B Contract Negotiation"
   version: "0.1.0"
-  author: "Scaler"
+  author: "Omkarchaithanya"
   description: "Deterministic negotiation environment for SME pricing, payment terms, and TReDS-aware settlement decisions."
 
 environment:

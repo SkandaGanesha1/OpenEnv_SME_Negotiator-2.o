@@ -180,7 +180,7 @@ Example output:
 ## Installation
 
 ```bash
-git clone https://github.com/scaler/openenv-sme-negotiator.git
+git clone https://github.com/Omkarchaithanya/meta-2.git
 cd openenv-sme-negotiator
 
 # Install in development mode
@@ -372,9 +372,9 @@ If you use this environment in your research, please cite:
 ```bibtex
 @software{openenv_sme_negotiator_2024,
   title={OpenEnv SME Negotiator: An RL Environment for B2B Contract Negotiation},
-  author={Scaler},
+  author={Omkarchaithanya},
   year={2024},
-  url={https://github.com/scaler/openenv-sme-negotiator}
+  url={https://github.com/Omkarchaithanya/meta-2}
 }
 ```
 
@@ -518,4 +518,4 @@ After running inference, you can analyze:
 
 - **Issues**: GitHub Issues tracker
 - **Discussions**: GitHub Discussions
-- **Email**: team@scaler.com
+- **Repository**: https://github.com/Omkarchaithanya/meta-2

@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "OpenEnv RL Environment for SME B2B Contract Negotiation"
 readme = "README.md"
 authors = [
-    {name = "Scaler", email = "team@scaler.com"}
+    {name = "Omkarchaithanya"}
 ]
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -43,8 +43,8 @@ dev = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/scaler/openenv-sme-negotiator"
-Repository = "https://github.com/scaler/openenv-sme-negotiator"
+Documentation = "https://github.com/Omkarchaithanya/meta-2"
+Repository = "https://github.com/Omkarchaithanya/meta-2"
 
 [tool.setuptools]
 packages = ["src"]
