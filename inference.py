@@ -228,7 +228,7 @@ JSON response only:"""
         """Reset environment for new episode."""
         response = self.client.post(
             f"{self.server_url}/reset",
-            params={"episode_id": f"{task_id}:{seed}", "seed": seed}
+            json={"task_id": task_id, "seed": seed}
         )
         response.raise_for_status()
         payload = response.json()
