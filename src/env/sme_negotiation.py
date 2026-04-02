@@ -211,6 +211,10 @@ class SMENegotiationEnv(Environment):
 		Returns:
 			(observation, reward, terminated, info)
 		"""
+
+		# Auto-initialize if reset was never called
+		if self.current_state is None:
+			self.reset(seed=42)
         
 		if self.current_state is None or self.task_config is None:
 			raise RuntimeError("Environment not initialized. Call reset() first.")
