@@ -6,7 +6,7 @@ metadata:
   description: "Deterministic negotiation environment for SME pricing, payment terms, and TReDS-aware settlement decisions."
 
 environment:
-  base_url: "http://localhost:8000"
+  base_url: "https://omkarchaithanya-sme-negotiator.hf.space"
   endpoints:
     health: "/health"
     reset: "/reset"
