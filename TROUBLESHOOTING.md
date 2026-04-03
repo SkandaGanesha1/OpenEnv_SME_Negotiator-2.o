@@ -34,7 +34,7 @@ pip install -e .
 pip install -e .
 
 # Verify installation
-python -c "from src.env.sme_negotiation import SMENegotiationEnv; print('✓ OK')"
+python -c "from server.sme_environment import SMENegotiatorEnvironment; print('✓ OK')"
 ```
 
 ---
@@ -93,7 +93,7 @@ python -c "from fastapi import FastAPI; print('✓ OK')"
 pip install fastapi==0.104.1 uvicorn==0.24.0
 
 # Run with verbose logging
-python -m uvicorn src.app:app --log-level debug
+python -m uvicorn server.app:app --log-level debug
 ```
 
 ---
@@ -518,8 +518,8 @@ If you're stuck:
 
 2. **Review the code**:
    - inference.py (well-commented)
-   - src/env/sme_negotiation.py
-   - src/utils/grader.py
+   - server/sme_environment.py
+   - sme_negotiator_env/models.py
 
 3. **Test incrementally**:
    ```python

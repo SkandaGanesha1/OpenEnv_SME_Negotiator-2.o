@@ -12,7 +12,7 @@ Quick start guide for project participants.
 ## 1. Clone & Navigate
 
 ```bash
-git clone https://github.com/Omkarchaithanya/meta-2.git
+git clone https://github.com/SkandaGanesha1/ENV.git
 cd openenv-sme-negotiator
 ```
 
@@ -52,7 +52,7 @@ set -a; source .env; set +a  # Bash with PowerShell
 In one terminal:
 
 ```bash
-python -m uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+python -m uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 You should see:
@@ -81,7 +81,7 @@ pytest tests/
 pytest tests/test_environment.py -v
 
 # Run with coverage
-pytest --cov=src/ tests/
+pytest --cov=server --cov=sme_negotiator_env tests/
 ```
 
 ## 7. Verify Installation
@@ -102,23 +102,16 @@ This will check:
 ## Project Structure
 
 ```
-├── src/
-│   ├── env/
-│   │   └── sme_negotiation.py       # Core environment MDP
-│   ├── agents/
-│   │   └── llm_agent.py             # Baseline LLM agent
-│   ├── utils/
-│   │   ├── models.py                # Pydantic schemas
-│   │   ├── grader.py                # Deterministic grader
-│   │   └── constants.py             # Task parameters
-│   └── app.py                       # FastAPI server factory
-├── eval/
-│   └── evaluation.py                # Evaluation framework
-├── training/
-│   └── dpo_training.py              # Fine-tuning scripts
+├── server/
+│   ├── app.py                       # OpenEnv server entrypoint
+│   └── sme_environment.py           # Core environment MDP
+├── sme_negotiator_env/
+│   ├── client.py                    # Typed client and heuristic policy
+│   └── models.py                    # OpenEnv models
 ├── tests/
 │   └── test_environment.py          # Unit tests
 ├── inference.py                     # Baseline inference script
+├── openenv.yaml                     # OpenEnv manifest
 └── README.md                        # Full documentation
 ```
 

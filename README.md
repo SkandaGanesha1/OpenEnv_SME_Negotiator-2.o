@@ -188,7 +188,7 @@ Example output:
 ## Installation
 
 ```bash
-git clone https://github.com/Omkarchaithanya/meta-2.git
+git clone https://github.com/SkandaGanesha1/ENV.git
 cd openenv-sme-negotiator
 
 # Install in development mode
@@ -201,18 +201,18 @@ pip install -e ".[dev]"
 ## Quick Start: Basic Usage
 
 ```python
-from src.env.sme_negotiation import SMENegotiationEnv
-from src.utils.models import NegotiationAction
+from server.sme_environment import SMENegotiatorEnvironment
+from sme_negotiator_env.models import NegotiationAction
 
 # Initialize environment
-env = SMENegotiationEnv()
+env = SMENegotiatorEnvironment()
 
 # Reset for Easy task with deterministic seed
-state = env.reset(task_id="easy", seed=42)
+observation = env.reset(seed=42, difficulty="EASY")
 
-print(f"Initial opponent offer: ₹{state.p_opp}/unit, {state.d_opp} days")
-print(f"Your production cost: ₹{state.c_sme}/unit")
-print(f"Survival threshold: {state.l_sme} days")
+print(f"Initial buyer offer: ₹{observation.buyer_price}/unit, {observation.buyer_days} days")
+print(f"Your production cost: ₹{observation.cost_threshold}/unit")
+print(f"Liquidity threshold: {observation.liquidity_threshold} days")
 
 # Generate an action
 action = NegotiationAction(
@@ -237,7 +237,7 @@ else:
 ### Local Development
 ```bash
 # Start FastAPI server on http://localhost:8000
-python -m uvicorn src.app:app --reload --port 8000
+python -m uvicorn server.app:app --reload --port 8000
 ```
 
 ### Docker Deployment
@@ -261,29 +261,30 @@ openenv deploy --space-id your-username/sme-negotiator
 ## Advanced: Custom Agent
 
 ```python
-from src.agents.llm_agent import LLMNegotiationAgent
-from src.env.sme_negotiation import SMENegotiationEnv
+from sme_negotiator_env.client import choose_action
+from server.sme_environment import SMENegotiatorEnvironment
 
-# Initialize agent and environment
-agent = LLMNegotiationAgent(model_name="nemotron-3-super")
-env = SMENegotiationEnv()
+# Initialize environment
+env = SMENegotiatorEnvironment()
 
 # Run episode
-state = env.reset(task_id="medium", seed=123)
-done = False
+observation = env.reset(seed=123, difficulty="MEDIUM")
 total_reward = 0.0
+round_number = 0
+agent_days = max(observation.liquidity_threshold, observation.buyer_days // 2)
 
-while not done:
-    # Agent generates action
-    action = agent.act(state)
-    
+while not observation.done:
+  action, agent_days = choose_action(observation, round_number, agent_days)
+
     # Environment steps
-    state, reward, terminated, info = env.step(action)
-    total_reward += reward
-    
-    if terminated:
-        print(f"Final score: {info.get('score', 0.0):.3f}")
+  observation = env.step(action)
+  total_reward += observation.reward
+
+  if observation.done:
+    print(f"Final score: {observation.reward:.3f}")
         break
+
+  round_number += 1
 ```
 
 ## Evaluation Methodology
@@ -326,17 +327,13 @@ Expected baseline (Nemotron 3 Super) performance:
 
 ```
 openenv-sme-negotiator/
-├── src/
-│   ├── env/
-│   │   └── sme_negotiation.py       # Core MDP environment
-│   ├── agents/
-│   │   └── llm_agent.py             # Baseline LLM agent
-│   ├── utils/
-│   │   ├── models.py                # Pydantic schemas
-│   │   └── grader.py                # Deterministic grader
-│   └── app.py                       # FastAPI server factory
-├── docker/
+├── server/
+│   ├── app.py                       # OpenEnv server entrypoint
+│   ├── sme_environment.py           # Core MDP environment
 │   └── Dockerfile                   # Container image
+├── sme_negotiator_env/
+│   ├── client.py                    # Typed client and heuristic policy
+│   └── models.py                    # OpenEnv models
 ├── tests/
 │   └── test_environment.py          # Unit tests
 ├── pyproject.toml                   # Project metadata & dependencies
@@ -382,7 +379,7 @@ If you use this environment in your research, please cite:
   title={OpenEnv SME Negotiator: An RL Environment for B2B Contract Negotiation},
   author={Omkarchaithanya},
   year={2024},
-  url={https://github.com/Omkarchaithanya/meta-2}
+  url={https://github.com/SkandaGanesha1/ENV}
 }
 ```
 
@@ -417,7 +414,7 @@ The `inference.py` script provides a complete baseline agent using OpenAI's LLM 
 
 3. **Start the server** (in another terminal):
    ```bash
-   python -m uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
+    python -m uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
    ```
 
 ### Running Inference
@@ -526,4 +523,4 @@ After running inference, you can analyze:
 
 - **Issues**: GitHub Issues tracker
 - **Discussions**: GitHub Discussions
-- **Repository**: https://github.com/Omkarchaithanya/meta-2
+- **Repository**: https://github.com/SkandaGanesha1/ENV

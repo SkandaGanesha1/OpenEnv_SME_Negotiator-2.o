@@ -55,13 +55,14 @@ make docker-run
 ```
 Part 1: Run Baseline
 ├── inference.py              ← LLM agent for negotiation
-├── requirements.txt          ← All dependencies
+├── openenv.yaml              ← OpenEnv manifest
+├── pyproject.toml            ← All dependencies
 └── .env                      ← API keys (create this)
 
 Part 2: Understanding the Environment
-├── src/env/sme_negotiation.py  ← Core MDP environment
-├── src/app.py                  ← FastAPI server factory
-└── src/utils/grader.py         ← Score calculation
+├── server/sme_environment.py  ← Core MDP environment
+├── server/app.py              ← OpenEnv server entrypoint
+└── sme_negotiator_env/models.py ← Score and state models
 
 Part 3: Testing
 ├── tests/test_environment.py   ← Unit tests
@@ -77,7 +78,7 @@ python inference.py
 # Start the game server
 make server
 # or
-python -m uvicorn src.app:app --reload
+python -m uvicorn server.app:app --reload
 
 # Run unit tests
 make test
@@ -107,9 +108,9 @@ make typecheck
 - **Goal**: Maximize price
 - **Python Example**:
   ```python
-  env = SMENegotiationEnv()
-  obs = env.reset(task_id="easy", seed=42)
-  # obs.p_opp = ₹96, obs.d_opp = 30, obs.c_sme = ₹70
+    env = SMENegotiatorEnvironment()
+    obs = env.reset(seed=42, difficulty="EASY")
+    # obs.buyer_price = ₹96, obs.buyer_days = 30, obs.cost_threshold = ₹70
   ```
 
 #### Medium Task: Pareto Frontier
@@ -244,10 +245,10 @@ if task_id == "hard":
 
 ```python
 # Create your own run_custom_inference.py
-from src.env.sme_negotiation import SMENegotiationEnv
+from server.sme_environment import SMENegotiatorEnvironment
 
-env = SMENegotiationEnv()
-obs = env.reset(task_id="easy", seed=42)
+env = SMENegotiatorEnvironment()
+obs = env.reset(seed=42, difficulty="EASY")
 
 for step in range(12):
     # Your custom logic here
