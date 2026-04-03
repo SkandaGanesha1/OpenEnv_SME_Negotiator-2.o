@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
@@ -8,18 +8,20 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml ./
-COPY requirements.txt ./
+COPY server/requirements.txt ./server/requirements.txt
 COPY README.md ./
 COPY openenv.yaml ./
-COPY src ./src
+COPY server ./server
+COPY sme_negotiator_env ./sme_negotiator_env
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r server/requirements.txt
 
-ENV PORT=7860
+ENV PORT=8000
+ENV PYTHONPATH=/app
 
-EXPOSE 7860
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://127.0.0.1:${PORT}/health || exit 1
 
-CMD ["sh", "-c", "uvicorn src.app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["sh", "-c", "uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]

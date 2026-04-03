@@ -1,88 +1,17 @@
-api_version: "1.0"
-metadata:
-  name: "SME B2B Contract Negotiation"
-  version: "0.1.0"
-  author: "Omkarchaithanya"
-  description: "Deterministic negotiation environment for SME pricing, payment terms, and TReDS-aware settlement decisions."
-
-environment:
-  base_url: "https://omkarchaithanya-sme-negotiator.hf.space"
-  endpoints:
-    health: "/health"
-    reset: "/reset"
-    step: "/step"
-    state: "/state"
-    schema: "/schema"
-
-tasks:
-  - id: "easy"
-    name: "Price Negotiation (Fixed Terms)"
-    description: "Negotiate price with fixed 30-day payment terms."
-    difficulty: 1
-    max_rounds: 5
-
-  - id: "medium"
-    name: "Price & Terms Negotiation"
-    description: "Negotiate price and payment days under a 45-day regulatory boundary."
-    difficulty: 2
-    max_rounds: 8
-
-  - id: "hard"
-    name: "Advanced Multi-dimensional Negotiation"
-    description: "Negotiate with tight liquidity constraints and TReDS-enabled settlement."
-    difficulty: 3
-    max_rounds: 12
-    deterministic: true
-    reproducible: true
-    scoring_range: [0.0, 1.0]
-
-inference:
-  baseline:
-    script: "inference.py"
-    model: "gpt-4o"
-    timeout: 300
-    required_env_vars:
-      - "OPENAI_API_KEY"
-      - "API_BASE_URL"
-      - "MODEL_NAME"
-    expected_scores:
-      easy: 0.75
-      medium: 0.85
-      hard: 0.70
-
-deployment:
-  containerization:
-    base_image: "python:3.10-slim"
-    port: 7860  # HF Spaces-compatible port
-    health_check:
-      endpoint: "/health"
-      interval: 30
-      timeout: 10
-  
-  platforms:
-    - name: "Hugging Face Spaces"
-      requirements: "Dockerfile in root"
-      port: 7860
-      env_variables:
-        - "OPENAI_API_KEY"
-        - "PORT=7860"
-
-validation:
-  pre_submission:
-    - name: "Space Deployment"
-      check: "HF Space URL responds with 200 on /health"
-    - name: "OpenEnv Spec Compliance"
-      check: "All typed models valid, endpoints functional"
-    - name: "Docker Build"
-      check: "docker build succeeds in < 300s"
-    - name: "Baseline Inference"
-      check: "inference.py runs in < 1200s, produces scores 0.0-1.0"
-    - name: "Task Graders"
-      check: "All 3 graders produce deterministic scores"
-
-compliance:
-  openenv_version: "0.1.0"
-  spec_compliance: "full"
-  typing: "pydantic-v2"
-  determinism: "guaranteed"
-  reproducibility: "seed-based"
+spec_version: 1
+name: sme-negotiator
+type: environment
+runtime: docker
+app: server/app.py
+port: 8000
+tags:
+  - openenv
+  - negotiation
+  - fintech
+  - rl
+description: >
+  SME payment term negotiation environment. An AI agent representing a small
+  supplier negotiates price and payment days with a large buyer. Models the
+  real-world problem where SMEs face 60-90 day payment terms despite needing
+  to pay suppliers within 30 days. Supports EASY/MEDIUM/HARD difficulty levels
+  and TReDS (Trade Receivables Discounting System) financing mechanism.
