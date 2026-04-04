@@ -18,6 +18,13 @@ app = create_app(
 )
 
 
+@app.post("/reset")
+def reset_status() -> dict:
+    """Fallback reset endpoint used when framework route is unavailable."""
+
+    return {"status": "ok"}
+
+
 def main() -> None:
     """Run the server with uvicorn."""
 
@@ -26,7 +33,7 @@ def main() -> None:
     uvicorn.run(
         "server.app:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
+        port=int(os.getenv("PORT", "7860")),
     )
 
 

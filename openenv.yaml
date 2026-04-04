@@ -1,17 +1,9 @@
-spec_version: 1
-name: sme-negotiator
-type: environment
-runtime: docker
-app: server/app.py
-port: 8000
-tags:
-  - openenv
-  - negotiation
-  - fintech
-  - rl
-description: >
-  SME payment term negotiation environment. An AI agent representing a small
-  supplier negotiates price and payment days with a large buyer. Models the
-  real-world problem where SMEs face 60-90 day payment terms despite needing
-  to pay suppliers within 30 days. Supports EASY/MEDIUM/HARD difficulty levels
-  and TReDS (Trade Receivables Discounting System) financing mechanism.
+name: SME Negotiator Environment
+description: OpenEnv simulation for payment-term negotiation with SME focus
+type: text
+app: server.app:app
+port: 7860
+tasks:
+  - payment-term-negotiation
+  - early-payment-discount
+  - treds-enrollment

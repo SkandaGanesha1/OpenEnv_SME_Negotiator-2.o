@@ -1,22 +1,36 @@
 #!/usr/bin/env python3
-"""Baseline inference runner for the SME negotiation environment."""
+"""Inference runner for the SME negotiation environment."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
+from openai import OpenAI
 
 from sme_negotiator_env.client import SMENegotiatorEnv
 from sme_negotiator_env.models import NegotiationAction
 
 load_dotenv()
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:7860")
+HF_TOKEN = os.getenv("HF_TOKEN")
+MODEL_NAME = os.getenv("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+
+NEGOTIATION_SYSTEM_PROMPT = (
+    "You are a B2B negotiation assistant. Respond ONLY with valid JSON containing "
+    "keys: action_type, price, payment_days, use_treds, reason. "
+    "action_type must be one of: propose, accept, reject."
+)
+
+client = OpenAI(
+    base_url="https://router.huggingface.co/v1",
+    api_key=HF_TOKEN,
+)
 
 
 def _observation_to_dict(observation: Any) -> Dict[str, Any]:
@@ -27,148 +41,130 @@ def _observation_to_dict(observation: Any) -> Dict[str, Any]:
     return dict(observation)
 
 
-def choose_action(observation: Any, round_number: int, agent_days: int) -> tuple[NegotiationAction, int]:
-    """Choose the next action using the current observation only."""
-
-    difficulty = str(getattr(observation, "difficulty", "")).upper()
-    print(
-        f"  accept check: buyer_days={observation.buyer_days}, "
-        f"liquidity_threshold={observation.liquidity_threshold}"
+def format_observation(obs: Dict[str, Any]) -> str:
+    return (
+        f"Round={obs.get('round_number')} | BuyerPrice={obs.get('buyer_price')} | "
+        f"BuyerDays={obs.get('buyer_days')} | LiquidityThreshold={obs.get('liquidity_threshold')} | "
+        f"CostThreshold={obs.get('cost_threshold')}"
     )
 
-    if difficulty == "EASY" and round_number == 0:
-        next_agent_days = max(observation.liquidity_threshold, observation.buyer_days)
-        return (
-            NegotiationAction(
-                action_type="propose",
-                price=round(max(observation.cost_threshold + 2.0, observation.buyer_price * 0.995), 2),
-                payment_days=next_agent_days,
-                use_treds=False,
-                reason="Easy-task opening offer",
-            ),
-            next_agent_days,
-        )
 
-    if difficulty == "EASY" and round_number == 1 and observation.buyer_price > observation.cost_threshold:
-        return (
-            NegotiationAction(
-                action_type="accept",
-                price=observation.buyer_price,
-                payment_days=observation.buyer_days,
-                use_treds=False,
-                reason="Easy-task acceptance after one counter-offer",
-            ),
-            agent_days,
-        )
+def _safe_fallback_action(observation: Any) -> Dict[str, Any]:
+    return {
+        "action_type": "propose",
+        "price": round(max(float(observation.cost_threshold) + 1.0, float(observation.buyer_price) * 0.99), 2),
+        "payment_days": int(max(int(observation.liquidity_threshold), int(observation.buyer_days) - 5)),
+        "use_treds": bool(int(observation.buyer_days) > int(observation.liquidity_threshold) + 20),
+        "reason": "Fallback action due to model output issue",
+    }
 
-    if observation.buyer_price > observation.cost_threshold and observation.buyer_days <= observation.liquidity_threshold:
-        return (
-            NegotiationAction(
-                action_type="accept",
-                price=observation.buyer_price,
-                payment_days=observation.buyer_days,
-                use_treds=False,
-                reason="Current offer is viable",
-            ),
-            agent_days,
-        )
 
-    if round_number >= 4 and observation.buyer_days > observation.liquidity_threshold * 2:
-        target_days = observation.liquidity_threshold + 15
-        return (
-            NegotiationAction(
-                action_type="propose",
-                price=round(max(observation.cost_threshold + 1.0, observation.buyer_price * 0.95), 2),
-                payment_days=target_days,
-                use_treds=True,
-                reason="TReDS-enabled proposal to unlock shorter payment terms",
-            ),
-            target_days,
-        )
+def get_agent_action(observation: Dict[str, Any], history: List[dict], task_name: str) -> Dict[str, Any]:
+    user_message = (
+        f"Task={task_name}\n"
+        f"Current observation:\n{format_observation(observation)}\n"
+        "Return only JSON action."
+    )
 
-    if round_number >= 6 and observation.buyer_days > observation.liquidity_threshold + 3:
-        target_days = observation.liquidity_threshold + 15
-        return (
-            NegotiationAction(
-                action_type="propose",
-                price=round(max(observation.cost_threshold + 1.0, observation.buyer_price * 0.98), 2),
-                payment_days=target_days,
-                use_treds=True,
-                reason="Late-round TReDS proposal to pull buyer days toward liquidity threshold",
-            ),
-            target_days,
-        )
+    messages = [{"role": "system", "content": NEGOTIATION_SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": user_message}
+    ]
 
-    if round_number == 0:
-        agent_days = max(observation.liquidity_threshold, observation.buyer_days // 2)
-    else:
-        agent_days = max(observation.liquidity_threshold, agent_days - 8)
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=180,
+    )
 
-    return (
-        NegotiationAction(
-            action_type="propose",
-            price=round(max(observation.cost_threshold + 2.0, observation.buyer_price * 0.995), 2),
-            payment_days=agent_days,
-            use_treds=False,
-            reason="Counter-offer focused on payment-term reduction",
-        ),
-        agent_days,
+    raw = completion.choices[0].message.content.strip()
+    if raw.startswith("```"):
+        raw = raw.strip("`")
+        raw = raw.replace("json", "", 1).strip()
+
+    action = json.loads(raw)
+    return {
+        "action_type": str(action.get("action_type", "propose")).lower(),
+        "price": float(action.get("price", observation.get("buyer_price", 0.0))),
+        "payment_days": int(action.get("payment_days", observation.get("buyer_days", 0))),
+        "use_treds": bool(action.get("use_treds", False)),
+        "reason": str(action.get("reason", "")),
+    }
+
+
+def _to_model_action(action_payload: Dict[str, Any], observation: Any) -> NegotiationAction:
+    action_type = str(action_payload.get("action_type", "propose")).lower()
+    if action_type not in {"propose", "accept", "reject"}:
+        action_type = "propose"
+
+    price = float(action_payload.get("price", observation.buyer_price))
+    payment_days = int(action_payload.get("payment_days", observation.buyer_days))
+    use_treds = bool(action_payload.get("use_treds", False))
+    reason = str(action_payload.get("reason", "Model-selected action"))
+
+    return NegotiationAction(
+        action_type=action_type,
+        price=round(price, 2),
+        payment_days=payment_days,
+        use_treds=use_treds,
+        reason=reason,
     )
 
 
 async def run_episode(env: SMENegotiatorEnv, difficulty: str, seed: int) -> Dict[str, Any]:
-    """Run one episode with a state-aware heuristic policy."""
+    """Run one episode using model-guided actions with strict stdout formatting."""
 
-    result = await env.reset(seed=seed, difficulty=difficulty)
+    task_name = difficulty.lower()
+    episode_id = f"{task_name}-{seed}"
+    history: List[dict] = []
+
+    result = await env.reset(seed=seed, difficulty=difficulty, episode_id=episode_id, task_name=task_name)
     observation = result.observation
+
+    print(
+        f"[START] EPISODE_ID={episode_id} TASK={task_name} "
+        f"SEED={seed} OBS={json.dumps(_observation_to_dict(observation), ensure_ascii=True)}",
+        flush=True,
+    )
+
     round_number = 0
     step_rewards: List[float] = []
     total_reward = 0.0
 
-    print("\n" + "=" * 72)
-    print(f"EPISODE START: {difficulty} | seed={seed}")
-    print("=" * 72)
-    print(
-        f"Initial buyer: ₹{observation.buyer_price:.2f} / unit @ {observation.buyer_days} days "
-        f"| volume={observation.volume}"
-    )
-    print(
-        f"Thresholds: cost=₹{observation.cost_threshold:.2f}, "
-        f"liquidity={observation.liquidity_threshold} days"
-    )
-
-    agent_days = max(observation.liquidity_threshold, observation.buyer_days // 2)
-
     while not result.done and round_number < observation.max_rounds:
-        action, agent_days = choose_action(observation, round_number, agent_days)
+        obs_dict = _observation_to_dict(observation)
+
+        try:
+            action_payload = get_agent_action(obs_dict, history, task_name)
+        except Exception:
+            action_payload = _safe_fallback_action(observation)
+
+        action = _to_model_action(action_payload, observation)
+
         print(
-            f"Round {round_number + 1}/{observation.max_rounds}: "
-            f"{action.action_type.upper()} price=₹{action.price:.2f}, "
-            f"days={action.payment_days}, treds={action.use_treds}"
+            f"[STEP] EPISODE_ID={episode_id} ROUND={round_number + 1} "
+            f"ACTION={json.dumps(action.model_dump(), ensure_ascii=True)} "
+            f"OBS={json.dumps(obs_dict, ensure_ascii=True)}",
+            flush=True,
         )
+
+        history.append({"role": "user", "content": format_observation(obs_dict)})
+        history.append({"role": "assistant", "content": json.dumps(action_payload, ensure_ascii=True)})
 
         result = await env.step(action)
         observation = result.observation
         reward = float(result.reward or 0.0)
         total_reward += reward
         step_rewards.append(reward)
-
-        print(
-            f"  buyer -> ₹{observation.buyer_price:.2f} / unit @ {observation.buyer_days} days"
-        )
-        print(
-            f"  step reward={reward:.4f} | cumulative={total_reward:.4f} | done={result.done}"
-        )
-
         round_number += 1
 
     final_score = float(result.reward or 0.0)
     success = bool(result.done and final_score > 0.0)
 
-    print("-" * 72)
     print(
-        f"Episode summary: final_score={final_score:.4f}, total_reward={total_reward:.4f}, "
-        f"steps={round_number}, success={success}"
+        f"[END] EPISODE_ID={episode_id} FINAL_SCORE={final_score} "
+        f"TOTAL_REWARD={total_reward} STEPS={round_number}",
+        flush=True,
     )
 
     return {
@@ -186,15 +182,11 @@ async def run_episode(env: SMENegotiatorEnv, difficulty: str, seed: int) -> Dict
 async def main() -> None:
     """Run three episodes per difficulty and write a compact results file."""
 
-    print("=" * 72)
-    print("SME NEGOTIATION BASELINE INFERENCE")
-    print("=" * 72)
-    print(f"API_BASE_URL={API_BASE_URL}")
-
     results: Dict[str, Any] = {
         "metadata": {
             "api_base_url": API_BASE_URL,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model_name": MODEL_NAME,
         },
         "tasks": {},
     }
@@ -242,23 +234,6 @@ async def main() -> None:
 
     with open("inference_results.json", "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2)
-
-    print("\n" + "=" * 72)
-    print("FINAL SUMMARY")
-    print("=" * 72)
-    for difficulty, task_data in results["tasks"].items():
-        summary = task_data["summary"]
-        print(
-            f"{difficulty}: mean_score={summary['mean_final_score']:.4f}, "
-            f"mean_reward={summary['mean_total_reward']:.4f}, "
-            f"success_rate={summary['success_rate']:.2%}"
-        )
-    print(
-        f"Overall: mean_score={results['summary']['overall_mean_score']:.4f}, "
-        f"mean_reward={results['summary']['overall_mean_reward']:.4f}, "
-        f"success_rate={results['summary']['overall_success_rate']:.2%}"
-    )
-    print("Results saved to inference_results.json")
 
 
 if __name__ == "__main__":

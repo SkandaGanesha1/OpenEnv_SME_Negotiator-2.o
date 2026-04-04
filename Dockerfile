@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM ghcr.io/meta-pytorch/openenv-base:latest
 
 WORKDIR /app
 
@@ -16,12 +16,12 @@ COPY sme_negotiator_env ./sme_negotiator_env
 
 RUN pip install --no-cache-dir -r server/requirements.txt
 
-ENV PORT=8000
+ENV PORT=7860
+ENV ENABLE_WEB_INTERFACE=true
 ENV PYTHONPATH=/app
-
-EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://127.0.0.1:${PORT}/health || exit 1
 
 CMD ["sh", "-c", "uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]
+EXPOSE 7860
