@@ -25,7 +25,7 @@ pinned: false
   <a href="https://fastapi.tiangolo.com/">
     <img src="https://img.shields.io/badge/FastAPI-API-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI">
   </a>
-  <a href="https://huggingface.co/docs/openenv">
+  <a href="https://huggingface.co/openenv/">
     <img src="https://img.shields.io/badge/OpenEnv-Compliant-111111?style=for-the-badge" alt="OpenEnv Compliant">
   </a>
   <a href="LICENSE">
