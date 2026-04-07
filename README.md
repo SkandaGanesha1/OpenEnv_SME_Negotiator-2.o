@@ -8,7 +8,7 @@ pinned: false
 ---
 
 <p align="center">
-  <img src="logo/OpenEnv-Sme-Negotiator-logo.png" alt="OpenEnv SME Negotiator" width="340">
+  <img src="logo.png" alt="OpenEnv SME Negotiator" width="340">
 </p>
 
 <p align="center">
