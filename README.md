@@ -146,6 +146,35 @@ asyncio.run(main())
 - **TReDS Platform**: Allows SMEs to auction trade receivables for immediate cash
 - **Real-world impact**: Millions of SMEs globally struggle with working capital gaps
 
+### Hackathon Spec Alignment
+
+This project is structured to make the evaluation contract easy to audit:
+
+- **`[START]`**: emitted once at the beginning of each episode with task, environment, and model metadata.
+- **`[STEP]`**: emitted after every action with the serialized action, step reward, done flag, and parser-safe error field.
+- **`[END]`**: emitted once per episode with success flag, number of steps, and the reward trace.
+
+Relevant configuration lives in `inference.py` and is documented here for reviewers:
+
+- **`API_BASE_URL`**: OpenAI-compatible LLM endpoint.
+- **`HF_TOKEN`**: token for Hugging Face router or hosted models.
+- **`MODEL_NAME`**: chat-capable model id used for `chat/completions`.
+- **`OPENENV_BASE_URL`**: negotiation server URL, default `http://127.0.0.1:7860`.
+- **`OPENENV_IN_PROCESS`**: set to `1` to run the environment in-process instead of starting `uv run server` separately.
+- **`INFERENCE_HARD_TWO_STEP`**: hard-task accept shortcut toggle; default `0` to preserve benchmark integrity.
+
+The practical baseline command is:
+
+```bash
+python inference.py
+```
+
+If you prefer the managed environment form, use:
+
+```bash
+uv run python inference.py
+```
+
 ### Economic Context Reading Pack (for judges and users)
 
 Use this as a single entry point to external context behind the environment design and scoring assumptions.
@@ -430,6 +459,12 @@ uv run server
 
 # Terminal 2
 uv run python inference.py
+```
+
+You can also run the script directly from an activated Python environment:
+
+```bash
+python inference.py
 ```
 
 Outputs are written to `inference_results.json` (gitignored by default).

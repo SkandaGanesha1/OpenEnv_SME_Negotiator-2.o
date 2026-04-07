@@ -51,6 +51,15 @@ make docker-run                 # http://127.0.0.1:7860
 | openenv.yaml | Environment config | Customizing task parameters |
 | Makefile | Development commands | Running tasks |
 
+### Hackathon Spec Alignment
+
+Reviewers can check the evaluation contract quickly in one place:
+
+- [README.md](README.md) documents the `[START]` / `[STEP]` / `[END]` output format used by `inference.py`.
+- [README.md](README.md) also lists the key environment variables: `API_BASE_URL`, `HF_TOKEN`, `MODEL_NAME`, `OPENENV_BASE_URL`, `OPENENV_IN_PROCESS`, and `INFERENCE_HARD_TWO_STEP`.
+- [README.md](README.md) includes the direct `python inference.py` command and the `uv run python inference.py` variant.
+- [README.md](README.md) spells out the TReDS simulation effect and the NPV-based hard grader.
+
 ---
 
 ## 💻 Core Code Files
