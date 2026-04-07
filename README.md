@@ -47,7 +47,7 @@ If you want an environment where an agent must balance price, payment days, work
 
 | 📊 Metric | 🔢 Number | 🗓️ Source |
 |---|---|---|
-| **Delayed MSME receivables (2026 Eco Survey)** | **₹8.1 lakh crore** | [Economic Survey 2025–26, Chapter 8](https://www.indiabudget.gov.in/economicsurvey/doc/eschapter/echap08.pdf) · [Economic Times coverage](https://economictimes.indiatimes.com/small-biz/sme-sector/rs-8-1-lakh-crore-stuck-in-delayed-msme-payments-eco-survey-2026/articleshow/127765852.cms?from=mdr) |
+| **Delayed MSME receivables (2026 Eco Survey)** | **₹8.1 lakh crore** | [Economic Times coverage](https://economictimes.indiatimes.com/small-biz/sme-sector/rs-8-1-lakh-crore-stuck-in-delayed-msme-payments-eco-survey-2026/articleshow/127765852.cms?from=mdr) |
 | **Razorpay “Fix My Itch” itch score** | 82.8 / 100 | [Fix My Itch by Razorpay](https://razorpay.com/m/fix-my-itch/) |
 | **Peak delayed payments (2022)** | ₹10.7 lakh crore | [GAME–FISME–C2FO White Paper 3.0](https://www.businesstoday.in/industry/story/rs-81-lakh-crore-stuck-in-dues-msme-growth-hinges-on-dispute-reform-warns-white-paper-422710-2026-02-26) |
 | **Samadhaan portal — applications filed** | 2,35,000+ applications | [MSME Samadhaan – Dashboard / all-amount reports](https://samadhaan.msme.gov.in/MyMsme/MSEFC/MSEFC_ReportAllAmount.aspx) |
