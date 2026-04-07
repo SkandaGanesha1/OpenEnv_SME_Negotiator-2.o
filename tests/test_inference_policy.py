@@ -62,3 +62,55 @@ def test_forced_accept_when_opted_in(monkeypatch) -> None:
 
     assert out["action_type"] == "accept"
     assert out["propose_dynamic_discounting"] is True
+
+
+def test_close_trigger_in_agreement_zone() -> None:
+    observation = {
+        "buyer_days": 44,
+        "buyer_price": 83.0,
+        "liquidity_threshold": 45,
+        "cost_threshold": 80.0,
+        "max_rounds": 12,
+    }
+    last_proposal = {
+        "action_type": "propose",
+        "price": 82.0,
+        "payment_days": 45,
+        "use_treds": False,
+    }
+
+    assert inference._should_close_deal(observation, "medium", round_number=6, last_valid_proposal=last_proposal)
+
+
+def test_hard_stage1_enforces_dynamic_discounting_contract() -> None:
+    observation = {
+        "buyer_price": 95.0,
+        "buyer_days": 95,
+        "liquidity_threshold": 55,
+        "cost_threshold": 78.0,
+    }
+    out = inference._normalize_stage1_proposal(
+        {
+            "action_type": "propose",
+            "price": 88.0,
+            "payment_days": 40,
+            "use_treds": False,
+            "propose_dynamic_discounting": False,
+            "dynamic_discount_annual_rate": 0.5,
+        },
+        observation,
+        "hard",
+        round_number=0,
+        last_valid_proposal=None,
+    )
+
+    assert out["action_type"] == "propose"
+    assert out["propose_dynamic_discounting"] is True
+    assert out["dynamic_discount_annual_rate"] == 0.02
+    assert out["use_treds"] is True
+
+
+def test_end_line_includes_score_field() -> None:
+    line = inference._format_end_line(True, 4, 0.75, [0.1, 0.2, 0.15, 0.75])
+    assert line.startswith("[END] success=true steps=4 score=0.75 rewards=")
+    assert "0.10,0.20,0.15,0.75" in line

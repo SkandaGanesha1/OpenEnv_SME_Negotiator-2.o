@@ -153,6 +153,161 @@ def _format_step_error(llm_error: str | None) -> str:
         return "null"
     return json.dumps(_clip_ascii_text(llm_error, _MAX_ERROR_CHARS), ensure_ascii=True)
 
+
+def _format_end_line(success: bool, steps: int, score: float, rewards: List[float]) -> str:
+    return (
+        f'[END] success={"true" if success else "false"} steps={steps} '
+        f'score={score:.2f} rewards={",".join(f"{r:.2f}" for r in rewards)}'
+    )
+
+
+def _task_margin(task_name: str) -> float:
+    t = task_name.lower()
+    if "easy" in t:
+        return 2.0
+    if "hard" in t:
+        return 1.0
+    return 1.5
+
+
+def _task_target_days(task_name: str, liquidity_threshold: int) -> int:
+    return 30 if "hard" in task_name.lower() else liquidity_threshold
+
+
+def _hard_fields_valid(action_payload: Dict[str, Any]) -> bool:
+    if not bool(action_payload.get("propose_dynamic_discounting", False)):
+        return False
+    rate = float(action_payload.get("dynamic_discount_annual_rate", 0.0))
+    return 0.0 < rate <= 0.05
+
+
+def _proposal_viable_for_close(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+) -> bool:
+    cost = float(observation.get("cost_threshold", 0.0))
+    liq = int(observation.get("liquidity_threshold", 0))
+    margin = _task_margin(task_name)
+    price_ok = float(action_payload.get("price", 0.0)) >= (cost + margin)
+    days_ok = int(action_payload.get("payment_days", 10**9)) <= liq
+    if "hard" in task_name.lower() and not _hard_fields_valid(action_payload):
+        return False
+    return price_ok and days_ok
+
+
+def _enforce_task_contract_fields(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+) -> Dict[str, Any]:
+    out = dict(action_payload)
+    t = task_name.lower()
+    buyer_days = int(observation.get("buyer_days", 0))
+    liq = int(observation.get("liquidity_threshold", 0))
+
+    if "medium" in t:
+        out["propose_late_payment_penalty_clause"] = True
+
+    if "hard" in t:
+        out["propose_dynamic_discounting"] = True
+        rate = float(out.get("dynamic_discount_annual_rate", 0.02))
+        if rate <= 0.0 or rate > 0.05:
+            out["dynamic_discount_annual_rate"] = 0.02
+        else:
+            out["dynamic_discount_annual_rate"] = round(rate, 4)
+        # Keep financing mechanic active when day-gap pressure is material.
+        if buyer_days > liq + 10:
+            out["use_treds"] = True
+    return out
+
+
+def _normalize_stage1_proposal(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+    round_number: int,
+    last_valid_proposal: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    out = dict(action_payload)
+    out["action_type"] = "propose"
+
+    buyer_price = float(observation.get("buyer_price", 100.0))
+    buyer_days = int(observation.get("buyer_days", 90))
+    liq = int(observation.get("liquidity_threshold", 60))
+    cost = float(observation.get("cost_threshold", 80.0))
+
+    margin = _task_margin(task_name)
+    target_days = _task_target_days(task_name, liq)
+    day_step = 8 if "easy" in task_name.lower() else (5 if "hard" in task_name.lower() else 6)
+
+    price_floor = cost + margin
+    llm_price = float(out.get("price", buyer_price))
+    llm_days = int(out.get("payment_days", buyer_days))
+
+    deterministic_days = max(target_days, buyer_days - day_step)
+    if last_valid_proposal is not None:
+        deterministic_days = min(deterministic_days, int(last_valid_proposal.get("payment_days", deterministic_days)))
+    proposed_days = max(target_days, min(llm_days, deterministic_days))
+
+    deterministic_price = max(price_floor, buyer_price - (0.4 + 0.2 * round_number))
+    proposed_price = max(price_floor, min(llm_price, deterministic_price, buyer_price))
+    if last_valid_proposal is not None:
+        proposed_price = min(proposed_price, float(last_valid_proposal.get("price", proposed_price)))
+
+    out["payment_days"] = int(proposed_days)
+    out["price"] = round(proposed_price, 2)
+    out["use_treds"] = bool(out.get("use_treds", False))
+    out = _enforce_task_contract_fields(out, observation, task_name)
+    return out
+
+
+def _should_close_deal(
+    observation: Dict[str, Any],
+    task_name: str,
+    round_number: int,
+    last_valid_proposal: Dict[str, Any] | None,
+) -> bool:
+    if last_valid_proposal is None:
+        return False
+
+    buyer_days = int(observation.get("buyer_days", 0))
+    buyer_price = float(observation.get("buyer_price", 0.0))
+    liq = int(observation.get("liquidity_threshold", 0))
+    cost = float(observation.get("cost_threshold", 0.0))
+    max_rounds = int(observation.get("max_rounds", 16))
+    remaining = max_rounds - (round_number + 1)
+    margin = _task_margin(task_name)
+
+    in_zone = buyer_days <= liq and buyer_price >= (cost + margin)
+    late_window = 4 if "hard" in task_name.lower() else 3
+
+    if in_zone and _proposal_viable_for_close(last_valid_proposal, observation, task_name):
+        return True
+    if remaining <= late_window and _proposal_viable_for_close(last_valid_proposal, observation, task_name):
+        return True
+    return False
+
+
+def _build_accept_from_last_proposal(
+    last_valid_proposal: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+) -> Dict[str, Any]:
+    out = {
+        "action_type": "accept",
+        "price": float(last_valid_proposal.get("price", observation.get("buyer_price", 0.0))),
+        "payment_days": int(last_valid_proposal.get("payment_days", observation.get("buyer_days", 0))),
+        "use_treds": bool(last_valid_proposal.get("use_treds", False)),
+        "reason": "Close deal in agreement zone before max rounds.",
+        "propose_late_payment_penalty_clause": bool(
+            last_valid_proposal.get("propose_late_payment_penalty_clause", False)
+        ),
+        "propose_dynamic_discounting": bool(last_valid_proposal.get("propose_dynamic_discounting", False)),
+        "dynamic_discount_annual_rate": float(last_valid_proposal.get("dynamic_discount_annual_rate", 0.0)),
+    }
+    return _enforce_task_contract_fields(out, observation, task_name)
+
 # Local OpenAI-compatible servers (Ollama, LM Studio) do not need a real key; HF router does.
 _OPENAI_API_KEY = HF_TOKEN or ("not-needed" if _llm_url_looks_local(API_BASE_URL) else "")
 client = OpenAI(base_url=API_BASE_URL, api_key=_OPENAI_API_KEY)
@@ -439,6 +594,7 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
     result: Any = None
     observation: Any = None
     final_score = 0.0
+    last_valid_proposal: Dict[str, Any] | None = None
 
     try:
         result = await env.reset(seed=seed, difficulty=difficulty, episode_id=episode_id, task_name=task_name)
@@ -490,14 +646,29 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             )
             if str(action_payload.get("reason", "")).startswith("Accept prior propose (hard two-step policy"):
                 forced_hard_accepts += 1
-            action_payload = _maybe_enable_treds_guardrail(
-                action_payload,
-                obs_dict,
-                task_name,
-                round_number,
-            )
+
+            if _should_close_deal(obs_dict, task_name, round_number, last_valid_proposal):
+                action_payload = _build_accept_from_last_proposal(last_valid_proposal, obs_dict, task_name)
+            else:
+                action_payload = _normalize_stage1_proposal(
+                    action_payload,
+                    obs_dict,
+                    task_name,
+                    round_number,
+                    last_valid_proposal,
+                )
+                action_payload = _maybe_enable_treds_guardrail(
+                    action_payload,
+                    obs_dict,
+                    task_name,
+                    round_number,
+                )
+
             action = _to_model_action(action_payload, observation)
             action_json = _serialize_step_action(action)
+
+            if action.action_type == "propose":
+                last_valid_proposal = action.model_dump()
 
             result = await env.step(action)
             observation = result.observation
@@ -525,11 +696,7 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             success = bool(result.done and final_score > 0.0)
     finally:
         total_reward = sum(all_rewards)
-        print(
-            f'[END] success={"true" if success else "false"} steps={round_number} '
-            f'rewards={",".join(f"{r:.2f}" for r in all_rewards)}',
-            flush=True,
-        )
+        print(_format_end_line(success, round_number, final_score, all_rewards), flush=True)
 
     return {
         "difficulty": difficulty,

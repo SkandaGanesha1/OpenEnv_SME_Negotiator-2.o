@@ -479,7 +479,7 @@ class SMENegotiatorEnvironment(Environment):
             reward_branch = f"max_rounds_terminal_grader:{terminal_reward:.4f}"
             self._reward_debug_print(reward_branch, step_reward)
             termination_reason = "max_rounds_no_deal"
-            success = False
+            success = terminal_reward > 0.0
 
         return self._obs_from_state(
             buyer_accepted=False,

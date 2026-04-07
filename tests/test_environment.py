@@ -95,3 +95,21 @@ def test_state_exposed_as_attribute() -> None:
 
     assert env.state is not None
     assert hasattr(env.state, "episode_id")
+
+
+def test_max_rounds_success_flag_matches_terminal_reward() -> None:
+    env = SMENegotiatorEnvironment()
+    observation = env.reset(seed=7, difficulty="medium")
+
+    while not observation.done:
+        observation = env.step(
+            NegotiationAction(
+                action_type="propose",
+                price=max(observation.cost_threshold + 1.0, observation.buyer_price - 0.5),
+                payment_days=max(observation.liquidity_threshold + 8, observation.buyer_days - 1),
+                use_treds=False,
+            )
+        )
+
+    assert observation.metadata.get("termination_reason") == "max_rounds_no_deal"
+    assert observation.metadata.get("success") == (observation.reward > 0.0)
