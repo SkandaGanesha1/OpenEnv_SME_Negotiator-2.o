@@ -146,6 +146,25 @@ asyncio.run(main())
 - **TReDS Platform**: Allows SMEs to auction trade receivables for immediate cash
 - **Real-world impact**: Millions of SMEs globally struggle with working capital gaps
 
+### Economic Context Reading Pack (for judges and users)
+
+Use this as a single entry point to external context behind the environment design and scoring assumptions.
+
+- **All-in-one section**: This block consolidates news, policy commentary, financing trends, and practitioner perspective on delayed MSME receivables.
+
+#### News and market reports
+- Economic Times: https://m.economictimes.com/small-biz/sme-sector/over-rs-7-3-lakh-crore-in-msme-receivables-stuck-due-to-delayed-payments-basant-kaur-c2fo/articleshow/126496632.cms
+- BusinessWorld: https://www.businessworld.in/article/despite-reforms-india-s-msme-delayed-receivables-still-exceed-4-6-of-gva-581337
+- Storyboard18: https://www.storyboard18.com/how-it-works/delayed-payments-to-msmes-fall-to-rs-7-34-lakh-crore-report-84822.htm
+
+#### Policy and ecosystem analysis
+- Massachusetts Entrepreneurship Center (Delayed Payments): https://massentrepreneurship.org/delayed-payments/
+- Corporate Counsel (India legal commentary): https://corporatecounsel.in/post/the-issues-of-delayed-payments-to-msmes-in-india
+
+#### SME financing trends and practitioner perspective
+- Recur Club (SME financing trends): https://www.recurclub.com/blog/sme-financing-trends
+- LinkedIn practitioner post: https://www.linkedin.com/posts/himanshu-mehta-977949a2_msme-vendorpayments-businessethics-activity-7436185677647749120-h-Jr
+
 ## Environment Architecture
 
 ### MDP (summary)
