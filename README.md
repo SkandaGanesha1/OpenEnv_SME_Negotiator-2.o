@@ -41,44 +41,22 @@ If you want an environment where an agent must balance price, payment days, work
 
 ---
 
-## 📋 Table of Contents
-
-- [🚨 The Crisis This Solves](#-the-crisis-this-solves)
-- [🏆 Judge Scoring Map](#-judge-scoring-map)
-- [💡 Why This Benchmark Is Unique](#-why-this-benchmark-is-unique)
-- [🗞️ Live Evidence: News & Official Data](#️-live-evidence-news--official-data)
-- [🎯 Task Ladder](#-task-ladder)
-- [⚙️ Environment Design](#️-environment-design)
-- [🏗️ Architecture](#-architecture)
-- [🚀 Quick Start](#-quick-start)
-- [🐍 Python Client](#-python-client)
-- [📡 API Surface](#-api-surface)
-- [📊 Logging & Evaluation Contract](#-logging--evaluation-contract)
-- [🐳 Deployment](#-deployment)
-- [🧪 Tests & Validation](#-tests--validation)
-- [📖 References](#-references)
-- [🤝 Contributing](#-contributing)
-- [📝 Citation](#-citation)
-- [⚖️ License](#-license)
-
----
-
 ## 🚨 The Crisis This Solves
 
 <div align="center">
 
 | 📊 Metric | 🔢 Number | 🗓️ Source |
 |---|---|---|
-| **Delayed MSME receivables (2026 Eco Survey)** | **₹8.1 lakh crore** | Govt of India Economic Survey 2025–26 / media reports[cite:16][cite:10][cite:22][cite:24] |
-| **Peak delayed payments (2022)** | ₹10.7 lakh crore | GAME–FISME–C2FO White Paper 3.0[cite:24] |
-| **Samadhaan portal — applications filed** | 2,35,000+ applications | MSME Samadhaan portal (all-amount reports)[cite:11][cite:19] |
-| **Amount payable across cases** | ~₹50,000 crore | MSME Samadhaan portal (pending amount reports)[cite:11][cite:19] |
-| **MSMEs in India** | 6.4+ crore enterprises | Ministry of MSME / Economic Survey |
-| **Employment supported** | 30+ crore people | Economic Survey 2025–26 |
-| **Share of India’s GDP** | ~31% | Ministry of MSME |
-| **Share of India’s exports** | ~48% | Ministry of MSME |
-| **TReDS invoice discounting growth** | ₹0 → ₹2.4 lakh crore | RBI TReDS statistics[cite:14] |
-| **Razorpay “Fix My Itch” itch score** | 82.8 / 100 | Razorpay Fix My Itch listing[cite:23] |
+| **Delayed MSME receivables (2026 Eco Survey)** | **₹8.1 lakh crore** | [Economic Survey 2025–26, Chapter 8](https://www.indiabudget.gov.in/economicsurvey/doc/eschapter/echap08.pdf) · [Economic Times coverage](https://economictimes.indiatimes.com/small-biz/sme-sector/rs-8-1-lakh-crore-stuck-in-delayed-msme-payments-eco-survey-2026/articleshow/127765852.cms?from=mdr) |
+| **Peak delayed payments (2022)** | ₹10.7 lakh crore | [GAME–FISME–C2FO White Paper 3.0](https://www.businesstoday.in/industry/story/rs-81-lakh-crore-stuck-in-dues-msme-growth-hinges-on-dispute-reform-warns-white-paper-422710-2026-02-26) |
+| **Samadhaan portal — applications filed** | 2,35,000+ applications | [MSME Samadhaan – Dashboard / all-amount reports](https://samadhaan.msme.gov.in/MyMsme/MSEFC/MSEFC_ReportAllAmount.aspx) |
+| **Amount payable across cases** | ~₹50,000 crore | [MSME Samadhaan – Pending Amount Report](https://samadhaan.msme.gov.in/MyMsme/MSEFC/MSEFC_ReportAllPendingAmount.aspx) |
+| **MSMEs in India** | 6.4+ crore enterprises | [PIB / Economic Survey MSME overview](https://www.pib.gov.in/PressReleasePage.aspx?PRID=2219984) |
+| **Employment supported** | 30+ crore people | [PIB / Economic Survey MSME overview](https://www.pib.gov.in/PressReleasePage.aspx?PRID=2219984) |
+| **Share of India’s GDP** | ~31% | [PIB / Economic Survey MSME overview](https://www.pib.gov.in/PressReleasePage.aspx?PRID=2219984) |
+| **Share of India’s exports** | ~48% | [PIB / Economic Survey MSME overview](https://www.pib.gov.in/PressReleasePage.aspx?PRID=2219984) |
+| **TReDS invoice discounting growth** | ₹0 → ₹2.4 lakh crore | [RBI TReDS statistics](https://www.rbi.org.in/Scripts/TREDSStatisticsView.aspx?TREDSid=40) |
+| **Razorpay “Fix My Itch” itch score** | 82.8 / 100 | [Fix My Itch by Razorpay](https://razorpay.com/m/fix-my-itch/) |
 
 </div>
 
