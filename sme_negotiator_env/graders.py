@@ -9,6 +9,14 @@ if TYPE_CHECKING:
     from sme_negotiator_env.models import NegotiationState
 
 
+_STRICT_EPS = 1e-6
+
+
+def _strict_unit_interval(score: float) -> float:
+    """Map any score into the strict open interval (0, 1)."""
+    return float(min(1.0 - _STRICT_EPS, max(_STRICT_EPS, float(score))))
+
+
 def compute_financing_npv_vs_status_quo(state: "NegotiationState") -> float:
     """NPV improvement (INR) from a dynamic discounting arrangement vs status quo.
 
@@ -33,38 +41,38 @@ def compute_financing_npv_vs_status_quo(state: "NegotiationState") -> float:
 def grade_task_payment_terms_easy(state: "NegotiationState") -> float:
     """Easy: cooperative buyer; success = agreed payment days at or below task liquidity threshold."""
     if not state.deal_reached or state.agreed_terms is None:
-        return 0.0
+        return _strict_unit_interval(0.0)
     d = int(state.agreed_terms)
     cap = int(state.liquidity_threshold)
     if d <= cap:
-        return 1.0
+        return _strict_unit_interval(1.0)
     if d <= cap + 15:
-        return 0.5
-    return 0.0
+        return _strict_unit_interval(0.5)
+    return _strict_unit_interval(0.0)
 
 
 def grade_task_payment_terms_medium(state: "NegotiationState") -> float:
     """Medium: primary success = agreed days at or below liquidity threshold (45d); bonus tier with penalty clause."""
     if not state.deal_reached or state.agreed_terms is None:
-        return 0.0
+        return _strict_unit_interval(0.0)
     d = int(state.agreed_terms)
     cap = int(state.liquidity_threshold)
     if d <= cap:
-        return 1.0
+        return _strict_unit_interval(1.0)
     if d <= cap + 7 and state.late_payment_penalty_agreed:
-        return 0.5
-    return 0.0
+        return _strict_unit_interval(0.5)
+    return _strict_unit_interval(0.0)
 
 
 def grade_task_dynamic_discounting_hard(state: "NegotiationState") -> float:
     """Hard: two-buyer pressure; reward from NPV of financing vs status quo."""
     if not state.deal_reached:
-        return 0.0
+        return _strict_unit_interval(0.0)
     if not state.dynamic_discounting_agreed:
-        return 0.0
+        return _strict_unit_interval(0.0)
     delta = compute_financing_npv_vs_status_quo(state)
     scale = max(abs(state.working_capital_gap) * 0.05, 1.0)
-    return float(max(0.0, min(1.0, delta / scale)))
+    return _strict_unit_interval(float(max(0.0, min(1.0, delta / scale))))
 
 
 TASK_GRADERS = {

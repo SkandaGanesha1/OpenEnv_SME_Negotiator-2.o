@@ -21,6 +21,14 @@ from sme_negotiator_env.models import (
 from sme_negotiator_env.task_config import TaskConfig, resolve_task_id, TASK_REGISTRY
 
 
+_STRICT_EPS = 1e-6
+
+
+def _strict_unit_interval(score: float) -> float:
+    """Map terminal scores into the strict open interval (0, 1)."""
+    return float(min(1.0 - _STRICT_EPS, max(_STRICT_EPS, float(score))))
+
+
 class SMENegotiatorEnvironment(Environment):
     """OpenEnv environment for SME payment term negotiation."""
 
@@ -81,7 +89,7 @@ class SMENegotiatorEnvironment(Environment):
 
     def _terminal_reward(self) -> float:
         assert self._state is not None
-        return float(self._grader_fn()(self._state))
+        return _strict_unit_interval(float(self._grader_fn()(self._state)))
 
     def _compute_reward(
         self,
@@ -343,20 +351,21 @@ class SMENegotiatorEnvironment(Environment):
         )
 
         if action_type == "reject":
+            terminal_reward = _strict_unit_interval(0.0)
             self._state.step_count += 1
             self._state.negotiation_round = self._state.step_count
-            self._cumulative_reward += step_reward
+            self._cumulative_reward += terminal_reward
             self._state.cumulative_reward = self._cumulative_reward
             self._state.message = "Agent rejected the negotiation"
             self._state.buyer_price = self._buyer_price
             self._state.buyer_days = self._buyer_days
-            self._reward_debug_print("reject_episode", step_reward)
+            self._reward_debug_print("reject_episode", terminal_reward)
             return self._obs_from_state(
                 buyer_accepted=False,
                 negotiation_done=True,
-                step_reward=step_reward,
+                step_reward=terminal_reward,
                 message="Agent rejected the negotiation",
-                reward=step_reward,
+                reward=terminal_reward,
                 done=True,
                 metadata=self._episode_meta(
                     "reject_episode",
@@ -366,18 +375,19 @@ class SMENegotiatorEnvironment(Environment):
             )
 
         if action_type == "accept" and not auto_accept and not accepts_current_buyer_offer and not accepts_own_proposal:
+            terminal_reward = _strict_unit_interval(0.0)
             self._state.step_count += 1
             self._state.negotiation_round = self._state.step_count
-            self._cumulative_reward += step_reward
+            self._cumulative_reward += terminal_reward
             self._state.cumulative_reward = self._cumulative_reward
             self._state.message = "ACCEPT failed validation"
-            self._reward_debug_print("invalid_accept_mismatch", step_reward)
+            self._reward_debug_print("invalid_accept_mismatch", terminal_reward)
             return self._obs_from_state(
                 buyer_accepted=False,
                 negotiation_done=True,
-                step_reward=step_reward,
+                step_reward=terminal_reward,
                 message="ACCEPT failed validation",
-                reward=step_reward,
+                reward=terminal_reward,
                 done=True,
                 metadata=self._episode_meta(
                     "invalid_accept",
@@ -408,7 +418,7 @@ class SMENegotiatorEnvironment(Environment):
             self._state.buyer_price = self._buyer_price
             self._state.buyer_days = self._buyer_days
             self._reward_debug_print("terminal_agreement", terminal_reward)
-            success = terminal_reward > 0.0
+            success = bool(self._deal_reached)
             return self._obs_from_state(
                 buyer_accepted=True,
                 negotiation_done=True,
@@ -479,7 +489,7 @@ class SMENegotiatorEnvironment(Environment):
             reward_branch = f"max_rounds_terminal_grader:{terminal_reward:.4f}"
             self._reward_debug_print(reward_branch, step_reward)
             termination_reason = "max_rounds_no_deal"
-            success = terminal_reward > 0.0
+            success = False
 
         return self._obs_from_state(
             buyer_accepted=False,

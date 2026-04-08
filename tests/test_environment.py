@@ -73,7 +73,9 @@ def test_reject_ends_episode_without_reward() -> None:
 
     assert result.done is True
     assert result.buyer_accepted is False
-    assert result.reward == 0.0
+    assert result.reward is not None
+    assert 0.0 < result.reward < 1.0
+    assert result.metadata.get("success") is False
 
 
 def test_choose_action_uses_current_observation() -> None:
@@ -112,4 +114,6 @@ def test_max_rounds_success_flag_matches_terminal_reward() -> None:
         )
 
     assert observation.metadata.get("termination_reason") == "max_rounds_no_deal"
-    assert observation.metadata.get("success") == (observation.reward > 0.0)
+    assert observation.metadata.get("success") is False
+    assert observation.reward is not None
+    assert 0.0 < observation.reward < 1.0
