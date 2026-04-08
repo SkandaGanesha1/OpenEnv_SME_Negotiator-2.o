@@ -165,13 +165,13 @@ def _format_step_error(llm_error: str | None) -> str:
 
 
 def _format_score_for_log(score: float) -> str:
-    """Format score safely so strict-open values are never displayed as 0.00/1.00."""
-    return f"{_strict_unit_interval(score):.6f}"
+    """Format score to 2 decimal places per mandatory rules."""
+    return f"{_strict_unit_interval(score):.2f}"
 
 
-def _format_end_line(success: bool, steps: int, rewards: List[float]) -> str:
+def _format_end_line(success: bool, steps: int, score: float, rewards: List[float]) -> str:
     return (
-        f'[END] success={"true" if success else "false"} steps={steps} '
+        f'[END] success={"true" if success else "false"} steps={steps} score={_format_score_for_log(score)} '
         f'rewards={",".join(_format_score_for_log(r) for r in rewards)}'
     )
 
@@ -711,7 +711,7 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             success = bool(result.done and final_score > 0.0)
     finally:
         total_reward = sum(all_rewards)
-        print(_format_end_line(success, round_number, all_rewards), flush=True)
+        print(_format_end_line(success, round_number, final_score, all_rewards), flush=True)
 
     return {
         "difficulty": difficulty,
