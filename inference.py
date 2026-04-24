@@ -19,6 +19,12 @@ from openenv.core.client_types import StepResult
 from sme_negotiator_env.client import SMENegotiatorEnv
 from sme_negotiator_env.llm_action_parser import parse_llm_text_to_negotiation_action
 from sme_negotiator_env.models import NegotiationAction, NegotiationObservation
+from sme_negotiator_env.prompting import (
+    action_payload_to_model_action,
+    clip_ascii_text,
+    format_observation_text,
+    observation_to_dict,
+)
 
 from server.environment import SMENegotiatorEnvironment
 
@@ -146,10 +152,7 @@ Do NOT reduce payment_days by 1-2 per step — jump directly to your target.
 
 
 def _clip_ascii_text(value: Any, max_len: int) -> str:
-    text = str(value)
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 1] + "~"
+    return clip_ascii_text(value, max_len)
 
 
 def _serialize_step_action(action: NegotiationAction) -> str:
@@ -353,11 +356,10 @@ class InProcessSMENegotiatorBridge:
 
 
 def _observation_to_dict(observation: Any) -> Dict[str, Any]:
-    if hasattr(observation, "model_dump"):
-        return observation.model_dump()
-    if isinstance(observation, dict):
-        return observation
-    return dict(observation)
+    return observation_to_dict(observation)
+
+
+format_observation = format_observation_text
 
 
 def format_observation(obs: Dict[str, Any]) -> str:
@@ -372,6 +374,9 @@ def format_observation(obs: Dict[str, Any]) -> str:
         f"SupplierPayDays={obs.get('sme_supplier_payment_days')} | InterestAnnual={obs.get('interest_rate_annual')} | "
         f"BuyerPower={obs.get('buyer_power_score')}"
     )
+
+
+format_observation = format_observation_text
 
 
 def _safe_fallback_action(observation: Any, task_name: str = "", round_number: int = 0) -> Dict[str, Any]:
@@ -505,6 +510,10 @@ def get_agent_action(observation: Dict[str, Any], history: List[dict], task_name
             "use_treds": bool(action.get("use_treds", False)),
             "reason": _clip_ascii_text(action.get("reason", ""), _MAX_REASON_CHARS),
         }
+        if "tool_name" in action:
+            out["tool_name"] = action.get("tool_name")
+        if "tool_args" in action:
+            out["tool_args"] = action.get("tool_args")
         if "propose_late_payment_penalty_clause" in action:
             out["propose_late_payment_penalty_clause"] = bool(action.get("propose_late_payment_penalty_clause"))
         if "propose_dynamic_discounting" in action:
@@ -572,24 +581,22 @@ def _coerce_hard_accept_after_propose(
 
 def _to_model_action(action_payload: Dict[str, Any], observation: Any) -> NegotiationAction:
     action_type = str(action_payload.get("action_type", "propose")).lower()
-    if action_type not in {"propose", "accept", "reject"}:
+    if action_type not in {"propose", "accept", "reject", "simulate_plan", "advance_period", "tool"}:
         action_type = "propose"
 
     price = float(action_payload.get("price", observation.buyer_price))
     payment_days = int(action_payload.get("payment_days", observation.buyer_days))
     use_treds = bool(action_payload.get("use_treds", False))
-    reason = _clip_ascii_text(action_payload.get("reason", "Model-selected action"), _MAX_REASON_CHARS)
-
-    return NegotiationAction(
-        action_type=action_type,
-        price=round(price, 2),
-        payment_days=payment_days,
-        use_treds=use_treds,
-        reason=reason,
-        propose_late_payment_penalty_clause=bool(action_payload.get("propose_late_payment_penalty_clause", False)),
-        propose_dynamic_discounting=bool(action_payload.get("propose_dynamic_discounting", False)),
-        dynamic_discount_annual_rate=float(action_payload.get("dynamic_discount_annual_rate", 0.0)),
+    normalized_payload = dict(action_payload)
+    normalized_payload["action_type"] = action_type
+    normalized_payload["price"] = round(price, 2)
+    normalized_payload["payment_days"] = payment_days
+    normalized_payload["use_treds"] = use_treds
+    normalized_payload["reason"] = _clip_ascii_text(
+        action_payload.get("reason", "Model-selected action"),
+        _MAX_REASON_CHARS,
     )
+    return action_payload_to_model_action(normalized_payload, observation)
 
 
 EnvClient = Union[SMENegotiatorEnv, InProcessSMENegotiatorBridge]

@@ -86,3 +86,5 @@ temp/
 stdout.txt
 stderr.txt
 logo/
+
+.test_tmp/

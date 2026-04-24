@@ -42,6 +42,7 @@ make docker-run                 # http://127.0.0.1:7860
 | [README.md](README.md) | Full project overview + baseline section | 10 min |
 | [SETUP.md](SETUP.md) | Step-by-step installation guide | 5 min |
 | [EVALUATION.md](EVALUATION.md) | How to measure & optimize performance | 15 min |
+| [docs/SELF_PLAY.md](docs/SELF_PLAY.md) | Stage 6 self-play and simulated experts | 8 min |
 
 ### Reference Documents
 
@@ -50,6 +51,24 @@ make docker-run                 # http://127.0.0.1:7860
 | [pyproject.toml](pyproject.toml) | Project metadata & dependencies | Building/publishing |
 | openenv.yaml | Environment config | Customizing task parameters |
 | Makefile | Development commands | Running tasks |
+| [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb) | Tiny in-process GRPO demo | Judge demo / onboarding |
+
+## Submission Shortcuts
+
+- Live baseline mode:
+  - `server.app`
+  - `openenv.yaml`
+  - `payment-terms-easy`, `payment-terms-medium`, `payment-terms-hard`
+- In-process liquidity and RL mode:
+  - `server/environment.py`
+  - `rl/bridge.py`
+  - `rl/demo.py`
+  - `rl/train_grpo_trl.py`
+  - `rl/train_grpo_unsloth.py`
+- Reward docs and artifacts:
+  - [EVALUATION.md](EVALUATION.md)
+  - [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg)
+  - [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
 
 ### Hackathon Spec Alignment
 

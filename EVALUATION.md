@@ -2,6 +2,108 @@
 
 Complete guide for measuring and optimizing agent performance during the hackathon.
 
+## Reward Modes
+
+There are now two intentionally separate reward paths in the repository:
+
+- Legacy Round 1 evaluation path
+  - The live OpenEnv server still serves `SMENegotiatorEnvironment`.
+  - Current `payment-terms-easy`, `payment-terms-medium`, and
+    `payment-terms-hard` tasks keep their existing `TASK_GRADERS` semantics.
+  - This path remains the compatibility baseline for hackathon evaluation.
+- Stage 2 liquidity RL path
+  - `SMELiquidityEnvironment` layers a world model and trajectory buffer around
+    the legacy single-deal simulator.
+  - Non-terminal rewards are `lambda * latest_shaping_reward`.
+  - Terminal rewards are `latest_verifiable_reward + lambda * latest_shaping_reward`.
+  - Full-episode RL totals are available through
+    `compute_total_sme_reward(world_state, trajectory, lambda_shaping=0.1)`.
+- Stage 4 tool-using liquidity path
+  - `SMELiquidityEnvironment` additionally supports `action_type="tool"` for
+    deterministic internal workflow tools.
+  - `QUERY_TREDS`, `CHECK_COMPLIANCE`, and `RUN_CASHFLOW_SIM` are informational
+    tools; they do not mutate the economic world state.
+  - Stage 4 keeps the Stage 2 terminal reward formulas unchanged and adds only
+    a tiny deterministic liquidity-only tool bonus/penalty on subsequent
+    negotiation steps.
+  - Tool outputs are exposed only on `LiquidityObservation` and liquidity state;
+    the live legacy OpenEnv observation contract remains unchanged.
+- External-only rubric hook
+  - `compute_rubric_score(episode_log)` is reserved for RL training scripts and
+    is not called from `step()` or any deterministic grader.
+
+Stage 2 also adds config-only stress tasks for the liquidity environment:
+
+- `liquidity-stress-medium`
+- `liquidity-correlation-hard`
+
+These are not wired into `openenv.yaml` yet, so they do not alter the live
+OpenEnv evaluation manifest.
+
+## Stage 4 Tool Notes
+
+- `RUN_CASHFLOW_SIM` is the enterprise-tool wrapper around the Stage 3 pure
+  simulator and returns the same projection lists plus summary fields.
+- Tool use is intended for the liquidity path only; the live OpenEnv server
+  still serves `SMENegotiatorEnvironment`.
+- `compute_rubric_score(...)` remains external-only and is still not invoked by
+  the environment core.
+
+## Stage 5 RL Integration Notes
+
+Stage 5 adds training-side integration only.
+
+- `rl/bridge.py` exposes a zero-arg `environment_factory` wrapper around
+  `SMELiquidityEnvironment` for GRPO/OpenEnv-style training loops.
+- `rl/train_grpo_trl.py` is the canonical TRL script.
+- `rl/train_grpo_unsloth.py` is an optional accelerated path using Unsloth plus
+  the same bridge and reward aggregation.
+- Base reward remains deterministic:
+  `compute_total_sme_reward(...)` over deal trajectories plus already-observed
+  deterministic tool bonuses.
+- Rubric scoring, when used, stays outside environment code and is applied only
+  as a training-side overlay.
+
+## Stage 6 Self-Improvement Notes
+
+Stage 6 adds self-play, curriculum, and simulated-expert overlays only on the
+training path.
+
+- self-play opponents are injected policies with heuristic fallback
+- curriculum changes only supported real knobs: macro horizon plus deterministic
+  buyer/financier volatility
+- persona-weighted rubric overlays and preference-data generation remain
+  external-only
+
+The environment-side grading contract remains deterministic and unchanged.
+
+## Stage 7 Submission Assets
+
+Stage 7 adds productization and judge-facing glue only.
+
+- `openenv.yaml` stays aligned with the live single-deal server contract
+- `README.md` now separates live baseline usage from in-process liquidity/RL usage
+- `rl/demo.py` and `notebooks/colab_grpo_sme_liquidity.ipynb` provide a tiny
+  GRPO demo path for onboarding and judge review
+- `docs/img/tiny_grpo_reward_curve.svg` is an illustrative tiny-run artifact,
+  not a benchmark claim
+
+## Reward Design Summary
+
+- Terminal deterministic reward:
+  - solvency / no default
+  - liquidity-buffer adequacy
+  - NPV uplift versus baseline
+  - legal/payment-term compliance
+- Deterministic shaping reward:
+  - payment-term improvement
+  - working-capital-gap reduction
+  - receivable/payable alignment improvement
+- Optional training-only overlays:
+  - rubric scoring
+  - persona-weighted reward
+  - self-play / curriculum logging
+
 ## Quick Performance Check
 
 ### Run Baseline Evaluation

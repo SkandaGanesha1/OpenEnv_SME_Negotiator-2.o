@@ -36,6 +36,15 @@ class TaskConfig:
     # Which grader key in ``sme_negotiator_env.graders.TASK_GRADERS``
     grader_id: str
     context_note: str = ""
+    minimum_cash_buffer_ratio: float = 0.25
+    initial_cash_balance_ratio: float = 0.5
+    credit_limit_multiplier: float = 1.5
+    primary_buyer_default_tendency: float = 0.15
+    secondary_buyer_default_tendency: Optional[float] = None
+    financier_capital_multiplier: float = 10.0
+    financier_risk_appetite: float = 0.6
+    legal_max_payment_days: int = 45
+    reward_lambda_shaping: float = 0.1
 
 
 def default_task_config(task_id: str) -> TaskConfig:
@@ -128,6 +137,87 @@ def default_task_config(task_id: str) -> TaskConfig:
             grader_id="payment-terms-hard",
             context_note="Consortium of two buyers; leverage is high — use dynamic discounting.",
         )
+    if task_id == "liquidity-stress-medium":
+        return TaskConfig(
+            name="liquidity-stress-medium",
+            description=(
+                "Stage 2 liquidity stress: a thin-cash SME faces a primary slow payer, a riskier secondary buyer, "
+                "and modest financing capacity."
+            ),
+            difficulty="medium",
+            initial_buyer_price=99.0,
+            initial_buyer_days=75,
+            max_rounds=14,
+            volume=1500,
+            cost_threshold=82.0,
+            liquidity_threshold=40,
+            concede_low=0.005,
+            concede_high=0.014,
+            day_floor=35,
+            day_step_low=2,
+            day_step_high=5,
+            sme_monthly_revenue=400_000.0,
+            current_payment_terms_days=85,
+            sme_supplier_payment_days=25,
+            interest_rate_annual=0.24,
+            buyer_power_score=0.72,
+            secondary_buyer_power=0.76,
+            negotiation_round_start=0,
+            grader_id="payment-terms-medium",
+            context_note=(
+                "Thin cash buffers and tighter supplier cycles make solvency fragile; the secondary buyer is riskier "
+                "and financing capacity is limited."
+            ),
+            initial_cash_balance_ratio=0.25,
+            credit_limit_multiplier=1.0,
+            minimum_cash_buffer_ratio=0.20,
+            primary_buyer_default_tendency=0.25,
+            secondary_buyer_default_tendency=0.35,
+            financier_capital_multiplier=2.0,
+            financier_risk_appetite=0.45,
+            legal_max_payment_days=45,
+            reward_lambda_shaping=0.1,
+        )
+    if task_id == "liquidity-correlation-hard":
+        return TaskConfig(
+            name="liquidity-correlation-hard",
+            description=(
+                "Stage 2 correlated-risk hard mode: both buyers are slow and risky, the SME has very thin buffers, "
+                "and the financier cannot absorb every invoice."
+            ),
+            difficulty="hard",
+            initial_buyer_price=96.0,
+            initial_buyer_days=95,
+            max_rounds=18,
+            volume=6000,
+            cost_threshold=79.0,
+            liquidity_threshold=35,
+            concede_low=0.002,
+            concede_high=0.008,
+            day_floor=30,
+            day_step_low=1,
+            day_step_high=3,
+            sme_monthly_revenue=450_000.0,
+            current_payment_terms_days=105,
+            sme_supplier_payment_days=20,
+            interest_rate_annual=0.28,
+            buyer_power_score=0.90,
+            secondary_buyer_power=0.88,
+            negotiation_round_start=0,
+            grader_id="payment-terms-hard",
+            context_note=(
+                "Correlated buyer risk, tight supplier terms, and limited financing force solvency and NPV trade-offs."
+            ),
+            initial_cash_balance_ratio=0.15,
+            credit_limit_multiplier=0.8,
+            minimum_cash_buffer_ratio=0.25,
+            primary_buyer_default_tendency=0.38,
+            secondary_buyer_default_tendency=0.42,
+            financier_capital_multiplier=0.75,
+            financier_risk_appetite=0.35,
+            legal_max_payment_days=45,
+            reward_lambda_shaping=0.1,
+        )
     raise KeyError(f"Unknown task_id: {task_id}")
 
 
@@ -142,6 +232,8 @@ TASK_REGISTRY: Final[Dict[str, TaskConfig]] = {
     "payment-terms-easy": default_task_config("payment-terms-easy"),
     "payment-terms-medium": default_task_config("payment-terms-medium"),
     "payment-terms-hard": default_task_config("payment-terms-hard"),
+    "liquidity-stress-medium": default_task_config("liquidity-stress-medium"),
+    "liquidity-correlation-hard": default_task_config("liquidity-correlation-hard"),
 }
 
 

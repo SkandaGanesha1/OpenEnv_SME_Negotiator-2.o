@@ -384,6 +384,18 @@ If you also want dev dependencies:
 uv sync --extra dev
 ```
 
+If you also want the Stage 5 RL training stack:
+
+```bash
+uv sync --extra rl
+```
+
+For the optional Unsloth path:
+
+```bash
+uv sync --extra rl --extra rl-unsloth
+```
+
 ### Run the environment server
 
 ```bash
@@ -414,6 +426,137 @@ uv run python inference.py
 ```
 
 Results are written to `inference_results.json`.
+
+## Stage 5 RL Training
+
+Stage 5 adds an in-process RL training layer under `rl/` without changing the
+live OpenEnv server wiring:
+
+- `server.app` still serves `SMENegotiatorEnvironment`
+- `openenv.yaml` is unchanged
+- `rl/bridge.py` trains directly against `SMELiquidityEnvironment`
+- rubric scoring remains optional and training-side only
+
+Dry-run the canonical TRL setup:
+
+```bash
+uv run --extra rl python -m rl.train_grpo_trl --dry-run
+```
+
+Dry-run the optional Unsloth setup:
+
+```bash
+uv run --extra rl --extra rl-unsloth python -m rl.train_grpo_unsloth --dry-run
+```
+
+## Stage 6 Self-Play
+
+Stage 6 adds three training-time self-improvement layers on the liquidity path:
+
+- policy-snapshot self-play for buyer and financier opponents
+- adaptive curriculum over macro horizon and deterministic volatility
+- persona-weighted external rubric overlays plus a minimal preference-data path
+
+These features live under `rl/` and `docs/SELF_PLAY.md`. They do not change:
+
+- `server.app`
+- `openenv.yaml`
+- live OpenEnv behavior
+- deterministic in-env reward and grader semantics
+
+## Modes Of Use
+
+| Mode | Entry Point | What It Covers |
+|---|---|---|
+| Live OpenEnv baseline | `server.app` + `openenv.yaml` | Legacy single-deal `payment-terms-*` tasks over the public HTTP/WebSocket API |
+| In-process liquidity training | `rl/bridge.py` + `SMELiquidityEnvironment` | Multi-deal world state, macro periods, deterministic tools, GRPO training, self-play, curriculum |
+
+## Hackathon Theme Map
+
+| Layer | Theme | What This Repo Implements |
+|---|---|---|
+| Core environment | Theme 1 | Multi-agent liquidity world with SME, buyers, financier, and deal state |
+| Long horizon | Theme 2 | Macro periods, cashflow settlement, defaults, and deterministic planning |
+| Professional workflow tools | Theme 3.1 | `QUERY_TREDS`, `CHECK_COMPLIANCE`, `RUN_CASHFLOW_SIM` as explicit actions |
+| Self-improvement | Theme 4 | Self-play opponents, curriculum, and persona-based rubric overlays in RL scripts |
+
+## Architecture
+
+```text
+                         LIVE OPENENV SERVER
+                   server.app -> SMENegotiatorEnvironment
+                              |
+                              v
+                   payment-terms-easy / medium / hard
+
+
+                         IN-PROCESS RL / DEMO PATH
+                   rl.bridge / rl.demo / TRL / Unsloth
+                              |
+                              v
+                    +-----------------------------+
+                    |     SMELiquidityEnvironment |
+                    |-----------------------------|
+                    | WorldState                  |
+                    | - SME accounts              |
+                    | - Buyers                    |
+                    | - Financier                 |
+                    | - Deals across periods      |
+                    +-----------------------------+
+                      |            |            |
+                      v            v            v
+                 Negotiation   Cashflow      Compliance
+                   engine      settlement      checks
+                      |            |            |
+                      +------------+------------+
+                                   |
+                                   v
+                     Deterministic tools and pure graders
+```
+
+## Reward Design
+
+- Deterministic terminal RLVR reward is computed from verifiable outcome terms:
+  solvency, liquidity-buffer adequacy, NPV versus baseline, and legal compliance.
+- Deterministic shaping rewards capture local negotiation progress such as
+  reducing working-capital gap, improving payment terms, and better receivable /
+  payable alignment.
+- Optional rubric overlays and persona-weighted rewards exist only in the RL
+  orchestration layer and never change the environment's deterministic grading.
+
+For more detail, see [EVALUATION.md](EVALUATION.md).
+
+## Results
+
+Illustrative Stage 7 submission artifacts live in the repo so judges can see
+the training/demo path without running a long experiment.
+
+![Illustrative tiny GRPO reward curve](docs/img/tiny_grpo_reward_curve.svg)
+
+Example before/after trajectory excerpt (illustrative tiny-run snippet, not a
+benchmark claim):
+
+```text
+Before training / heuristic:
+- opens first deal
+- queries TReDS when tenor is outside liquidity comfort
+- accepts current buyer terms to avoid macro default
+
+After a tiny GRPO demo:
+- queries TReDS earlier on stressed deals
+- resolves open deals with fewer wasted macro steps
+- advances periods only after clearing the immediate negotiation queue
+```
+
+## Colab Demo
+
+Stage 7 adds a notebook-first demo path:
+
+- notebook: `notebooks/colab_grpo_sme_liquidity.ipynb`
+- helper API: `rl/demo.py`
+- tiny trainer helper: `rl.demo.demo_train_grpo(...)`
+
+The notebook stays fully in process and does not depend on `server.app`.
 
 ---
 

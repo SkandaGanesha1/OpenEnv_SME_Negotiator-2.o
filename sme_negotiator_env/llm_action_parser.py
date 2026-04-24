@@ -150,7 +150,7 @@ def parse_llm_text_to_negotiation_action(
 
 def _dict_to_action(data: Dict[str, Any], obs: Dict[str, Any]) -> NegotiationAction:
     action_type = str(data.get("action_type", "propose")).lower()
-    if action_type not in {"propose", "accept", "reject"}:
+    if action_type not in {"propose", "accept", "reject", "simulate_plan", "advance_period", "tool"}:
         action_type = "propose"
     price = float(data.get("price", obs.get("buyer_price", 100.0)))
     payment_days = int(data.get("payment_days", obs.get("buyer_days", 45)))
@@ -160,4 +160,6 @@ def _dict_to_action(data: Dict[str, Any], obs: Dict[str, Any]) -> NegotiationAct
         payment_days=payment_days,
         use_treds=bool(data.get("use_treds", False)),
         reason=str(data.get("reason") or "") or None,
+        tool_name=data.get("tool_name"),
+        tool_args=data.get("tool_args"),
     )
