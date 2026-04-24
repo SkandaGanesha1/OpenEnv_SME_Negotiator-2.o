@@ -10,12 +10,14 @@ import math
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 from dotenv import load_dotenv
 from openai import OpenAI
 from openenv.core.client_types import StepResult
 
+from rl.bridge import format_observation as format_liquidity_observation
+from rl.bridge import make_environment_factory, parse_action as parse_liquidity_action
 from sme_negotiator_env.client import SMENegotiatorEnv
 from sme_negotiator_env.llm_action_parser import parse_llm_text_to_negotiation_action
 from sme_negotiator_env.models import NegotiationAction, NegotiationObservation
@@ -24,6 +26,11 @@ from sme_negotiator_env.prompting import (
     clip_ascii_text,
     format_observation_text,
     observation_to_dict,
+)
+from sme_negotiator_env.reward_reporting import (
+    build_legacy_step_diagnostics,
+    build_shadow_reward_report,
+    reward_branch as legacy_reward_branch,
 )
 
 from server.environment import SMENegotiatorEnvironment
@@ -89,10 +96,48 @@ def _llm_url_looks_local(url: str) -> bool:
     u = url.lower()
     return "127.0.0.1" in u or "localhost" in u
 
+
+def _normalize_inference_env_mode(value: str) -> str:
+    mode = (value or DEFAULT_INFERENCE_ENV_MODE).strip().lower()
+    if mode not in {"legacy", "liquidity"}:
+        return DEFAULT_INFERENCE_ENV_MODE
+    return mode
+
+
+def _inference_env_mode() -> str:
+    return _normalize_inference_env_mode(os.getenv("INFERENCE_ENV_MODE", DEFAULT_INFERENCE_ENV_MODE))
+
+
+def _inference_reward_mode() -> str:
+    mode = (os.getenv("INFERENCE_REWARD_MODE", DEFAULT_INFERENCE_REWARD_MODE) or DEFAULT_INFERENCE_REWARD_MODE).strip()
+    if mode not in {"legacy", "legacy+shadow_rlvr", "legacy+full_debug"}:
+        return DEFAULT_INFERENCE_REWARD_MODE
+    return mode
+
+
+def _openenv_in_process_enabled() -> bool:
+    return _env_truthy("OPENENV_IN_PROCESS", False)
+
+
+def _runtime_banner(env_mode: str) -> str:
+    if env_mode == "liquidity":
+        return "LIQUIDITY_IN_PROCESS_ADVANCED"
+    return "LEGACY_LIVE_BASELINE"
+
+
+def _liquidity_task_for_difficulty(difficulty: str) -> str:
+    explicit = os.getenv("INFERENCE_LIQUIDITY_TASK", "").strip()
+    if explicit:
+        return explicit
+    return "liquidity-correlation-hard" if str(difficulty).lower() == "hard" else "liquidity-stress-medium"
+
 # OpenEnv simulation server URL only (set OPENENV_BASE_URL when using HTTP/WebSocket client)
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://127.0.0.1:7860")
 # If true, run SME negotiation in-process (no uv run server). Default false so inference matches deployed HTTP API.
 OPENENV_IN_PROCESS = os.getenv("OPENENV_IN_PROCESS", "0").strip().lower() in ("1", "true", "yes", "on")
+
+DEFAULT_INFERENCE_ENV_MODE = "legacy"
+DEFAULT_INFERENCE_REWARD_MODE = "legacy+shadow_rlvr"
 
 NEGOTIATION_SYSTEM_PROMPT = """
 You represent an SME supplier in B2B negotiation (motivation: Razorpay Fix My Itch —
@@ -148,6 +193,30 @@ a price below cost_threshold — this causes reward penalty.
 CRITICAL — negotiation speed:
 You have only 10-16 rounds total. Make AGGRESSIVE proposals.
 Do NOT reduce payment_days by 1-2 per step — jump directly to your target.
+""".strip()
+
+LIQUIDITY_SYSTEM_PROMPT = """
+You represent an SME treasury agent operating in a long-horizon liquidity environment.
+Respond ONLY with valid JSON. Supported action types are:
+- propose
+- accept
+- reject
+- tool
+- simulate_plan
+- advance_period
+
+When action_type is:
+- propose / accept: include price, payment_days, use_treds, optionally deal_id and negotiation clause fields.
+- reject: include deal_id when available and a short reason.
+- tool: include tool_name in {QUERY_TREDS, CHECK_COMPLIANCE, RUN_CASHFLOW_SIM} and tool_args.
+- simulate_plan: include simulation_plan and optionally simulation_horizon.
+- advance_period: no extra fields required.
+
+Treasury priorities:
+- Avoid default and preserve positive NPV.
+- Use tools when tenor risk or compliance risk is unclear.
+- Advance macro periods only when open negotiation work is exhausted for now.
+- Include deal_id for deal-specific actions whenever possible.
 """.strip()
 
 
@@ -355,6 +424,98 @@ class InProcessSMENegotiatorBridge:
         return StepResult(observation=obs, reward=obs.reward, done=bool(obs.done))
 
 
+class InProcessLiquidityBridge:
+    """Async-compatible bridge over the existing Stage 5/6 liquidity wrapper."""
+
+    def __init__(self) -> None:
+        wrapper_cls = make_environment_factory()
+        self._wrapper = wrapper_cls()
+
+    async def __aenter__(self) -> "InProcessLiquidityBridge":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    @property
+    def env(self) -> Any:
+        return self._wrapper.env
+
+    def summarize_episode(self) -> Any:
+        return self._wrapper.summarize_episode()
+
+    def build_episode_log(self) -> str:
+        return self._wrapper.build_episode_log()
+
+    async def reset(self, **kwargs: Any) -> StepResult[Any]:
+        self._wrapper.reset(**kwargs)
+        observation = self._wrapper.last_observation
+        assert observation is not None
+        return StepResult(observation=observation, reward=observation.reward, done=bool(observation.done))
+
+    async def step(self, action: NegotiationAction, **kwargs: Any) -> StepResult[Any]:
+        action_type = str(action.action_type).lower()
+        if action_type == "propose":
+            self._wrapper.propose(
+                price=float(action.price),
+                payment_days=int(action.payment_days),
+                use_treds=bool(action.use_treds),
+                deal_id=action.deal_id,
+                reason=action.reason,
+                propose_late_payment_penalty_clause=bool(action.propose_late_payment_penalty_clause),
+                propose_dynamic_discounting=bool(action.propose_dynamic_discounting),
+                dynamic_discount_annual_rate=float(action.dynamic_discount_annual_rate),
+            )
+        elif action_type == "accept":
+            self._wrapper.accept(
+                price=float(action.price),
+                payment_days=int(action.payment_days),
+                use_treds=bool(action.use_treds),
+                deal_id=action.deal_id,
+                reason=action.reason,
+                propose_late_payment_penalty_clause=bool(action.propose_late_payment_penalty_clause),
+                propose_dynamic_discounting=bool(action.propose_dynamic_discounting),
+                dynamic_discount_annual_rate=float(action.dynamic_discount_annual_rate),
+            )
+        elif action_type == "reject":
+            self._wrapper.reject(deal_id=action.deal_id, reason=action.reason)
+        elif action_type == "tool":
+            tool_name = str(action.tool_name or "").upper()
+            if tool_name == "QUERY_TREDS":
+                invoice_id = str((action.tool_args or {}).get("invoice_id") or action.deal_id or "")
+                self._wrapper.query_treds(invoice_id=invoice_id, deal_id=action.deal_id)
+            elif tool_name == "CHECK_COMPLIANCE":
+                contract_id = str((action.tool_args or {}).get("contract_id") or action.deal_id or "")
+                self._wrapper.check_compliance(contract_id=contract_id, deal_id=action.deal_id)
+            elif tool_name == "RUN_CASHFLOW_SIM":
+                tool_args = action.tool_args or {}
+                self._wrapper.run_cashflow_sim(
+                    plan=tool_args.get("plan") if isinstance(tool_args.get("plan"), dict) else {},
+                    horizon=int(tool_args.get("horizon")) if tool_args.get("horizon") is not None else None,
+                    deal_id=action.deal_id,
+                )
+            else:
+                raise ValueError(f"Unsupported tool_name for liquidity inference: {tool_name!r}")
+        elif action_type == "simulate_plan":
+            self._wrapper._apply_action(  # type: ignore[attr-defined]
+                NegotiationAction(
+                    action_type="simulate_plan",
+                    simulation_plan=action.simulation_plan or {},
+                    simulation_horizon=action.simulation_horizon,
+                    deal_id=action.deal_id,
+                    reason=action.reason,
+                )
+            )
+        elif action_type == "advance_period":
+            self._wrapper.advance_period()
+        else:
+            raise ValueError(f"Unsupported liquidity action type: {action_type!r}")
+
+        observation = self._wrapper.last_observation
+        assert observation is not None
+        return StepResult(observation=observation, reward=observation.reward, done=bool(observation.done))
+
+
 def _observation_to_dict(observation: Any) -> Dict[str, Any]:
     return observation_to_dict(observation)
 
@@ -407,6 +568,37 @@ def _safe_fallback_action(observation: Any, task_name: str = "", round_number: i
         "dynamic_discount_annual_rate": 0.02 if is_hard else 0.0,
         "propose_late_payment_penalty_clause": is_medium,
     }
+
+
+def _safe_liquidity_fallback_action(observation: Any) -> NegotiationAction:
+    obs_dict = _observation_to_dict(observation) if not isinstance(observation, dict) else observation
+    open_deal_ids = list(obs_dict.get("open_deal_ids") or [])
+    active_deal_id = obs_dict.get("active_deal_id") or (open_deal_ids[0] if open_deal_ids else None)
+
+    if not open_deal_ids:
+        return NegotiationAction(action_type="advance_period", reason="No open deals remain in this macro period.")
+
+    buyer_days = int(obs_dict.get("buyer_days", 0) or 0)
+    liquidity_threshold = int(obs_dict.get("liquidity_threshold", 0) or 0)
+    buyer_price = float(obs_dict.get("buyer_price", 0.0) or 0.0)
+
+    if obs_dict.get("last_tool_name") != "QUERY_TREDS" and buyer_days > liquidity_threshold + 10:
+        return NegotiationAction(
+            action_type="tool",
+            deal_id=str(active_deal_id),
+            tool_name="QUERY_TREDS",
+            tool_args={"invoice_id": str(active_deal_id), "deal_id": str(active_deal_id)},
+            reason="Fallback: inspect TReDS quote before accepting long tenor.",
+        )
+
+    return NegotiationAction(
+        action_type="accept",
+        deal_id=str(active_deal_id),
+        price=round(buyer_price, 2),
+        payment_days=buyer_days,
+        use_treds=bool(buyer_days > liquidity_threshold),
+        reason="Fallback: accept deterministic current terms to progress the episode.",
+    )
 
 
 def _task_hint(task_name: str, observation: Dict[str, Any]) -> str:
@@ -527,6 +719,27 @@ def get_agent_action(observation: Dict[str, Any], history: List[dict], task_name
         return parsed.model_dump()
 
 
+def get_liquidity_agent_action(observation: Dict[str, Any], history: List[dict], task_name: str) -> NegotiationAction:
+    user_message = (
+        f"Task={task_name}\n"
+        f"Current liquidity observation:\n{format_liquidity_observation(observation)}\n"
+        "Return only JSON."
+    )
+
+    messages = [{"role": "system", "content": LIQUIDITY_SYSTEM_PROMPT}] + history + [
+        {"role": "user", "content": user_message}
+    ]
+
+    completion = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        temperature=0.2,
+        max_tokens=220,
+    )
+    content = completion.choices[0].message.content
+    return parse_liquidity_action(str(content or ""), observation)
+
+
 def _parse_last_assistant_action(history: List[dict]) -> Dict[str, Any] | None:
     for m in reversed(history):
         if m.get("role") != "assistant":
@@ -599,7 +812,112 @@ def _to_model_action(action_payload: Dict[str, Any], observation: Any) -> Negoti
     return action_payload_to_model_action(normalized_payload, observation)
 
 
-EnvClient = Union[SMENegotiatorEnv, InProcessSMENegotiatorBridge]
+def _legacy_final_state_from_env(env: Any) -> Optional[Any]:
+    inner_env = getattr(env, "_env", None)
+    return getattr(inner_env, "state", None)
+
+
+def _print_legacy_step_debug(
+    *,
+    observation: Any,
+    reward: float,
+    last_valid_proposal: Optional[dict[str, Any]],
+) -> None:
+    diagnostics = build_legacy_step_diagnostics(
+        observation,
+        reward=reward,
+        last_valid_proposal=last_valid_proposal,
+    )
+    print(
+        "[REWARD_DEBUG] "
+        f"legacy_step_reward={diagnostics.legacy_step_reward:.4f} "
+        f'legacy_reward_branch="{diagnostics.legacy_reward_branch}" '
+        f"close_zone_flag={'true' if diagnostics.close_zone_flag else 'false'}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _print_shadow_reward_summary(report_mode: str, report: Any, final_score: float) -> None:
+    print(
+        "[REWARD_SUMMARY] "
+        f"legacy_terminal_score={final_score:.4f} "
+        f"shadow_verifiable_reward={report.shadow_verifiable_reward:.4f} "
+        f"shadow_total_sme_reward={report.shadow_total_sme_reward:.4f} "
+        f"npv_delta_vs_baseline={report.npv_delta_vs_baseline:.4f} "
+        f"effective_receivable_days={report.effective_receivable_days} "
+        f"legal_max_payment_days={report.legal_max_payment_days} "
+        f"compliance_within_legal_cap={'true' if report.compliance_within_legal_cap else 'false'} "
+        f"compliance_with_penalty_exception={'true' if report.compliance_with_penalty_exception else 'false'}",
+        file=sys.stderr,
+        flush=True,
+    )
+    if report_mode == "legacy+full_debug":
+        shaping = ",".join(f"{value:.4f}" for value in report.shadow_shaping_rewards) or "none"
+        print(
+            "[REWARD_DEBUG] "
+            f"shadow_shaping_rewards={shaping} "
+            f"shadow_shaping_total={report.shadow_shaping_total:.4f} "
+            f"default_flag={'true' if report.default_flag else 'false'} "
+            f"missed_supplier_payment={'true' if report.missed_supplier_payment else 'false'} "
+            f"cash_balance={report.cash_balance:.2f} "
+            f"required_minimum_cash={report.required_minimum_cash:.2f} "
+            f"current_utilization={report.current_utilization:.2f} "
+            f"credit_limit={report.credit_limit:.2f}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def _print_liquidity_step_debug(observation: Any) -> None:
+    obs_dict = _observation_to_dict(observation)
+    metadata = obs_dict.get("metadata") or {}
+    print(
+        "[LIQUIDITY_REWARD] "
+        f"env_reward={float(obs_dict.get('reward', 0.0) or 0.0):.4f} "
+        f"latest_shaping_reward={float(metadata.get('latest_shaping_reward', 0.0) or 0.0):.4f} "
+        f"tool_bonus_applied={float(metadata.get('tool_bonus_applied', 0.0) or 0.0):.4f} "
+        f"latest_verifiable_reward={float(metadata.get('latest_verifiable_reward', 0.0) or 0.0):.4f} "
+        f"reward_branch={json.dumps(str(metadata.get('legacy_reward_branch') or ''))} "
+        f"active_deal_id={json.dumps(obs_dict.get('active_deal_id'))} "
+        f"current_period={obs_dict.get('current_period')}/{obs_dict.get('total_periods')}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _print_liquidity_episode_summary(env: Any) -> dict[str, Any]:
+    summary = {}
+    summarize = getattr(env, "summarize_episode", None)
+    if callable(summarize):
+        episode_summary = summarize()
+        summary = {
+            "base_rl_reward": float(episode_summary.base_rl_reward),
+            "tool_bonus_total": float(episode_summary.tool_bonus_total),
+            "env_reward_total": float(episode_summary.env_reward_total),
+            "success_no_default_positive_npv": bool(episode_summary.success_no_default_positive_npv),
+            "average_final_payment_days": float(episode_summary.average_final_payment_days),
+            "tool_usage_count": int(episode_summary.tool_usage_count),
+            "resolved_deal_count": int(episode_summary.resolved_deal_count),
+            "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
+        }
+        print(
+            "[LIQUIDITY_SUMMARY] "
+            f"base_rl_reward={summary['base_rl_reward']:.4f} "
+            f"tool_bonus_total={summary['tool_bonus_total']:.4f} "
+            f"env_reward_total={summary['env_reward_total']:.4f} "
+            f"success_no_default_positive_npv={'true' if summary['success_no_default_positive_npv'] else 'false'} "
+            f"average_final_payment_days={summary['average_final_payment_days']:.2f} "
+            f"tool_usage_count={summary['tool_usage_count']} "
+            f"resolved_deal_count={summary['resolved_deal_count']} "
+            f"defaulted_sme_count={summary['defaulted_sme_count']}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return summary
+
+
+EnvClient = Union[SMENegotiatorEnv, InProcessSMENegotiatorBridge, InProcessLiquidityBridge]
 
 
 async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, Any]:
