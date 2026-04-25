@@ -512,6 +512,55 @@ def test_reward_function_uses_fifo_compatibility_fallback_after_signature_miss()
     assert pending_buffer.items == []
 
 
+def test_reward_function_uses_prompt_env_fallback_when_pending_buffer_is_empty(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    pending_buffer = PendingRolloutBuffer()
+
+    def _fake_score(prompt, completion, *, fallback_args, env_factory):
+        is_valid = '"action_type":"propose"' in str(completion)
+        reward = 0.6 if is_valid else 0.3
+        return {
+            "episode_summary": EpisodeSummary(
+                episode_completed=True,
+                base_rl_reward=reward,
+                verifiable_reward=reward,
+                total_reward=reward,
+                tool_bonus_total=0.0,
+                env_reward_total=reward,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=35.0,
+                tool_usage_count=1,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+            ),
+            "episode_log": f"log::{prompt}",
+            "raw_completion_text": str(completion),
+            "termination_reason": "prompt_env_fallback",
+            "invalid_parse_fraction": 0.0 if is_valid else 1.0,
+            "contract_score": 0.95 if is_valid else 0.15,
+        }
+
+    monkeypatch.setattr(trl_script, "_score_prompt_completion_via_environment", _fake_score)
+    reward_func = make_reward_function(
+        pending_rollout_buffer=pending_buffer,
+        prompt_env_factory=lambda: object(),
+        prompt_env_args=make_training_args(),
+    )
+
+    rewards = reward_func(
+        prompts=["prompt-a", "prompt-b"],
+        completions=[
+            '{"action_type":"propose","price":95.0,"payment_days":40}',
+            '{"action_type":"proposal","price":95.0,"payment_days":40}',
+        ],
+    )
+
+    assert rewards[0] > rewards[1]
+    assert reward_func.bridge_diagnostics["bridge_miss_count"] == 2
+    assert reward_func.bridge_diagnostics["prompt_env_fallback_count"] == 2
+
+
 def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -> None:
     reward_func = make_reward_function()
 

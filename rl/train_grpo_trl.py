@@ -38,6 +38,7 @@ from rl.episode_logging import EpisodeSummary, combine_rewards
 from rl.opponents import OpponentPolicyManager
 from rl.rubrics import persona_reward
 from rl.self_rewarding_dpo import build_preference_examples, write_preference_dataset
+from sme_negotiator_env.models import NegotiationAction
 from sme_negotiator_env.prompting import conservative_default_action
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -814,15 +815,19 @@ def make_reward_function(
     rubric_weight: float = 0.0,
     summary_buffer: Optional[EpisodeSummaryBuffer] = None,
     pending_rollout_buffer: Optional[PendingRolloutBuffer] = None,
+    prompt_env_factory: Optional[Callable[[], Any]] = None,
+    prompt_env_args: Any = None,
 ) -> Callable[[list[Any]], list[float]]:
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
     warned_non_environment_inputs = False
     warned_pending_bridge_miss = False
     warned_pending_fifo_fallback = False
+    warned_prompt_env_fallback = False
     bridge_diagnostics = {
         "bridge_miss_count": 0,
         "fifo_fallback_count": 0,
         "signature_match_count": 0,
+        "prompt_env_fallback_count": 0,
     }
     bridge_debug_state = {"reward_calls": 0}
 
@@ -980,6 +985,45 @@ def make_reward_function(
                                 f"pending_before={pending_before} pending_after={len(pending_rollout_buffer.items)} "
                                 f"signature_available={signature_available} bridge_mode={bridge_mode}",
                                 flush=True,
+                            )
+                        if prompt_env_factory is not None and prompt_env_args is not None and prompt_batch and completion_batch:
+                            bridge_diagnostics["prompt_env_fallback_count"] = int(
+                                bridge_diagnostics["prompt_env_fallback_count"]
+                            ) + batch_count
+                            nonlocal warned_prompt_env_fallback
+                            if not warned_prompt_env_fallback:
+                                print(
+                                    f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}][WARN] "
+                                    "pending rollout buffer is empty for this TRL build; "
+                                    "scoring prompt/completion batches via prompt-derived environment fallback.",
+                                    flush=True,
+                                )
+                                warned_prompt_env_fallback = True
+                            simulated_batch = [
+                                _score_prompt_completion_via_environment(
+                                    prompt,
+                                    completion,
+                                    fallback_args=prompt_env_args,
+                                    env_factory=prompt_env_factory,
+                                )
+                                for prompt, completion in zip(prompt_batch, completion_batch)
+                            ]
+                            return _reward_from_episode_payloads(
+                                [record["episode_summary"] for record in simulated_batch],
+                                completions_value=list(completion_batch),
+                                episode_logs_value=[str(record.get("episode_log", "")) for record in simulated_batch],
+                                raw_completion_texts_value=[
+                                    str(record.get("raw_completion_text", "")) for record in simulated_batch
+                                ],
+                                invalid_parse_fraction_value=[
+                                    float(record.get("invalid_parse_fraction", 0.0) or 0.0) for record in simulated_batch
+                                ],
+                                termination_reasons_value=[
+                                    str(record.get("termination_reason", "")) for record in simulated_batch
+                                ],
+                                contract_score_value=[
+                                    float(record.get("contract_score", 0.0) or 0.0) for record in simulated_batch
+                                ],
                             )
                         return [round(_strict_invalid_reward(_coerce_completion_text(completion)), 6) for completion in completion_batch]
             else:
@@ -1408,6 +1452,96 @@ def _parse_action_and_validity(raw_text: str, observation: Any, *, strict_json: 
     if strict_json:
         return conservative_default_action(observation), False
     return parse_action(str(raw_text or "").strip(), observation), False
+
+
+def _followup_policy_action(observation: Any, *, step_index: int) -> NegotiationAction:
+    obs = _coerce_observation_dict(observation)
+    open_deal_ids = list(obs.get("open_deal_ids") or [])
+    active_deal_id = obs.get("active_deal_id") or (open_deal_ids[0] if open_deal_ids else None)
+
+    if not open_deal_ids:
+        return NegotiationAction(action_type="advance_period")
+
+    buyer_price = float(obs.get("buyer_price", 0.0) or 0.0)
+    buyer_days = int(obs.get("buyer_days", 0) or 0)
+    cost_threshold = float(obs.get("cost_threshold", 0.0) or 0.0)
+    liquidity_threshold = int(obs.get("liquidity_threshold", buyer_days) or buyer_days)
+    use_treds = bool(buyer_days > liquidity_threshold + 10)
+
+    if step_index >= 1 and buyer_days <= liquidity_threshold and buyer_price >= cost_threshold:
+        return NegotiationAction(
+            action_type="accept",
+            deal_id=active_deal_id,
+            price=buyer_price,
+            payment_days=buyer_days,
+            use_treds=use_treds,
+            reason="Deterministic follow-up policy acceptance",
+        )
+
+    fallback = conservative_default_action(observation)
+    if getattr(fallback, "deal_id", None) is None and active_deal_id is not None:
+        payload = fallback.model_dump(exclude_none=True)
+        payload["deal_id"] = str(active_deal_id)
+        return NegotiationAction(**payload)
+    return fallback
+
+
+def _score_prompt_completion_via_environment(
+    prompt: Any,
+    completion: Any,
+    *,
+    fallback_args: Any,
+    env_factory: Callable[[], Any],
+) -> dict[str, Any]:
+    row = _extract_training_row_from_prompt(prompt, fallback_args)
+    wrapper = env_factory()
+    wrapper.reset(**row)
+
+    completion_text = _coerce_completion_text(completion)
+    first_observation = getattr(wrapper, "last_observation", None)
+    first_contract_score = _completion_format_score(completion_text, first_observation)
+    first_action, was_valid_json = _parse_action_and_validity(completion_text, first_observation, strict_json=True)
+
+    termination_reason = "prompt_env_fallback"
+    action_history = [first_action.model_dump(exclude_none=True)]
+    try:
+        execute_action(wrapper, first_action)
+    except Exception as exc:
+        termination_reason = f"prompt_env_action_error:{exc}"
+    else:
+        max_episode_steps = int(getattr(fallback_args, "max_episode_steps", 24) or 24)
+        for step_index in range(1, max_episode_steps):
+            if bool(getattr(wrapper, "done", False)):
+                break
+            observation = getattr(wrapper, "last_observation", None)
+            if observation is None:
+                termination_reason = "prompt_env_missing_observation"
+                break
+            next_action = _followup_policy_action(observation, step_index=step_index)
+            action_history.append(next_action.model_dump(exclude_none=True))
+            try:
+                execute_action(wrapper, next_action)
+            except Exception as exc:
+                termination_reason = f"prompt_env_followup_error:{exc}"
+                break
+        else:
+            termination_reason = "prompt_env_step_cap"
+
+    final_observation = getattr(wrapper, "last_observation", None)
+    if final_observation is not None:
+        metadata_reason = str((final_observation.metadata or {}).get("termination_reason", "") or "")
+        if metadata_reason:
+            termination_reason = metadata_reason
+
+    return {
+        "episode_summary": wrapper.summarize_episode(),
+        "episode_log": wrapper.build_episode_log(),
+        "raw_completion_text": completion_text,
+        "termination_reason": termination_reason,
+        "invalid_parse_fraction": 0.0 if was_valid_json else 1.0,
+        "contract_score": round(first_contract_score, 6),
+        "parsed_actions": action_history,
+    }
 
 
 def _run_single_rollout_sample(
@@ -2059,6 +2193,8 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
         pending_rollout_buffer=pending_rollout_buffer,
+        prompt_env_factory=components["env_factory"],
+        prompt_env_args=args,
     )
     rollout_func = build_rollout_func(
         args,
