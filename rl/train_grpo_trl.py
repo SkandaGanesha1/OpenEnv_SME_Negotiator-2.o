@@ -509,6 +509,7 @@ def make_reward_function(
     pending_rollout_buffer: Optional[PendingRolloutBuffer] = None,
 ) -> Callable[[list[Any]], list[float]]:
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
+    warned_non_environment_inputs = False
 
     def _reward_from_episode_payloads(
         episode_summaries_value: list[EpisodeSummary],
@@ -641,10 +642,32 @@ def make_reward_function(
         environments = list(resolved_inputs or [])
         completions = completions or [None] * len(environments)
         for env, completion in zip(environments, completions):
+            nonlocal warned_non_environment_inputs
             inner_env = getattr(env, "env", env)
             world_state = getattr(inner_env, "_world_state", None)
             trajectory = getattr(env, "_trajectory_states", [])
             verifiable = None
+            completion_text = _coerce_completion_text(completion)
+
+            # Some TRL builds call the reward function with prompt/chat payloads instead of
+            # the original environment wrappers. Fall back to a tiny format-only reward
+            # instead of crashing, while our explicit rollout buffer path handles the
+            # canonical environment-based signal.
+            if not (
+                hasattr(env, "build_episode_log")
+                or hasattr(env, "compute_final_reward")
+                or hasattr(env, "summarize_episode")
+            ):
+                if not warned_non_environment_inputs:
+                    print(
+                        "[train_grpo_trl][WARN] reward_func received non-environment inputs from TRL; "
+                        "falling back to completion-format reward for this batch.",
+                        flush=True,
+                    )
+                    warned_non_environment_inputs = True
+                rewards.append(round(0.01 * _completion_format_score(completion_text), 6))
+                continue
+
             if world_state is not None and trajectory:
                 try:
                     from sme_negotiator_env.graders import compute_verifiable_reward  # type: ignore[import]
@@ -667,7 +690,6 @@ def make_reward_function(
                     pass
                 base_reward = verifiable + 0.1 * shaping_signal
 
-            completion_text = _coerce_completion_text(completion)
             base_reward = base_reward + 0.1 * _completion_format_score(completion_text)
 
             final_reward = base_reward
@@ -1620,6 +1642,37 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def create_trainer(session: dict[str, Any]) -> Any:
+    """Instantiate GRPOTrainer from a freshly built training session."""
+    _, GRPOTrainer = _import_trl_grpo_symbols()
+    return GRPOTrainer(**dict(session["trainer_kwargs"]))
+
+
+def save_training_session(session: dict[str, Any], trainer: Any) -> Path:
+    """Save the final model/tokenizer checkpoint for a completed session."""
+    checkpoint_path = Path(session["final_checkpoint_path"])
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    if hasattr(trainer, "save_model"):
+        trainer.save_model(str(checkpoint_path))
+    tokenizer = session.get("tokenizer")
+    if tokenizer is not None and hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(checkpoint_path)
+    return checkpoint_path
+
+
+def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
+    """Build, train, and save a canonical GRPO session in one call."""
+    session = build_training_session(args)
+    trainer = create_trainer(session)
+    trainer.train()
+    checkpoint_path = save_training_session(session, trainer)
+    return {
+        "session": session,
+        "trainer": trainer,
+        "checkpoint_path": checkpoint_path,
+    }
+
+
 def print_dry_run_summary(
     args: argparse.Namespace,
     rows: list[dict[str, Any]],
@@ -1689,19 +1742,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 0
 
-    _, GRPOTrainer = _import_trl_grpo_symbols()
-
-    session = build_training_session(args)
-    trainer = GRPOTrainer(**session["trainer_kwargs"])
-    trainer.train()
-
-    checkpoint_path = Path(session["final_checkpoint_path"])
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
-    if hasattr(trainer, "save_model"):
-        trainer.save_model(str(checkpoint_path))
-    tokenizer = session["tokenizer"]
-    if hasattr(tokenizer, "save_pretrained"):
-        tokenizer.save_pretrained(str(checkpoint_path))
+    result = run_training_session(args)
+    checkpoint_path = Path(result["checkpoint_path"])
     return 0
 
 

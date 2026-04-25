@@ -22,6 +22,7 @@ from rl.train_grpo_trl import (
     _run_single_rollout_sample,
     EpisodeSummaryBuffer,
     PendingRolloutBuffer,
+    create_trainer,
     build_arg_parser,
     build_environment_factory,
     build_grpo_config_kwargs,
@@ -36,6 +37,8 @@ from rl.train_grpo_trl import (
     make_reward_function,
     prepare_model_for_grpo,
     _require_rollout_func_support,
+    run_training_session,
+    save_training_session,
 )
 from rl.monitoring import RewardMonitorCallback
 from rl.train_grpo_unsloth import (
@@ -253,6 +256,18 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
 
     assert rewards == [0.4, 0.6]
     assert pending_buffer.items == []
+
+
+def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -> None:
+    reward_func = make_reward_function()
+
+    rewards = reward_func(
+        prompts=[[{"role": "user", "content": "hello"}], [{"role": "user", "content": "world"}]],
+        completions=["{}", '{"action_type":"accept"}'],
+    )
+
+    assert len(rewards) == 2
+    assert all(isinstance(value, float) for value in rewards)
 
 
 def test_reward_function_completion_text_provides_per_group_variance() -> None:
@@ -767,6 +782,40 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
         "rollout_func",
         "callbacks",
     }
+
+
+def test_create_trainer_and_run_training_session_use_canonical_helper_path(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        trl_script,
+        "build_training_session",
+        lambda args: {
+            "trainer_kwargs": {"model": object(), "args": object(), "rollout_func": object()},
+            "tokenizer": _DummyTokenizerSaver(),
+            "final_checkpoint_path": _workspace_tmp_dir("run_training_session") / "final-grpo-model",
+        },
+    )
+
+    class _FakeTrainer:
+        def __init__(self, **kwargs) -> None:
+            captured["kwargs"] = kwargs
+
+        def train(self) -> None:
+            captured["trained"] = True
+
+        def save_model(self, output_dir: str) -> None:
+            captured["saved_to"] = output_dir
+
+    monkeypatch.setattr(trl_script, "create_trainer", lambda session: _FakeTrainer(**session["trainer_kwargs"]))
+
+    result = run_training_session(make_training_args())
+
+    assert captured["trained"] is True
+    assert "checkpoint_path" in result
+    assert result["session"]["final_checkpoint_path"].name == "final-grpo-model"
 
 
 def test_require_rollout_func_support_rejects_older_trl_signature() -> None:
