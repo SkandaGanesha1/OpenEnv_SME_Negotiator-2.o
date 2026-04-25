@@ -21,6 +21,7 @@ from rl.train_grpo_trl import (
     _ensure_grpo_response_schema,
     _render_chat_prompt,
     _run_single_rollout_sample,
+    _score_prompt_completion_via_environment,
     _strict_json_payload,
     EpisodeSummaryBuffer,
     PendingRolloutBuffer,
@@ -519,26 +520,26 @@ def test_reward_function_uses_prompt_env_fallback_when_pending_buffer_is_empty(m
 
     def _fake_score(prompt, completion, *, fallback_args, env_factory):
         is_valid = '"action_type":"propose"' in str(completion)
-        reward = 0.6 if is_valid else 0.3
+        reward = 0.6 if is_valid else 0.65
         return {
             "episode_summary": EpisodeSummary(
-                episode_completed=True,
+                episode_completed=is_valid,
                 base_rl_reward=reward,
                 verifiable_reward=reward,
                 total_reward=reward,
                 tool_bonus_total=0.0,
                 env_reward_total=reward,
-                success_no_default_positive_npv=True,
+                success_no_default_positive_npv=is_valid,
                 average_final_payment_days=35.0,
                 tool_usage_count=1,
-                resolved_deal_count=1,
+                resolved_deal_count=1 if is_valid else 0,
                 defaulted_sme_count=0,
             ),
             "episode_log": f"log::{prompt}",
             "raw_completion_text": str(completion),
-            "termination_reason": "prompt_env_fallback",
+            "termination_reason": "done" if is_valid else "prompt_env_invalid_first_action",
             "invalid_parse_fraction": 0.0 if is_valid else 1.0,
-            "contract_score": 0.95 if is_valid else 0.15,
+            "contract_score": 0.95 if is_valid else 0.65,
         }
 
     monkeypatch.setattr(trl_script, "_score_prompt_completion_via_environment", _fake_score)
@@ -556,9 +557,69 @@ def test_reward_function_uses_prompt_env_fallback_when_pending_buffer_is_empty(m
         ],
     )
 
-    assert rewards[0] > rewards[1]
+    assert rewards[0] > 0.6
+    assert rewards[1] < 0.0
     assert reward_func.bridge_diagnostics["bridge_miss_count"] == 2
     assert reward_func.bridge_diagnostics["prompt_env_fallback_count"] == 2
+
+
+def test_score_prompt_completion_via_environment_short_circuits_invalid_first_action(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    class _Wrapper:
+        def __init__(self) -> None:
+            self.done = False
+            self.last_observation = SimpleNamespace(metadata={})
+
+        def reset(self, **kwargs):
+            self.done = False
+            self.last_observation = SimpleNamespace(metadata={})
+            return "reset"
+
+        def summarize_episode(self) -> EpisodeSummary:
+            return EpisodeSummary(
+                episode_completed=False,
+                base_rl_reward=0.8,
+                verifiable_reward=0.8,
+                total_reward=0.8,
+                tool_bonus_total=0.0,
+                env_reward_total=0.8,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=30.0,
+                tool_usage_count=1,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+            )
+
+        def build_episode_log(self) -> str:
+            return "wrapper-log"
+
+    monkeypatch.setattr(trl_script, "_extract_training_row_from_prompt", lambda prompt, fallback_args: {"prompt": prompt})
+    monkeypatch.setattr(
+        trl_script,
+        "_parse_action_and_validity",
+        lambda raw_text, observation, strict_json=True: (
+            SimpleNamespace(model_dump=lambda exclude_none=True: {"action_type": "advance_period"}),
+            False,
+        ),
+    )
+
+    def _fail_execute_action(wrapper, action):
+        raise AssertionError("invalid first action should not be executed in prompt-env fallback")
+
+    monkeypatch.setattr(trl_script, "execute_action", _fail_execute_action)
+
+    result = _score_prompt_completion_via_environment(
+        "prompt-a",
+        '{"action_type":"proposal","price":95.0,"payment_days":40}',
+        fallback_args=make_training_args(),
+        env_factory=_Wrapper,
+    )
+
+    assert result["termination_reason"] == "prompt_env_invalid_first_action"
+    assert result["episode_summary"].verifiable_reward < 0.0
+    assert result["invalid_parse_fraction"] == 1.0
+    assert result["parsed_actions"] == []
 
 
 def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -> None:
@@ -601,6 +662,39 @@ def test_reward_function_penalizes_invalid_json_in_episode_payloads() -> None:
     )
 
     assert rewards[0] > rewards[1]
+
+
+def test_reward_function_penalizes_prompt_env_incomplete_episode_payloads() -> None:
+    reward_func = make_reward_function()
+    summary = EpisodeSummary(
+        episode_completed=False,
+        base_rl_reward=0.7,
+        verifiable_reward=0.7,
+        total_reward=0.7,
+        tool_bonus_total=0.0,
+        env_reward_total=0.7,
+        success_no_default_positive_npv=True,
+        average_final_payment_days=35.0,
+        tool_usage_count=1,
+        resolved_deal_count=1,
+        defaulted_sme_count=0,
+    )
+
+    rewards = reward_func(
+        [None, None],
+        episode_summaries=[summary, summary],
+        raw_completion_texts=[
+            '{"action_type":"propose","price":95.0,"payment_days":40}',
+            '{"action_type":"propose","price":95.0,"payment_days":40}',
+        ],
+        env_reward_std=[0.0, 0.0],
+        invalid_parse_fraction=[0.0, 0.0],
+        termination_reasons=["done", "prompt_env_incomplete"],
+        contract_score=[0.95, 0.95],
+    )
+
+    assert rewards[0] > rewards[1]
+    assert rewards[1] <= 0.5
 
 
 def test_reward_function_completion_text_provides_per_group_variance() -> None:
@@ -1368,6 +1462,25 @@ def test_colab_notebook_baseline_handles_dict_or_attr_summary_shape() -> None:
     assert "_baseline_success" in source
     assert "summary.get(\"success_no_default_positive_npv\", False)" in source
     assert "run[\"summary\"].success_no_default_positive_npv" not in source
+
+
+def test_colab_notebook_uses_shared_dashboard_helper_and_saved_artifacts() -> None:
+    source = _load_notebook_source()
+
+    assert 'RUN_PROFILE = "submission"' in source
+    assert "save_training_dashboard" in source
+    assert 'training_dashboard.png' in source
+    assert 'policy_comparison.png' in source
+    assert 'eval_summary.json' in source
+
+
+def test_colab_notebook_evaluates_base_and_trained_policies() -> None:
+    source = _load_notebook_source()
+
+    assert 'policy="base"' in source
+    assert 'policy="trained"' in source
+    assert "evaluate_before_after_policies" in source
+    assert "submission_ready" in source
 
 
 def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) -> None:

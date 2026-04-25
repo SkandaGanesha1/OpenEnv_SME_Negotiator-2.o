@@ -13,7 +13,7 @@ pinned: false
 > The manifest-facing OpenEnv surface stays the legacy HTTP path; the in-process liquidity path is the canonical training/demo artifact for Theme #2 and Theme #3.1, and now emits explicit `[TERMINAL_REWARD]`, `[VERIFIABLE_REWARD]`, `[PERIOD_SUMMARY]`, and terminal `termination_reason=` / `defaulted_sme_count=` fields.
 > Set `INFERENCE_AGENT_MODE=heuristic` for a deterministic baseline path that does not depend on router quality.
 > For public HF router demos, prefer a long-context chat model such as `Qwen/Qwen2.5-7B-Instruct-1M`; keep `.env` overrideable and use the same `inference_results.json -> judge_pack` pipeline for every README metric.
-> Training runs save `reward_curve.png` into the trainer output directory; the repo keeps `docs/img/tiny_grpo_reward_curve.svg` as the checked-in illustrative artifact until a moderate run is generated locally.
+> The Colab submission profile now saves reviewer-facing artifacts into `outputs/grpo_sme_liquidity_colab/`, including `reward_curve.png`, `training_dashboard.png`, `policy_comparison.png`, and `eval_summary.json`. Refresh those files by rerunning `notebooks/colab_grpo_sme_liquidity.ipynb` before cutting a submission.
 
 ## Judge Quick Links
 
@@ -21,7 +21,9 @@ pinned: false
 |---|---|
 | HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator) |
 | GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb) |
-| Checked-in reward curve artifact | [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg) |
+| Submission training dashboard | [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png) |
+| Submission policy comparison | [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png) |
+| Submission eval summary | [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json) |
 | Current inference summary artifact | [inference_results.json](inference_results.json) |
 | Full evaluation notes | [EVALUATION.md](EVALUATION.md) |
 | OpenEnv manifest | [openenv.yaml](openenv.yaml) |
@@ -494,9 +496,10 @@ export TRAINING_LOG_BACKEND=none
 uv run --extra rl python -m rl.train_grpo_trl --num-samples 128 --output-dir outputs/grpo_sme_liquidity_trl
 ```
 
-Each completed run now writes `reward_curve.png` into the chosen output
-directory. Copy the selected moderate-run artifact to `docs/img/reward_curve.png`
-when packaging a final submission.
+Each completed run now writes `reward_curve.png`, `training_dashboard.png`,
+`policy_comparison.png`, and `eval_summary.json` into the chosen output
+directory. The notebook submission profile uses
+`outputs/grpo_sme_liquidity_colab/` as the canonical artifact location.
 
 To build the judge-facing evidence bundle from a real `inference_results.json`:
 
@@ -626,17 +629,28 @@ Checked-in judge-facing artifacts today:
 | Legacy single-deal reference benchmark | `0.52` overall score | Public server-compatible `payment-terms-*` baseline from `EVALUATION.md` |
 | Checked-in liquidity smoke artifact | `0.00` overall score / `0.0000` mean reward | Current `inference_results.json` confirms the in-process liquidity path, explicit terminal reward logs, and additive summary metrics |
 
-Illustrative Stage 7 submission artifacts stay in the repo so judges can see
-the training/demo path without running a long experiment.
+## Real Training Evidence
 
-![Illustrative tiny GRPO reward curve](docs/img/tiny_grpo_reward_curve.svg)
+Run profile: `submission`
+Task: `liquidity-correlation-hard`
+Artifacts: `outputs/grpo_sme_liquidity_colab/training_dashboard.png`, `outputs/grpo_sme_liquidity_colab/policy_comparison.png`, `outputs/grpo_sme_liquidity_colab/eval_summary.json`
 
-Moderate GRPO runs now save `reward_curve.png` directly into the trainer output
-directory. For a judge-ready moderate run, copy that file into
-`docs/img/reward_curve.png` after the local training job completes.
+| Metric | Base model | Trained checkpoint |
+|---|---|---|
+| Mean total reward | `policies.base.mean_total_reward` | `policies.trained.mean_total_reward` |
+| Mean verifiable reward | `policies.base.mean_verifiable_reward` | `policies.trained.mean_verifiable_reward` |
+| Success rate | `policies.base.success_rate` | `policies.trained.success_rate` |
+| Mean final payment days | `policies.base.mean_final_payment_days` | `policies.trained.mean_final_payment_days` |
 
-Example before/after trajectory excerpt (illustrative tiny-run snippet, not a
-benchmark claim):
+![Submission training dashboard](outputs/grpo_sme_liquidity_colab/training_dashboard.png)
+
+Caption: Multi-panel training diagnostics from the real environment-connected GRPO run, with reward, rollout diversity, and format-quality metrics on labeled axes.
+
+![Base model vs trained checkpoint comparison](outputs/grpo_sme_liquidity_colab/policy_comparison.png)
+
+Caption: Fixed-seed before/after comparison using the same task, horizon, and evaluation budget for the base model and the trained checkpoint.
+
+Example before/after trajectory excerpt:
 
 ```text
 Before training / heuristic:
@@ -958,7 +972,9 @@ MIT. See [LICENSE](LICENSE).
 
 ### Evidence
 
-- Tiny illustrative reward curve: [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg)
+- Submission training dashboard: [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png)
+- Submission policy comparison: [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png)
+- Submission eval summary: [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json)
 - Colab-style tiny demo: [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
 - Notebook/demo helper layer: `rl/demo.py`
 - Public manifest stays legacy-first and truthful: [openenv.yaml](openenv.yaml)

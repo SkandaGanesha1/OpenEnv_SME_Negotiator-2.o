@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import copy
 import inspect
+import json
 from pathlib import Path
+from statistics import mean
 from typing import Any, Optional
 
 from rl.bridge import execute_action, format_observation, make_environment_factory
@@ -38,6 +41,34 @@ class SummaryView(dict[str, Any]):
             return self[name]
         except KeyError as exc:
             raise AttributeError(name) from exc
+
+
+_TRAINING_DASHBOARD_GROUPS = (
+    ("Reward and Success", "Episode metric", ("episode/avg_total_reward", "episode/success_rate")),
+    (
+        "Rollout Diversity",
+        "Std / Count",
+        ("rollout/reward_std", "rollout/unique_action_count", "rollout/unique_completion_count"),
+    ),
+    (
+        "Format Quality",
+        "Fraction",
+        ("rollout/invalid_parse_fraction", "rollout/identical_terminal_fraction"),
+    ),
+)
+_POLICY_COMPARISON_METRICS = (
+    ("mean_total_reward", "Mean Total Reward", True),
+    ("mean_verifiable_reward", "Mean Verifiable Reward", True),
+    ("success_rate", "Success Rate", True),
+    ("mean_final_payment_days", "Mean Final Payment Days", False),
+    ("default_rate", "Default Rate", False),
+    ("timeout_or_stepcap_rate", "Timeout / Step-Cap Rate", False),
+)
+_PLACEHOLDER_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="
+)
+
+
 def _cuda_training_dtype() -> Any:
     """Return the lowest-risk CUDA dtype for Colab-class demo training."""
     try:
@@ -172,6 +203,54 @@ def _action_to_text(action: NegotiationAction) -> str:
     return ", ".join(parts)
 
 
+def _write_placeholder_png(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_PLACEHOLDER_PNG)
+
+
+def _episode_summary_view(episode_summary: Any) -> SummaryView:
+    return SummaryView(
+        {
+            "base_rl_reward": float(episode_summary.base_rl_reward),
+            "verifiable_reward": float(episode_summary.verifiable_reward),
+            "total_reward": float(episode_summary.total_reward),
+            "tool_bonus_total": float(episode_summary.tool_bonus_total),
+            "env_reward_total": float(episode_summary.env_reward_total),
+            "success_no_default_positive_npv": bool(episode_summary.success_no_default_positive_npv),
+            "average_final_payment_days": float(episode_summary.average_final_payment_days),
+            "tool_usage_count": int(episode_summary.tool_usage_count),
+            "tool_call_count": int(episode_summary.tool_call_count),
+            "tool_effective_count": int(episode_summary.tool_effective_count),
+            "duplicate_tool_count": int(episode_summary.duplicate_tool_count),
+            "invalid_action_count": int(episode_summary.invalid_action_count),
+            "stall_step_count": int(episode_summary.stall_step_count),
+            "resolved_deal_count": int(episode_summary.resolved_deal_count),
+            "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
+            "terminated_by_step_cap": bool(episode_summary.terminated_by_step_cap),
+        }
+    )
+
+
+def _policy_episode_result(
+    *,
+    seed: int,
+    transcript_lines: list[str],
+    done: bool,
+    summary: SummaryView,
+    steps: int,
+    policy: str,
+) -> dict[str, Any]:
+    return {
+        "seed": seed,
+        "policy": policy,
+        "total_reward": round(float(summary["total_reward"]), 6),
+        "steps": int(steps),
+        "done": bool(done),
+        "transcript": "\n".join(transcript_lines),
+        "summary": summary,
+    }
+
+
 def run_heuristic_episode(
     *,
     seed: int = 0,
@@ -198,7 +277,6 @@ def run_heuristic_episode(
     )
     observation = wrapper.last_observation
     assert observation is not None
-    total_reward = float(wrapper.env_reward_total)
     transcript_lines = [f"RESET :: {format_observation(observation)}"]
 
     for step_index in range(max_steps):
@@ -239,7 +317,6 @@ def run_heuristic_episode(
             raise ValueError(f"Unexpected heuristic demo action: {action.action_type!r}")
         observation = wrapper.last_observation
         assert observation is not None
-        total_reward = float(wrapper.env_reward_total)
         transcript_lines.append(
             f"STEP {step_index + 1} :: action[{_action_to_text(action)}] :: reward={float(observation.reward):.6f}"
         )
@@ -248,33 +325,16 @@ def run_heuristic_episode(
             break
 
     episode_summary = wrapper.summarize_episode()
-    summary = SummaryView({
-        "base_rl_reward": float(episode_summary.base_rl_reward),
-        "verifiable_reward": float(episode_summary.verifiable_reward),
-        "total_reward": float(episode_summary.total_reward),
-        "tool_bonus_total": float(episode_summary.tool_bonus_total),
-        "env_reward_total": float(episode_summary.env_reward_total),
-        "success_no_default_positive_npv": bool(episode_summary.success_no_default_positive_npv),
-        "average_final_payment_days": float(episode_summary.average_final_payment_days),
-        "tool_usage_count": int(episode_summary.tool_usage_count),
-        "tool_call_count": int(episode_summary.tool_call_count),
-        "tool_effective_count": int(episode_summary.tool_effective_count),
-        "duplicate_tool_count": int(episode_summary.duplicate_tool_count),
-        "invalid_action_count": int(episode_summary.invalid_action_count),
-        "stall_step_count": int(episode_summary.stall_step_count),
-        "resolved_deal_count": int(episode_summary.resolved_deal_count),
-        "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
-        "terminated_by_step_cap": bool(episode_summary.terminated_by_step_cap),
-    })
+    summary = _episode_summary_view(episode_summary)
 
-    return {
-        "seed": seed,
-        "total_reward": round(total_reward, 6),
-        "steps": max(0, len(transcript_lines) // 2),
-        "done": bool(observation.done),
-        "transcript": "\n".join(transcript_lines),
-        "summary": summary,
-    }
+    return _policy_episode_result(
+        seed=seed,
+        transcript_lines=transcript_lines,
+        done=bool(observation.done),
+        summary=summary,
+        steps=max(0, len(transcript_lines) // 2),
+        policy="heuristic",
+    )
 
 
 def demo_train_grpo(
@@ -401,7 +461,131 @@ def demo_train_grpo(
     }
 
 
-def run_policy_episode(
+def _coerce_history_entries(trainer_or_history: Any) -> list[dict[str, Any]]:
+    if isinstance(trainer_or_history, list):
+        return [entry for entry in trainer_or_history if isinstance(entry, dict)]
+    state = getattr(trainer_or_history, "state", None)
+    log_history = getattr(state, "log_history", []) if state is not None else []
+    return [entry for entry in log_history if isinstance(entry, dict)]
+
+
+def _metric_series(history: list[dict[str, Any]], name: str) -> tuple[list[int], list[float]]:
+    steps: list[int] = []
+    values: list[float] = []
+    for entry in history:
+        if name in entry and "step" in entry:
+            steps.append(int(entry["step"]))
+            values.append(float(entry[name]))
+    return steps, values
+
+
+def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict[str, Any]:
+    """Save a readable multi-metric dashboard for notebook and README use."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    history = _coerce_history_entries(trainer_or_history)
+    metrics: dict[str, float | None] = {}
+    for _, _, group in _TRAINING_DASHBOARD_GROUPS:
+        for metric_name in group:
+            _, values = _metric_series(history, metric_name)
+            metrics[metric_name] = values[-1] if values else None
+
+    figure_path = output_path / "training_dashboard.png"
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_placeholder_png(figure_path)
+    else:
+        fig, axes = plt.subplots(len(_TRAINING_DASHBOARD_GROUPS), 1, figsize=(11, 10), sharex=True)
+        if len(_TRAINING_DASHBOARD_GROUPS) == 1:
+            axes = [axes]
+
+        for axis, (title, ylabel, group) in zip(axes, _TRAINING_DASHBOARD_GROUPS):
+            plotted = False
+            for metric_name in group:
+                steps, values = _metric_series(history, metric_name)
+                if values:
+                    axis.plot(steps, values, label=metric_name)
+                    plotted = True
+            axis.set_title(title)
+            axis.set_ylabel(ylabel)
+            axis.grid(True, alpha=0.3)
+            if plotted:
+                axis.legend()
+            else:
+                axis.text(0.5, 0.5, "No logged data for this panel.", ha="center", va="center", transform=axis.transAxes)
+
+        for axis in axes:
+            axis.set_xlabel("Training step")
+        fig.suptitle("SME Negotiator Training Dashboard")
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+        fig.savefig(figure_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+
+    zero_variance_streak = 0
+    zero_variance_warning = False
+    for entry in history:
+        reward_std = float(entry.get("rollout/reward_std", 0.0) or 0.0)
+        if reward_std <= 1e-8:
+            zero_variance_streak += 1
+        else:
+            zero_variance_streak = 0
+        if zero_variance_streak >= 2:
+            zero_variance_warning = True
+            break
+
+    return {
+        "training_dashboard_path": str(figure_path.resolve()),
+        "reward_curve_path": str((output_path / "reward_curve.png").resolve()),
+        "metrics": metrics,
+        "history_points": len(history),
+        "zero_variance_warning": zero_variance_warning,
+    }
+
+
+def _load_policy_model(
+    *,
+    policy: str,
+    model_name: str,
+    checkpoint_path: Optional[str],
+) -> tuple[Any, Any]:
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except ImportError as exc:
+        raise ImportError("Running a model policy requires transformers to be installed.") from exc
+
+    if policy == "base":
+        tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(model_name))
+        model = _load_demo_model(AutoModelForCausalLM, model_name)
+    elif policy == "trained":
+        if not checkpoint_path:
+            raise ValueError("checkpoint_path is required when policy='trained'.")
+        checkpoint = Path(checkpoint_path)
+        tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(checkpoint_path))
+        try:
+            from peft import PeftConfig, PeftModel
+        except ImportError:
+            model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+        else:
+            try:
+                peft_config = PeftConfig.from_pretrained(str(checkpoint))
+            except Exception:
+                model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+            else:
+                base_model_name = str(getattr(peft_config, "base_model_name_or_path", "") or model_name)
+                model = PeftModel.from_pretrained(
+                    _load_demo_model(AutoModelForCausalLM, base_model_name),
+                    str(checkpoint),
+                )
+    else:
+        raise ValueError("policy must be one of 'heuristic', 'base', or 'trained'.")
+
+    if hasattr(model, "eval"):
+        model.eval()
+    return model, tokenizer
+
+
+def run_policy_episode_report(
     *,
     policy: str = "heuristic",
     seed: int = 123,
@@ -409,49 +593,24 @@ def run_policy_episode(
     task_name: str = "liquidity-correlation-hard",
     difficulty: str = "hard",
     checkpoint_path: Optional[str] = None,
+    model_name: str = DEFAULT_MODEL_NAME,
     max_steps: int = 20,
-) -> str:
-    """Run one heuristic or model-driven episode and return a compact transcript."""
+) -> dict[str, Any]:
+    """Run one heuristic, base-model, or trained-model episode and return a compact report."""
     if policy == "heuristic":
-        return str(
-            run_heuristic_episode(
-                seed=seed,
-                total_periods=total_periods,
-                task_name=task_name,
-                difficulty=difficulty,
-                max_steps=max_steps,
-            )["transcript"]
+        return run_heuristic_episode(
+            seed=seed,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            max_steps=max_steps,
         )
 
-    if policy != "trained":
-        raise ValueError("policy must be either 'heuristic' or 'trained'.")
-    if not checkpoint_path:
-        raise ValueError("checkpoint_path is required when policy='trained'.")
-
-    try:
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ImportError as exc:
-        raise ImportError("Running a trained policy requires transformers to be installed.") from exc
-
-    checkpoint = Path(checkpoint_path)
-    tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(checkpoint_path))
-    try:
-        from peft import PeftConfig, PeftModel
-    except ImportError:
-        model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
-    else:
-        try:
-            peft_config = PeftConfig.from_pretrained(str(checkpoint))
-        except Exception:
-            model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
-        else:
-            base_model_name = str(getattr(peft_config, "base_model_name_or_path", "") or DEFAULT_MODEL_NAME)
-            model = PeftModel.from_pretrained(
-                _load_demo_model(AutoModelForCausalLM, base_model_name),
-                str(checkpoint),
-            )
-    if hasattr(model, "eval"):
-        model.eval()
+    model, tokenizer = _load_policy_model(
+        policy=policy,
+        model_name=model_name,
+        checkpoint_path=checkpoint_path,
+    )
     rows = build_training_rows(
         prompt=DEFAULT_PROMPT,
         task_name=task_name,
@@ -481,6 +640,7 @@ def run_policy_episode(
     messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
     messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
     transcript_lines = [f"RESET :: {format_observation(observation)}"]
+    executed_steps = 0
 
     for step_index in range(max_steps):
         if observation.done:
@@ -495,17 +655,17 @@ def run_policy_episode(
         )
         text = str(turn["text"])
         action, was_valid_json = _parse_action_and_validity(text, observation, strict_json=False)
-        transcript_lines.append(
-            f"MODEL {step_index + 1} :: valid_json={str(was_valid_json).lower()} :: raw={text}"
-        )
+        transcript_lines.append(f"MODEL {step_index + 1} :: valid_json={str(was_valid_json).lower()} :: raw={text}")
         messages.append({"role": "assistant", "content": text})
         try:
             execute_action(wrapper, action)
         except Exception as exc:
             transcript_lines.append(f"ERROR {step_index + 1} :: action_error={exc}")
+            executed_steps = step_index + 1
             break
         observation = wrapper.last_observation
         assert observation is not None
+        executed_steps = step_index + 1
         transcript_lines.append(
             f"STEP {step_index + 1} :: action[{_action_to_text(action)}] :: reward={float(observation.reward):.6f}"
         )
@@ -514,4 +674,197 @@ def run_policy_episode(
             break
         messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
 
-    return "\n".join(transcript_lines)
+    summary = _episode_summary_view(wrapper.summarize_episode())
+    return _policy_episode_result(
+        seed=seed,
+        transcript_lines=transcript_lines,
+        done=bool(getattr(observation, "done", False)),
+        summary=summary,
+        steps=executed_steps,
+        policy=policy,
+    )
+
+
+def _aggregate_policy_runs(runs: list[dict[str, Any]]) -> dict[str, float]:
+    if not runs:
+        return {
+            "episode_count": 0.0,
+            "mean_total_reward": 0.0,
+            "mean_verifiable_reward": 0.0,
+            "success_rate": 0.0,
+            "mean_final_payment_days": 0.0,
+            "default_rate": 0.0,
+            "timeout_or_stepcap_rate": 0.0,
+        }
+
+    summaries = [run["summary"] for run in runs]
+    return {
+        "episode_count": float(len(runs)),
+        "mean_total_reward": round(mean(float(run["total_reward"]) for run in runs), 6),
+        "mean_verifiable_reward": round(mean(float(summary["verifiable_reward"]) for summary in summaries), 6),
+        "success_rate": round(
+            mean(1.0 if bool(summary["success_no_default_positive_npv"]) else 0.0 for summary in summaries),
+            6,
+        ),
+        "mean_final_payment_days": round(mean(float(summary["average_final_payment_days"]) for summary in summaries), 6),
+        "default_rate": round(
+            mean(1.0 if int(summary["defaulted_sme_count"]) > 0 else 0.0 for summary in summaries),
+            6,
+        ),
+        "timeout_or_stepcap_rate": round(
+            mean(1.0 if bool(summary["terminated_by_step_cap"]) else 0.0 for summary in summaries),
+            6,
+        ),
+    }
+
+
+def evaluate_before_after_policies(
+    *,
+    output_dir: str,
+    seeds: list[int],
+    total_periods: int,
+    task_name: str,
+    difficulty: str,
+    checkpoint_path: str,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_steps: int = 20,
+    include_heuristic: bool = True,
+) -> dict[str, Any]:
+    """Evaluate base vs trained policies on a fixed seed panel and save judge-ready artifacts."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    base_runs = [
+        run_policy_episode_report(
+            policy="base",
+            seed=seed,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            model_name=model_name,
+            max_steps=max_steps,
+        )
+        for seed in seeds
+    ]
+    trained_runs = [
+        run_policy_episode_report(
+            policy="trained",
+            seed=seed,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            checkpoint_path=checkpoint_path,
+            model_name=model_name,
+            max_steps=max_steps,
+        )
+        for seed in seeds
+    ]
+
+    heuristic_reference = None
+    if include_heuristic:
+        heuristic_reference = run_policy_episode_report(
+            policy="heuristic",
+            seed=seeds[0] if seeds else 0,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            max_steps=max_steps,
+        )
+
+    comparison = {
+        "base": _aggregate_policy_runs(base_runs),
+        "trained": _aggregate_policy_runs(trained_runs),
+    }
+    primary_metrics = ("success_rate", "mean_verifiable_reward", "mean_total_reward")
+    trained_primary_wins = sum(
+        1 for metric_name in primary_metrics if comparison["trained"][metric_name] > comparison["base"][metric_name]
+    )
+    submission_ready = trained_primary_wins >= 2
+
+    figure_path = output_path / "policy_comparison.png"
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_placeholder_png(figure_path)
+    else:
+        fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+        axes_flat = list(axes.flatten())
+        labels = ["Base model", "Trained checkpoint"]
+        colors = ["#4C72B0", "#55A868"]
+        for axis, (metric_name, title, higher_is_better) in zip(axes_flat, _POLICY_COMPARISON_METRICS):
+            values = [comparison["base"][metric_name], comparison["trained"][metric_name]]
+            axis.bar(labels, values, color=colors)
+            axis.set_title(f"{title}{'' if higher_is_better else ' (lower is better)'}")
+            axis.set_ylabel(title)
+            axis.grid(True, axis="y", alpha=0.3)
+        fig.suptitle("Base Model vs Trained Checkpoint")
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+        fig.savefig(figure_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+
+    base_transcript_path = output_path / "base_model_transcript.txt"
+    trained_transcript_path = output_path / "trained_model_transcript.txt"
+    base_transcript_path.write_text(str(base_runs[0]["transcript"]) if base_runs else "", encoding="utf-8")
+    trained_transcript_path.write_text(str(trained_runs[0]["transcript"]) if trained_runs else "", encoding="utf-8")
+    heuristic_transcript_path = None
+    if heuristic_reference is not None:
+        heuristic_transcript_path = output_path / "heuristic_reference_transcript.txt"
+        heuristic_transcript_path.write_text(str(heuristic_reference["transcript"]), encoding="utf-8")
+
+    eval_summary = {
+        "metadata": {
+            "task_name": task_name,
+            "difficulty": difficulty,
+            "total_periods": int(total_periods),
+            "max_steps": int(max_steps),
+            "model_name": model_name,
+            "checkpoint_path": str(Path(checkpoint_path).resolve()),
+            "seeds": [int(seed) for seed in seeds],
+            "submission_ready": submission_ready,
+            "trained_primary_wins": int(trained_primary_wins),
+        },
+        "policies": comparison,
+        "artifacts": {
+            "policy_comparison_path": str(figure_path.resolve()),
+            "base_transcript_path": str(base_transcript_path.resolve()),
+            "trained_transcript_path": str(trained_transcript_path.resolve()),
+            "heuristic_transcript_path": str(heuristic_transcript_path.resolve()) if heuristic_transcript_path else None,
+        },
+    }
+    summary_path = output_path / "eval_summary.json"
+    summary_path.write_text(json.dumps(eval_summary, indent=2), encoding="utf-8")
+
+    return {
+        "summary": eval_summary,
+        "eval_summary_path": str(summary_path.resolve()),
+        "policy_comparison_path": str(figure_path.resolve()),
+        "base_transcript": str(base_runs[0]["transcript"]) if base_runs else "",
+        "trained_transcript": str(trained_runs[0]["transcript"]) if trained_runs else "",
+        "heuristic_transcript": str(heuristic_reference["transcript"]) if heuristic_reference is not None else "",
+    }
+
+
+def run_policy_episode(
+    *,
+    policy: str = "heuristic",
+    seed: int = 123,
+    total_periods: int = 2,
+    task_name: str = "liquidity-correlation-hard",
+    difficulty: str = "hard",
+    checkpoint_path: Optional[str] = None,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_steps: int = 20,
+) -> str:
+    """Run one policy episode and return the transcript only."""
+    return str(
+        run_policy_episode_report(
+            policy=policy,
+            seed=seed,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            checkpoint_path=checkpoint_path,
+            model_name=model_name,
+            max_steps=max_steps,
+        )["transcript"]
+    )

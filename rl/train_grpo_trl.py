@@ -866,6 +866,8 @@ def make_reward_function(
             base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
             contract_score = float(contract_values[index] or 0.0)
             invalid_fraction = float(invalid_values[index] or 0.0)
+            termination_reason = str(termination_values[index] or "")
+            termination_lower = termination_reason.lower()
             reward_std_scalar = float(reward_std_values[index] or 0.0)
             if reward_std_scalar <= 1e-8 or invalid_fraction > 0.0:
                 base_reward += 0.12 * (contract_score - 0.5)
@@ -873,6 +875,17 @@ def make_reward_function(
 
             if reward_std_scalar <= 1e-8:
                 base_reward += 0.02 * (contract_score - 0.5)
+
+            if termination_lower == "prompt_env_invalid_first_action":
+                invalid_cap = -0.35 + 0.06 * max(-0.5, min(0.5, contract_score - 0.5))
+                base_reward = min(base_reward, invalid_cap)
+            elif termination_lower.startswith("prompt_env_") and any(
+                marker in termination_lower for marker in ("ongoing", "incomplete", "step_cap", "missing_observation")
+            ):
+                unresolved_cap = 0.45 + 0.08 * max(-0.5, min(0.5, contract_score - 0.5))
+                base_reward = min(base_reward - 0.18, unresolved_cap)
+            elif termination_lower == "ongoing":
+                base_reward -= 0.12
 
             final_reward = base_reward
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
@@ -896,7 +909,7 @@ def make_reward_function(
                         "unique_completion_count": float(unique_completion_values[index] or 0.0),
                         "invalid_parse_fraction": float(invalid_values[index] or 0.0),
                         "identical_terminal_fraction": float(identical_terminal_values[index] or 0.0),
-                        "termination_reason": termination_values[index],
+                        "termination_reason": termination_reason,
                         "contract_score": contract_score,
                         "sample_completion": texts[index],
                     },
@@ -1486,6 +1499,30 @@ def _followup_policy_action(observation: Any, *, step_index: int) -> Negotiation
     return fallback
 
 
+def _prompt_env_penalty_summary(
+    *,
+    reward: float,
+    invalid_action_count: int = 0,
+    terminated_by_step_cap: bool = False,
+) -> EpisodeSummary:
+    penalty_reward = float(reward)
+    return EpisodeSummary(
+        episode_completed=False,
+        base_rl_reward=penalty_reward,
+        verifiable_reward=penalty_reward,
+        total_reward=penalty_reward,
+        tool_bonus_total=0.0,
+        env_reward_total=penalty_reward,
+        success_no_default_positive_npv=False,
+        average_final_payment_days=0.0,
+        tool_usage_count=0,
+        resolved_deal_count=0,
+        defaulted_sme_count=0,
+        invalid_action_count=int(invalid_action_count),
+        terminated_by_step_cap=bool(terminated_by_step_cap),
+    )
+
+
 def _score_prompt_completion_via_environment(
     prompt: Any,
     completion: Any,
@@ -1502,6 +1539,17 @@ def _score_prompt_completion_via_environment(
     first_contract_score = _completion_format_score(completion_text, first_observation)
     first_action, was_valid_json = _parse_action_and_validity(completion_text, first_observation, strict_json=True)
 
+    if not was_valid_json:
+        return {
+            "episode_summary": _prompt_env_penalty_summary(reward=-0.4, invalid_action_count=1),
+            "episode_log": "Prompt-env fallback rejected an invalid first action before stepping the environment.",
+            "raw_completion_text": completion_text,
+            "termination_reason": "prompt_env_invalid_first_action",
+            "invalid_parse_fraction": 1.0,
+            "contract_score": round(first_contract_score, 6),
+            "parsed_actions": [],
+        }
+
     termination_reason = "prompt_env_fallback"
     action_history = [first_action.model_dump(exclude_none=True)]
     try:
@@ -1510,7 +1558,8 @@ def _score_prompt_completion_via_environment(
         termination_reason = f"prompt_env_action_error:{exc}"
     else:
         max_episode_steps = int(getattr(fallback_args, "max_episode_steps", 24) or 24)
-        for step_index in range(1, max_episode_steps):
+        followup_step_limit = max(0, min(3, max_episode_steps - 1))
+        for step_index in range(1, followup_step_limit + 1):
             if bool(getattr(wrapper, "done", False)):
                 break
             observation = getattr(wrapper, "last_observation", None)
@@ -1525,13 +1574,21 @@ def _score_prompt_completion_via_environment(
                 termination_reason = f"prompt_env_followup_error:{exc}"
                 break
         else:
-            termination_reason = "prompt_env_step_cap"
+            if not bool(getattr(wrapper, "done", False)):
+                termination_reason = "prompt_env_incomplete"
 
     final_observation = getattr(wrapper, "last_observation", None)
     if final_observation is not None:
         metadata_reason = str((final_observation.metadata or {}).get("termination_reason", "") or "")
         if metadata_reason:
-            termination_reason = metadata_reason
+            if metadata_reason.startswith("prompt_env_"):
+                termination_reason = metadata_reason
+            elif bool(getattr(wrapper, "done", False)):
+                termination_reason = metadata_reason
+            else:
+                termination_reason = f"prompt_env_{metadata_reason}"
+    if not bool(getattr(wrapper, "done", False)) and termination_reason == "prompt_env_fallback":
+        termination_reason = "prompt_env_incomplete"
 
     return {
         "episode_summary": wrapper.summarize_episode(),
