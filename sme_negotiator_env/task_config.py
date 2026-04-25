@@ -168,12 +168,18 @@ def default_task_config(task_id: str) -> TaskConfig:
                 "Thin cash buffers and tighter supplier cycles make solvency fragile; the secondary buyer is riskier "
                 "and financing capacity is limited."
             ),
-            initial_cash_balance_ratio=0.25,
-            credit_limit_multiplier=1.0,
+            # Headroom calibrated so a competent agent (negotiates short tenor +
+            # uses TReDS responsibly) can finish without default while a naive
+            # always-accept-on-buyer-floor policy still risks tripping the
+            # solvency constraint. Without this, supplier payments alone
+            # exceed initial cash + financier advance and every rollout
+            # terminates with verifiable_reward = 0.
+            initial_cash_balance_ratio=0.6,
+            credit_limit_multiplier=1.5,
             minimum_cash_buffer_ratio=0.20,
             primary_buyer_default_tendency=0.25,
             secondary_buyer_default_tendency=0.35,
-            financier_capital_multiplier=2.0,
+            financier_capital_multiplier=4.0,
             financier_risk_appetite=0.45,
             legal_max_payment_days=45,
             reward_lambda_shaping=0.1,
@@ -208,12 +214,17 @@ def default_task_config(task_id: str) -> TaskConfig:
             context_note=(
                 "Correlated buyer risk, tight supplier terms, and limited financing force solvency and NPV trade-offs."
             ),
-            initial_cash_balance_ratio=0.30,
-            credit_limit_multiplier=0.8,
+            # Hard task: narrow but achievable solvency margin. Initial cash
+            # large enough to cover one supplier cycle so a plan-aware agent
+            # can earn non-zero verifiable reward without the rollout always
+            # ending in default. Financier capital is still scarce so the
+            # agent must prefer dynamic discounting + TReDS selectively.
+            initial_cash_balance_ratio=0.65,
+            credit_limit_multiplier=1.2,
             minimum_cash_buffer_ratio=0.25,
             primary_buyer_default_tendency=0.38,
             secondary_buyer_default_tendency=0.42,
-            financier_capital_multiplier=0.75,
+            financier_capital_multiplier=2.0,
             financier_risk_appetite=0.35,
             legal_max_payment_days=45,
             reward_lambda_shaping=0.35,

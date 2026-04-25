@@ -1663,7 +1663,49 @@ def _extract_terminal_reward_breakdown(
             candidate = dict(candidate)
             candidate["total"] = float(canonical_total)
             return candidate
-    return None
+
+    # Liquidity path: synthesize the breakdown directly from the env's
+    # WorldState + per-deal trajectories so judges always see the four
+    # verifiable axes (solvency, liquidity, NPV, compliance) instead of
+    # ``breakdown=unavailable``. This stays a pure read of canonical state.
+    try:
+        underlying = getattr(env, "env", None) or env
+        state = getattr(underlying, "state", None)
+        world_state = getattr(state, "world_state", None)
+        deal_trajectories = getattr(state, "deal_trajectories", None) if state is not None else None
+        if world_state is None or not deal_trajectories:
+            return None
+
+        from sme_negotiator_env.graders import compute_verifiable_reward_breakdown
+
+        weighted: Dict[str, float] = {
+            "solvency": 0.0,
+            "liquidity": 0.0,
+            "npv": 0.0,
+            "compliance": 0.0,
+        }
+        total_weight = 0.0
+        for deal in getattr(world_state, "deals", []):
+            if deal.status == "open":
+                continue
+            trajectory = deal_trajectories.get(deal.deal_id) if isinstance(deal_trajectories, Mapping) else None
+            if not trajectory:
+                continue
+            breakdown = compute_verifiable_reward_breakdown(world_state, list(trajectory))
+            weight = float(deal.invoice_amount) if float(deal.invoice_amount) > 0.0 else 1.0
+            weighted["solvency"] += float(getattr(breakdown, "solvency", 0.0)) * weight
+            weighted["liquidity"] += float(getattr(breakdown, "liquidity", 0.0)) * weight
+            weighted["npv"] += float(getattr(breakdown, "npv", 0.0)) * weight
+            weighted["compliance"] += float(getattr(breakdown, "compliance", 0.0)) * weight
+            total_weight += weight
+        if total_weight <= 0.0:
+            return None
+        for key in weighted:
+            weighted[key] = round(weighted[key] / total_weight, 6)
+        weighted["total"] = round(float(canonical_total), 6)
+        return weighted
+    except Exception:
+        return None
 
 
 def _build_canonical_reward_component_report(

@@ -188,14 +188,33 @@ def make_reward_function(
             inner_env = getattr(env, "env", env)
             world_state = getattr(inner_env, "_world_state", None)
             trajectory = getattr(env, "_trajectory_states", [])
+            verifiable = None
             if world_state is not None and trajectory:
                 try:
                     from sme_negotiator_env.graders import compute_verifiable_reward  # type: ignore[import]
-                    base_reward = float(compute_verifiable_reward(world_state, trajectory))
+                    verifiable = float(compute_verifiable_reward(world_state, trajectory))
                 except Exception:
+                    verifiable = None
+            if verifiable is None:
+                try:
                     base_reward = float(env.compute_final_reward())
+                except Exception:
+                    base_reward = float(getattr(env, "reward", 0.0))
             else:
-                base_reward = float(env.compute_final_reward())
+                # Add a small bounded fraction of the accumulated env shaping
+                # reward on top of the verifiable score. This is what gives
+                # non-zero per-completion variance early in training, which
+                # makes the GRPO advantage non-zero (and therefore loss > 0).
+                # Without it, every completion in a group can collapse to
+                # the same terminal score and the trainer logs loss=0.000000.
+                shaping_signal = 0.0
+                try:
+                    summary = env.summarize_episode()
+                    env_total = float(getattr(summary, "env_reward_total", 0.0) or 0.0)
+                    shaping_signal = max(0.0, env_total - verifiable)
+                except Exception:
+                    pass
+                base_reward = verifiable + 0.1 * shaping_signal
             final_reward = base_reward
             episode_log = env.build_episode_log()
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
@@ -206,7 +225,10 @@ def make_reward_function(
                     final_reward = combine_rewards(base_reward, rubric_scores, rubric_weight)
             rewards.append(round(final_reward, 6))
             if summary_buffer is not None:
-                summary_buffer.append(env.summarize_episode(), episode_log)
+                try:
+                    summary_buffer.append(env.summarize_episode(), episode_log)
+                except Exception:
+                    pass
         return rewards
 
     return reward_func
