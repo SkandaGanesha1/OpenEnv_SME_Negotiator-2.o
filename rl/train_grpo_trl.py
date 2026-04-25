@@ -172,19 +172,105 @@ def summarize_batch(summaries: list[EpisodeSummary]) -> dict[str, float]:
     }
 
 
+def _coerce_completion_text(completion: Any) -> str:
+    """Return a flat string for a TRL completion (chat list or raw string)."""
+    if completion is None:
+        return ""
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list):
+        parts: list[str] = []
+        for message in completion:
+            if isinstance(message, dict):
+                content = message.get("content", "")
+                if isinstance(content, list):
+                    for chunk in content:
+                        if isinstance(chunk, dict):
+                            parts.append(str(chunk.get("text", "")))
+                        else:
+                            parts.append(str(chunk))
+                else:
+                    parts.append(str(content))
+            else:
+                parts.append(str(message))
+        return "\n".join(parts)
+    return str(completion)
+
+
+def _completion_format_score(text: str) -> float:
+    """Bounded format-quality score in [0, 1] that reads the model output text.
+
+    This exists for one critical reason: GRPO normalizes rewards within each
+    generation group as ``(reward - mean) / std``. When every completion in a
+    group produces an identical environment trajectory (which happens before
+    the policy has learned to emit tool calls or structured actions), the
+    env-only verifiable reward is constant across the group, ``std == 0``,
+    advantage is clipped to 0, and TRL logs ``loss=0.000000`` for every step.
+
+    A small bounded score derived from the *completion text itself* gives
+    every group non-zero per-sample variance, so GRPO gradients are non-zero
+    even when the env trajectory hasn't responded yet. The contribution is
+    capped (max 0.1 of the total) so it cannot dominate or be hacked.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return 0.0
+
+    score = 0.0
+    lowered = raw.lower()
+
+    # Reward parseable JSON-shaped output (the action schema we want).
+    if raw.startswith("{") and raw.rstrip().endswith("}"):
+        score += 0.30
+    if '"action_type"' in raw:
+        score += 0.15
+    # Reward references to canonical action verbs.
+    for verb in ("propose", "accept", "reject", "advance_period", "tool"):
+        if verb in lowered:
+            score += 0.05
+            break
+    # Reward including the key negotiation levers.
+    for key in ("payment_days", "use_treds", "price"):
+        if key in lowered:
+            score += 0.07
+    # Reward a non-trivial reasoning field.
+    if '"reason"' in raw or "reason=" in lowered:
+        score += 0.10
+    # Mild length shaping: prefer concise, non-empty outputs (50-600 chars).
+    length = len(raw)
+    if 50 <= length <= 600:
+        score += 0.10
+    elif 10 <= length < 50:
+        score += 0.05
+
+    return float(min(1.0, max(0.0, score)))
+
+
 def make_reward_function(
     *,
     rubric_scorer=None,
     rubric_weight: float = 0.0,
     summary_buffer: Optional[EpisodeSummaryBuffer] = None,
 ) -> Callable[[list[Any]], list[float]]:
-    """Build the TRL reward function that reads deterministic env state."""
+    """Build the TRL reward function that reads deterministic env state.
 
-    def reward_func(environments: list[Any], **kwargs: Any) -> list[float]:
+    The returned function is a hybrid of two signals:
+        verifiable (env-derived, deterministic) +
+        format_signal (text-derived, bounded, gives per-group variance).
+
+    The verifiable component dominates once the policy starts producing valid
+    tool calls; the format component guarantees a non-zero GRPO advantage
+    early in training so the policy gets gradient signal at all.
+    """
+
+    def reward_func(
+        environments: list[Any],
+        completions: Optional[list[Any]] = None,
+        **kwargs: Any,
+    ) -> list[float]:
         rewards: list[float] = []
-        for env in environments:
-            # Prefer the verifiable reward (solvency+liquidity+NPV+compliance) when
-            # world state is available; fall back to the environment's own scorer.
+        completions = completions or [None] * len(environments)
+        for env, completion in zip(environments, completions):
             inner_env = getattr(env, "env", env)
             world_state = getattr(inner_env, "_world_state", None)
             trajectory = getattr(env, "_trajectory_states", [])
@@ -201,12 +287,6 @@ def make_reward_function(
                 except Exception:
                     base_reward = float(getattr(env, "reward", 0.0))
             else:
-                # Add a small bounded fraction of the accumulated env shaping
-                # reward on top of the verifiable score. This is what gives
-                # non-zero per-completion variance early in training, which
-                # makes the GRPO advantage non-zero (and therefore loss > 0).
-                # Without it, every completion in a group can collapse to
-                # the same terminal score and the trainer logs loss=0.000000.
                 shaping_signal = 0.0
                 try:
                     summary = env.summarize_episode()
@@ -215,6 +295,13 @@ def make_reward_function(
                 except Exception:
                     pass
                 base_reward = verifiable + 0.1 * shaping_signal
+
+            # Completion-text variance signal — bounded so the verifiable
+            # reward is still the dominant policy signal once it lights up.
+            completion_text = _coerce_completion_text(completion)
+            format_signal = _completion_format_score(completion_text)
+            base_reward = base_reward + 0.1 * format_signal
+
             final_reward = base_reward
             episode_log = env.build_episode_log()
             if rubric_scorer is not None and float(rubric_weight) > 0.0:

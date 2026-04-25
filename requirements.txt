@@ -11,3 +11,4 @@ python-dotenv>=1.0.1
 pyyaml>=6.0.1
 gymnasium>=0.28.0
 openenv-core>=0.2.3
+gradio>=4.0.0
