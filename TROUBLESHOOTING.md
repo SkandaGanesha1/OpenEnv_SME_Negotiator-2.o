@@ -304,6 +304,40 @@ response = client.chat.completions.create(
 
 ---
 
+### Problem: Rewards Look Wrong Or Keep Going Down
+
+**Symptom**: `inference.py` prints descending step rewards even though the final
+deal score is high.
+
+**What is happening**:
+- The default `inference.py` path still uses the legacy live single-deal
+  environment.
+- The step-level `reward=` field is dense shaping, not the full liquidity RL
+  objective.
+- If the buyer keeps conceding and your proposal barely changes, the marginal
+  improvement shrinks, so shaping can go down before the terminal score lands.
+
+**How to inspect it**:
+```powershell
+$env:INFERENCE_REWARD_MODE="legacy+shadow_rlvr"
+uv run python inference.py
+```
+
+That keeps the legacy reward unchanged but prints a shadow RLVR-style summary at
+the end of the episode.
+
+**How to see the advanced liquidity/tool path**:
+```powershell
+$env:OPENENV_IN_PROCESS="1"
+$env:INFERENCE_ENV_MODE="liquidity"
+uv run python inference.py
+```
+
+That runs the in-process liquidity environment, where tool calls, macro periods,
+and long-horizon reward diagnostics are visible.
+
+---
+
 ### Problem: Server Returns 500 Error
 
 **Error**: `HTTPError: 500 Internal Server Error`

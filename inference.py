@@ -30,7 +30,6 @@ from sme_negotiator_env.prompting import (
 from sme_negotiator_env.reward_reporting import (
     build_legacy_step_diagnostics,
     build_shadow_reward_report,
-    reward_branch as legacy_reward_branch,
 )
 
 from server.environment import SMENegotiatorEnvironment
@@ -133,10 +132,8 @@ def _liquidity_task_for_difficulty(difficulty: str) -> str:
 
 # OpenEnv simulation server URL only (set OPENENV_BASE_URL when using HTTP/WebSocket client)
 OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://127.0.0.1:7860")
-# If true, run SME negotiation in-process (no uv run server). Default false so inference matches deployed HTTP API.
-OPENENV_IN_PROCESS = os.getenv("OPENENV_IN_PROCESS", "0").strip().lower() in ("1", "true", "yes", "on")
 
-DEFAULT_INFERENCE_ENV_MODE = "legacy"
+DEFAULT_INFERENCE_ENV_MODE = "liquidity"
 DEFAULT_INFERENCE_REWARD_MODE = "legacy+shadow_rlvr"
 
 NEGOTIATION_SYSTEM_PROMPT = """
@@ -241,11 +238,32 @@ def _format_score_for_log(score: float) -> str:
     return f"{_strict_unit_interval(score):.2f}"
 
 
-def _format_end_line(success: bool, steps: int, score: float, rewards: List[float]) -> str:
-    return (
+def _format_end_line(
+    success: bool,
+    steps: int,
+    score: float,
+    rewards: List[float],
+    judge_score: Optional[float] = None,
+) -> str:
+    base = (
         f'[END] success={"true" if success else "false"} steps={steps} score={_format_score_for_log(score)} '
         f'rewards={",".join(_format_score_for_log(r) for r in rewards)}'
     )
+    if judge_score is not None:
+        base += f" judge_score={judge_score:.3f}"
+    return base
+
+
+def _ascii_sparkline(rewards: List[float]) -> str:
+    """Return a single-line ASCII bar chart summarising per-step rewards."""
+    if not rewards:
+        return ""
+    blocks = "▁▂▃▄▅▆▇█"
+    mx = max(rewards) if max(rewards) > 0 else 1.0
+    bars = [blocks[min(7, int(r / mx * 8))] for r in rewards]
+    mn = min(rewards)
+    avg = sum(rewards) / len(rewards)
+    return f"{''.join(bars)} min={mn:.2f} max={mx:.2f} avg={avg:.2f}"
 
 
 def _task_margin(task_name: str) -> float:
@@ -333,14 +351,13 @@ def _normalize_stage1_proposal(
     llm_days = int(out.get("payment_days", buyer_days))
 
     deterministic_days = max(target_days, buyer_days - day_step)
-    if last_valid_proposal is not None:
-        deterministic_days = min(deterministic_days, int(last_valid_proposal.get("payment_days", deterministic_days)))
-    proposed_days = max(target_days, min(llm_days, deterministic_days))
+    # Anchor to buyer's current offer (always decreasing) instead of locking to previous proposal.
+    # This lets the LLM re-anchor each round without getting frozen at a single value.
+    proposed_days = max(target_days, min(llm_days, buyer_days))
 
     deterministic_price = max(price_floor, buyer_price - (0.4 + 0.2 * round_number))
     proposed_price = max(price_floor, min(llm_price, deterministic_price, buyer_price))
-    if last_valid_proposal is not None:
-        proposed_price = min(proposed_price, float(last_valid_proposal.get("price", proposed_price)))
+    # No monotonicity lock on price — the floor (cost + margin) already prevents below-cost proposals.
 
     out["payment_days"] = int(proposed_days)
     out["price"] = round(proposed_price, 2)
@@ -626,6 +643,45 @@ def _task_hint(task_name: str, observation: Dict[str, Any]) -> str:
     return ""
 
 
+def _detect_repetition(history: List[Dict[str, Any]], window: int = 3) -> bool:
+    """Return True if the last `window` assistant turns produced identical action JSON."""
+    assistant_msgs = [m["content"] for m in history if m.get("role") == "assistant"]
+    if len(assistant_msgs) < window:
+        return False
+    return len(set(assistant_msgs[-window:])) == 1
+
+
+def _diversity_hint(observation: Dict[str, Any], task_name: str) -> str:
+    """Generate an escape instruction when the LLM is stuck repeating the same action."""
+    buyer_days = int(observation.get("buyer_days", 0))
+    liq = int(observation.get("liquidity_threshold", 0))
+    cost = float(observation.get("cost_threshold", 0.0))
+    gap = buyer_days - liq
+    alt_days = max(liq, buyer_days - 8)
+    return (
+        f"[STUCK] You have proposed the same terms 3 times. The buyer has NOT accepted. "
+        f"Change strategy NOW: (1) try use_treds=true to reduce buyer day floor, "
+        f"(2) propose payment_days={alt_days} (a different value), "
+        f"(3) add propose_late_payment_penalty_clause=true. "
+        f"Day gap remaining: {gap}. Cost floor: {cost:.2f}. Do NOT repeat the same JSON."
+    )
+
+
+def _urgency_hint(observation: Dict[str, Any], history: List[Dict[str, Any]], task_name: str) -> str:
+    """Return urgency/diversity prefix to inject into the next user turn."""
+    max_rounds = int(observation.get("max_rounds", 16))
+    round_number = int(observation.get("round_number", 0))
+    remaining = max_rounds - round_number
+    parts: List[str] = []
+    if remaining <= 3:
+        parts.append(f"[URGENT] Only {remaining} rounds left. You MUST accept now or score=0.")
+    elif remaining <= 6:
+        parts.append(f"[WARNING] {remaining} rounds left. Accelerate concessions.")
+    if _detect_repetition(history, window=3):
+        parts.append(_diversity_hint(observation, task_name))
+    return "\n".join(parts)
+
+
 def _maybe_enable_treds_guardrail(
     action_payload: Dict[str, Any],
     observation: Dict[str, Any],
@@ -667,8 +723,10 @@ def _maybe_enable_treds_guardrail(
 
 def get_agent_action(observation: Dict[str, Any], history: List[dict], task_name: str) -> Dict[str, Any]:
     hint = _task_hint(task_name, observation)
+    urgency = _urgency_hint(observation, history, task_name)
+    prefix = (urgency + "\n") if urgency else ""
     user_message = (
-        f"Task={task_name}\n"
+        f"{prefix}Task={task_name}\n"
         f"{hint}\n"
         f"Current observation:\n{format_observation(observation)}\n"
         "Return only JSON action."
@@ -921,7 +979,7 @@ EnvClient = Union[SMENegotiatorEnv, InProcessSMENegotiatorBridge, InProcessLiqui
 
 
 async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, Any]:
-    """Run one episode using model-guided actions with strict stdout formatting."""
+    """Run one legacy episode using model-guided actions with strict stdout formatting."""
 
     task_name = difficulty.lower()
     episode_id = f"{task_name}-{seed}"
@@ -935,10 +993,15 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
     observation: Any = None
     final_score = _strict_unit_interval(0.0)
     last_valid_proposal: Dict[str, Any] | None = None
+    reward_mode = _inference_reward_mode()
+    reset_observation: Any = None
+    step_actions: List[NegotiationAction] = []
+    step_observations: List[Any] = []
 
     try:
         result = await env.reset(seed=seed, difficulty=difficulty, episode_id=episode_id, task_name=task_name)
         observation = result.observation
+        reset_observation = observation
 
         print(
             f"[START] task={task_name} env=openenv-sme-negotiator model={MODEL_NAME}",
@@ -1015,6 +1078,8 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             reward = float(result.reward or 0.0)
             done = bool(result.done)
             all_rewards.append(reward)
+            step_actions.append(action)
+            step_observations.append(observation)
 
             err_out = _format_step_error(llm_error)
             print(
@@ -1022,8 +1087,26 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
                 f'done={"true" if done else "false"} error={err_out}',
                 flush=True,
             )
+            if reward_mode != "legacy":
+                _print_legacy_step_debug(
+                    observation=observation,
+                    reward=reward,
+                    last_valid_proposal=last_valid_proposal,
+                )
 
-            history.append({"role": "user", "content": format_observation(obs_dict)})
+            # Feed RLVR signal back so the LLM knows if it's in the close zone.
+            new_obs_dict = _observation_to_dict(observation)
+            buyer_days_new = int(new_obs_dict.get("buyer_days", 99))
+            liq_new = int(new_obs_dict.get("liquidity_threshold", 60))
+            obs_text = format_observation(obs_dict)
+            if reward_mode != "legacy":
+                close_zone = "yes" if buyer_days_new <= liq_new else "no"
+                obs_text += (
+                    f"\n[RLVR_SIGNAL] step_reward={reward:.3f} "
+                    f"close_zone={close_zone} "
+                    f"buyer_days_now={buyer_days_new} liq_target={liq_new}"
+                )
+            history.append({"role": "user", "content": obs_text})
             history.append({"role": "assistant", "content": json.dumps(action_payload, ensure_ascii=True)})
 
             round_number += 1
@@ -1036,7 +1119,35 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             success = bool(result.done and final_score > 0.0)
     finally:
         total_reward = sum(all_rewards)
-        print(_format_end_line(success, round_number, final_score, all_rewards), flush=True)
+        # Compute rule-based persona judge score from accumulated step log lines.
+        judge_score: Optional[float] = None
+        try:
+            from rl.self_rewarding_dpo import build_rule_based_rubric_scorer  # type: ignore[import]
+            from rl.rubrics import PERSONAS, persona_reward  # type: ignore[import]
+            step_log_text = "\n".join(
+                f"[STEP] step={i + 1} reward={_format_score_for_log(r)}"
+                for i, r in enumerate(all_rewards)
+            ) + f"\n[END] score={_format_score_for_log(final_score)}"
+            _scorer = build_rule_based_rubric_scorer()
+            _rubric_scores = _scorer(step_log_text)
+            judge_score = max(persona_reward(p, _rubric_scores) for p in PERSONAS)
+        except Exception:
+            pass
+        print(_format_end_line(success, round_number, final_score, all_rewards, judge_score), flush=True)
+        if all_rewards:
+            print(f"[REWARD_CURVE] {_ascii_sparkline(all_rewards)}", flush=True)
+
+    shadow_summary: Optional[dict[str, Any]] = None
+    if reward_mode != "legacy" and reset_observation is not None:
+        shadow_report = build_shadow_reward_report(
+            reset_observation=reset_observation,
+            actions=step_actions,
+            step_observations=step_observations,
+            seed=seed,
+            final_state=_legacy_final_state_from_env(env),
+        )
+        shadow_summary = shadow_report.to_dict()
+        _print_shadow_reward_summary(reward_mode, shadow_report, final_score)
 
     return {
         "difficulty": difficulty,
@@ -1047,6 +1158,113 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
         "success": success,
         "forced_hard_accepts": forced_hard_accepts,
         "step_rewards": all_rewards,
+        "reward_mode": reward_mode,
+        "final_observation": _observation_to_dict(observation) if observation is not None else {},
+        "shadow_reward_report": shadow_summary,
+    }
+
+
+async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, seed: int) -> Dict[str, Any]:
+    """Run one advanced in-process liquidity episode."""
+
+    task_name = _liquidity_task_for_difficulty(difficulty)
+    history: List[dict] = []
+    all_rewards: List[float] = []
+    result: Any = await env.reset(
+        seed=seed,
+        difficulty=difficulty.lower(),
+        task_name=task_name,
+        total_periods=int(os.getenv("INFERENCE_TOTAL_PERIODS", "3") or "3"),
+    )
+    observation: Any = result.observation
+    round_number = 0
+    skip_llm_after_402 = _env_truthy("INFERENCE_SKIP_LLM_AFTER_402", False)
+    llm_blocked_402 = False
+
+    print(
+        f"[START] task={task_name} env=sme-liquidity-inprocess model={MODEL_NAME}",
+        flush=True,
+    )
+
+    while not result.done:
+        obs_dict = _observation_to_dict(observation)
+        llm_error: Optional[str] = None
+
+        if llm_blocked_402:
+            action = _safe_liquidity_fallback_action(observation)
+            llm_error = (
+                "HF Inference 402 - further LLM calls skipped (INFERENCE_SKIP_LLM_AFTER_402=1). "
+                "Resolve quota at https://huggingface.co/settings/billing or use local Ollama."
+            )
+        else:
+            try:
+                action = get_liquidity_agent_action(obs_dict, history, task_name)
+            except Exception as e:
+                _maybe_print_hf_402_hint(e)
+                print(
+                    f"[ERROR] LLM call failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                logger.warning(
+                    "Liquidity LLM call failed; using fallback action: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+                if os.getenv("INFERENCE_DEBUG_LLM", "").strip().lower() in ("1", "true", "yes"):
+                    logger.exception("LLM traceback (INFERENCE_DEBUG_LLM=1)")
+                llm_error = str(e)
+                if skip_llm_after_402 and _is_hf_inference_402(e):
+                    llm_blocked_402 = True
+                action = _safe_liquidity_fallback_action(observation)
+
+        action_json = _serialize_step_action(action)
+        result = await env.step(action)
+        observation = result.observation
+        reward = float(result.reward or 0.0)
+        all_rewards.append(reward)
+
+        print(
+            f'[STEP] step={round_number + 1} action={action_json} reward={_format_score_for_log(reward)} '
+            f'done={"true" if bool(result.done) else "false"} error={_format_step_error(llm_error)}',
+            flush=True,
+        )
+        _print_liquidity_step_debug(observation)
+
+        history.append({"role": "user", "content": format_liquidity_observation(obs_dict)})
+        history.append({"role": "assistant", "content": action_json})
+        round_number += 1
+
+    final_score = _strict_unit_interval(float(result.reward or 0.0))
+    episode_summary = _print_liquidity_episode_summary(env)
+    episode_log = env.build_episode_log()
+    success = bool(episode_summary.get("success_no_default_positive_npv", False))
+    total_reward = sum(all_rewards)
+    # Compute rule-based persona judge score.
+    judge_score_liq: Optional[float] = None
+    try:
+        from rl.self_rewarding_dpo import build_rule_based_rubric_scorer  # type: ignore[import]
+        from rl.rubrics import PERSONAS, persona_reward  # type: ignore[import]
+        _scorer_liq = build_rule_based_rubric_scorer()
+        _rubric_liq = _scorer_liq(episode_log or "")
+        judge_score_liq = max(persona_reward(p, _rubric_liq) for p in PERSONAS)
+    except Exception:
+        pass
+    print(_format_end_line(success, round_number, final_score, all_rewards, judge_score_liq), flush=True)
+    if all_rewards:
+        print(f"[REWARD_CURVE] {_ascii_sparkline(all_rewards)}", flush=True)
+
+    return {
+        "difficulty": difficulty,
+        "task_name": task_name,
+        "seed": seed,
+        "final_score": final_score,
+        "total_reward": total_reward,
+        "steps": round_number,
+        "success": success,
+        "step_rewards": all_rewards,
+        "episode_summary": episode_summary,
+        "episode_log": episode_log,
         "final_observation": _observation_to_dict(observation) if observation is not None else {},
     }
 
@@ -1054,8 +1272,27 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
 async def main() -> None:
     """Run three episodes per difficulty and write a compact results file."""
 
+    env_mode = _inference_env_mode()
+    requested_in_process = _openenv_in_process_enabled()
+    effective_in_process = requested_in_process or env_mode == "liquidity"
     print(f"[CONFIG] LLM API_BASE_URL={API_BASE_URL}", file=sys.stderr, flush=True)
     print(f"[CONFIG] MODEL_NAME={MODEL_NAME}", file=sys.stderr, flush=True)
+    print(f"[MODE] {_runtime_banner(env_mode)}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] INFERENCE_ENV_MODE={env_mode}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] INFERENCE_REWARD_MODE={_inference_reward_mode()}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] OPENENV_IN_PROCESS_REQUESTED={'1' if requested_in_process else '0'}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] OPENENV_IN_PROCESS_EFFECTIVE={'1' if effective_in_process else '0'}", file=sys.stderr, flush=True)
+    if env_mode == "liquidity":
+        print(
+            f"[CONFIG] INFERENCE_LIQUIDITY_TASK_HINT={_liquidity_task_for_difficulty('MEDIUM')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        print(
+            f"[CONFIG] INFERENCE_TOTAL_PERIODS={int(os.getenv('INFERENCE_TOTAL_PERIODS', '3') or '3')}",
+            file=sys.stderr,
+            flush=True,
+        )
     if "router.huggingface.co" in API_BASE_URL:
         print(
             "[CONFIG] Hugging Face router uses /v1/chat/completions — pick a chat/instruct model id "
@@ -1085,15 +1322,27 @@ async def main() -> None:
         "metadata": {
             "llm_api_base_url": API_BASE_URL,
             "openenv_base_url": OPENENV_BASE_URL,
-            "openenv_in_process": OPENENV_IN_PROCESS,
+            "openenv_in_process": effective_in_process,
+            "openenv_in_process_requested": requested_in_process,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "model_name": MODEL_NAME,
+            "inference_env_mode": env_mode,
+            "inference_reward_mode": _inference_reward_mode(),
         },
         "tasks": {},
     }
 
-    if OPENENV_IN_PROCESS:
-        env_manager: Any = InProcessSMENegotiatorBridge()
+    if env_mode == "liquidity":
+        if not requested_in_process:
+            print(
+                "[WARN] Liquidity inference runs in-process only because the live OpenEnv server still exposes the "
+                "legacy single-deal environment.",
+                file=sys.stderr,
+                flush=True,
+            )
+        env_manager = InProcessLiquidityBridge()
+    elif requested_in_process:
+        env_manager = InProcessSMENegotiatorBridge()
     else:
         env_manager = SMENegotiatorEnv(base_url=OPENENV_BASE_URL)
 
@@ -1133,7 +1382,11 @@ async def _run_all_episodes(env: EnvClient, results: Dict[str, Any]) -> None:
     for difficulty in all_difficulties:
         episode_results: List[Dict[str, Any]] = []
         for seed in all_seeds:
-            episode_results.append(await run_episode(env, difficulty, seed))
+            if _inference_env_mode() == "liquidity":
+                assert isinstance(env, InProcessLiquidityBridge)
+                episode_results.append(await run_liquidity_episode(env, difficulty, seed))
+            else:
+                episode_results.append(await run_episode(env, difficulty, seed))
 
         scores = [episode["final_score"] for episode in episode_results]
         rewards = [episode["total_reward"] for episode in episode_results]

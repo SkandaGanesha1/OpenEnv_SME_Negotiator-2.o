@@ -70,6 +70,22 @@ make docker-run                 # http://127.0.0.1:7860
   - [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg)
   - [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
 
+### Theme 3.1 Pointers
+
+- Canonical world-modeling environment:
+  - `server/environment.py`
+  - `SMELiquidityEnvironment`
+- Tool contracts and normalization:
+  - `sme_negotiator_env/models.py`
+  - `sme_negotiator_env/tool_backends.py`
+- Reward reporting and deterministic grading:
+  - `sme_negotiator_env/graders.py`
+  - `rl/episode_logging.py`
+- Demo and trainer entrypoints:
+  - `rl/demo.py`
+  - `rl/train_grpo_trl.py`
+  - `rl/train_grpo_unsloth.py`
+
 ### Hackathon Spec Alignment
 
 Reviewers can check the evaluation contract quickly in one place:

@@ -526,6 +526,30 @@ These features live under `rl/` and `docs/SELF_PLAY.md`. They do not change:
 
 For more detail, see [EVALUATION.md](EVALUATION.md).
 
+## Why Rewards Can Look Wrong
+
+By default, `python inference.py` runs the in-process liquidity path so Theme
+1 / 2 / 3.1 features are visible in runtime logs.
+
+- The per-step `reward=` values in `[STEP]` logs are dense shaping rewards, not
+  the full long-horizon liquidity RL objective.
+- Those shaping rewards can decline across steps when the buyer keeps conceding
+  and the SME proposal stays nearly flat, because the marginal improvement vs
+  the buyer's current terms gets smaller.
+- The terminal score can still be high even after descending intermediate
+  shaping rewards.
+- Theme 1 / 2 / 3.1 features are visible through the in-process liquidity
+  runner. Theme 4 overlays remain training-layer features.
+
+For reward debugging, use:
+
+- `INFERENCE_REWARD_MODE=legacy+shadow_rlvr` to print a shadow Stage 2-style
+  report alongside the unchanged legacy reward (legacy mode only).
+- `INFERENCE_ENV_MODE=legacy OPENENV_IN_PROCESS=0` to run the live single-deal
+  server contract.
+- `INFERENCE_ENV_MODE=liquidity OPENENV_IN_PROCESS=1` to run the multi-deal
+  liquidity path with tool, planning, and macro-period actions visible.
+
 ## Results
 
 Illustrative Stage 7 submission artifacts live in the repo so judges can see
@@ -657,6 +681,9 @@ Core environment variables:
 | `MODEL_NAME` | Chat-capable model id used by `chat/completions` |
 | `OPENENV_BASE_URL` | Negotiation server URL, default `http://127.0.0.1:7860` |
 | `OPENENV_IN_PROCESS` | Set to `1` to skip the server and run in-process |
+| `INFERENCE_ENV_MODE` | `liquidity` (default) or `legacy` |
+| `INFERENCE_LIQUIDITY_TASK` | Optional explicit liquidity task id override |
+| `INFERENCE_TOTAL_PERIODS` | Macro periods for liquidity mode (default `3`) |
 | `TASK_FILTER` | Optional comma-separated subset such as `EASY,MEDIUM` |
 | `INFERENCE_SKIP_LLM_AFTER_402` | Optional fallback guard after the first Hugging Face billing error |
 | `INFERENCE_HARD_TWO_STEP` | Debug-only hard-mode accept shortcut; off by default |
@@ -745,3 +772,85 @@ If you use this environment in research or benchmarking, cite it as:
 ## ⚖️ License
 
 MIT. See [LICENSE](LICENSE).
+ 
+---
+
+## Theme 3.1 World-Modeling
+
+### Modes of Use
+
+| Mode | Entry Point | What it exposes | When to use it |
+|---|---|---|---|
+| Live OpenEnv baseline | `server.app:app` via `openenv.yaml` | Legacy single-deal `payment-terms-*` tasks | Public server validation, baseline inference, compatibility |
+| In-process liquidity workflow | `server.environment.SMELiquidityEnvironment` | Multi-deal world state, macro periods, deterministic tools, and plan simulation | Theme 3.1 demos, GRPO training, notebook runs |
+
+### Theme Mapping
+
+| Theme | Repo implementation |
+|---|---|
+| Theme 1 | Multi-agent `WorldState` with SME, buyers, and financier state |
+| Theme 2 | Macro periods, settlement timing, `advance_period`, and read-only plan simulation |
+| Theme 3.1 | Deterministic professional workflow tools plus persistent partially observable liquidity state |
+| Theme 4 | Self-play, curriculum, personas, and external rubric overlays on the RL path |
+
+### Theme 3.1 Audit
+
+| Requirement | Deterministic implementation | Optional realism path | Evidence |
+|---|---|---|---|
+| Persistent internal state | `SMELiquidityEnvironment`, `WorldState`, per-deal trajectories | Same state with live-backed adapters | `server/environment.py`, `tests/test_multi_agent_init.py` |
+| Partially observable world | Active deal, open/resolved deals, macro period, history tail, latest tool evidence | Same observation contract | `sme_negotiator_env/models.py` |
+| Real workflow tools | `QUERY_TREDS`, `CHECK_COMPLIANCE`, `RUN_CASHFLOW_SIM`, `simulate_plan` | `Live*Backend` adapters with deterministic fallback | `sme_negotiator_env/tool_backends.py`, `tests/test_stage4_tools.py` |
+| Verifiable rewards | Deterministic terminal reward plus bounded shaping and bounded tool bonus | Same reward semantics after normalization | `sme_negotiator_env/graders.py`, `tests/test_reward_monotonicity.py` |
+| Anti-shortcut controls | Duplicate-tool detection, invalid-action counters, stall counters, hard step cap | Same counters surfaced with live adapter fallback | `server/environment.py`, `tests/test_liquidity_environment.py` |
+
+### Architecture
+
+```text
+                         +---------------------------+
+                         |  Live OpenEnv Baseline    |
+                         |  server.app -> HTTP/WS    |
+                         |  SMENegotiatorEnvironment |
+                         +-------------+-------------+
+                                       |
+                                       | truthful public contract
+                                       |
+                 +---------------------v----------------------+
+                 |           WorldState / Liquidity Env       |
+                 |   SMEs + Buyers + Financier + Deals        |
+                 | current_period + history + tool evidence   |
+                 +-----------+---------------+----------------+
+                             |               |
+                  negotiate  |               | tool envelopes
+                             |               |
+        +--------------------v--+        +---v-------------------+
+        |  SME / Buyer / Deal    |        |  Tool Backends        |
+        |  propose / accept /    |        |  QUERY_TREDS          |
+        |  reject / advance      |        |  CHECK_COMPLIANCE     |
+        +------------------------+        |  RUN_CASHFLOW_SIM     |
+                                          |  deterministic default|
+                                          |  optional live adapt  |
+                                          +-----------+-----------+
+                                                      |
+                                                      v
+                                         +-------------------------+
+                                         | Reward Components       |
+                                         | verifiable + shaping +  |
+                                         | bounded tool bonus      |
+                                         +-------------------------+
+
+      In-process RL / demo path: rl/bridge.py -> rl/train_grpo_trl.py -> notebooks/*
+```
+
+### Reward Design
+
+- Deterministic terminal RLVR reward scores solvency, liquidity buffer adequacy, NPV uplift vs baseline, and legal/payment-term compliance.
+- Deterministic shaping rewards give bounded step-level credit for reducing working-capital gap, improving payment days, and aligning receivables with payables.
+- Tool bonuses stay intentionally tiny and only apply when a later negotiation step uses the tool information to improve the real economic trajectory.
+- Rubric, persona, and self-reward overlays stay training-side only; they do not replace the deterministic environment reward.
+
+### Evidence
+
+- Tiny illustrative reward curve: [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg)
+- Colab-style tiny demo: [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
+- Notebook/demo helper layer: `rl/demo.py`
+- Public manifest stays legacy-first and truthful: [openenv.yaml](openenv.yaml)

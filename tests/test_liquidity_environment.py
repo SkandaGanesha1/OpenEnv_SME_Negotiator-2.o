@@ -240,6 +240,35 @@ def test_final_macro_closeout_emits_terminal_reward_only_at_episode_end() -> Non
     assert terminal_obs.metadata.get("reward_mode") == "stage3_long_horizon"
 
 
+def test_liquidity_step_cap_terminates_non_progress_tool_spam_deterministically() -> None:
+    def _run(seed: int) -> tuple[int, object]:
+        env = SMELiquidityEnvironment(total_periods=1)
+        observation = env.reset(seed=seed, difficulty="medium")
+        steps = 0
+        while not observation.done and steps < 64:
+            deal_id = observation.active_deal_id or observation.open_deal_ids[0]
+            observation = env.step(
+                NegotiationAction(
+                    action_type="tool",
+                    deal_id=deal_id,
+                    tool_name="QUERY_TREDS",
+                    tool_args={"invoice_id": deal_id, "deal_id": deal_id},
+                )
+            )
+            steps += 1
+        assert env.state is not None
+        assert env.state.terminated_by_step_cap is True
+        return steps, observation
+
+    steps_a, final_a = _run(91)
+    steps_b, final_b = _run(91)
+
+    assert final_a.done is True
+    assert final_a.metadata["terminated_by_step_cap"] is True
+    assert steps_a == steps_b
+    assert final_a.reward == final_b.reward
+
+
 def test_simulation_projection_matches_manual_period_advance_for_balance_and_defaults() -> None:
     env = SMELiquidityEnvironment(total_periods=2)
     observation = env.reset(seed=21, difficulty="medium")
@@ -284,9 +313,9 @@ def test_legacy_environment_rejects_stage3_action_types_deterministically() -> N
 
 def test_sme_negotiator_environment_matches_frozen_stage0_trace() -> None:
     expected = {
-        "easy": (97.11, 87, 0.1378, "partial_progress:improvement=0.432|days=0.140|price=0.975"),
-        "medium": (99.01, 57, 0.1524, "partial_progress:improvement=0.514|days=0.265|price=0.975"),
-        "hard": (95.2, 99, 0.133, "partial_progress:improvement=0.405|days=0.100|price=0.972"),
+        "easy": (97.11, 87, 0.1448, "partial_progress:improvement=0.471|days_baseline=0.200|price_baseline=0.975"),
+        "medium": (99.01, 57, 0.1682, "partial_progress:improvement=0.601|days_baseline=0.400|price_baseline=0.975"),
+        "hard": (95.2, 99, 0.1368, "partial_progress:improvement=0.427|days_baseline=0.133|price_baseline=0.972"),
     }
 
     for difficulty, seed in (("easy", 42), ("medium", 43), ("hard", 44)):

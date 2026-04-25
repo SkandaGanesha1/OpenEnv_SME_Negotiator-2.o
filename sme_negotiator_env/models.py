@@ -133,7 +133,40 @@ class HistoryEvent(BaseModel):
     summary: str
     tool_name: Optional[str] = None
     tool_args: Optional[dict[str, Any]] = None
-    tool_result: Optional[dict[str, Any]] = None
+    tool_result: Optional["ToolResultEnvelope"] = None
+
+
+class ToolResultEnvelope(BaseModel):
+    """Normalized provenance envelope returned for every Theme 3.1 tool call."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    source: Literal["deterministic", "live"] = "deterministic"
+    backend_name: str
+    request_id: str
+    latency_ms: int = Field(0, ge=0)
+    cache_hit: bool = False
+    stale: bool = False
+    normalized_payload: dict[str, Any] = Field(default_factory=dict)
+    requested_source: Literal["deterministic", "live"] = "deterministic"
+    fallback_reason: Optional[str] = None
+
+
+class RewardComponentReport(BaseModel):
+    """Pure additive reward report for one deal trajectory or episode slice."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    verifiable_reward: float = 0.0
+    shaping_gap: float = 0.0
+    shaping_days: float = 0.0
+    shaping_alignment: float = 0.0
+    shaping_total: float = 0.0
+    tool_bonus: float = 0.0
+    total_reward: float = 0.0
+    npv_delta_vs_baseline: float = 0.0
+    success_no_default_positive_npv: bool = False
+    lambda_shaping: float = Field(0.1, ge=0.0)
 
 
 class ToolCallRecord(BaseModel):
@@ -146,7 +179,7 @@ class ToolCallRecord(BaseModel):
     deal_id: Optional[str] = None
     tool_name: Literal["QUERY_TREDS", "CHECK_COMPLIANCE", "RUN_CASHFLOW_SIM"]
     tool_args: dict[str, Any] = Field(default_factory=dict)
-    tool_result: dict[str, Any] = Field(default_factory=dict)
+    tool_result: ToolResultEnvelope
     context_fingerprint: str
 
 
@@ -183,7 +216,14 @@ class NegotiationAction(Action):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    action_type: Literal["propose", "accept", "reject", "simulate_plan", "advance_period", "tool"] = "propose"
+    action_type: Literal[
+        "propose", "accept", "reject", "simulate_plan", "advance_period", "tool",
+        # Multi-agent Theme #1 action types
+        "invoke_regulator",
+        "request_financier_auction",
+        "propose_split_deal",
+        "signal_distress",
+    ] = "propose"
     price: float = Field(0, description="Proposed price in ₹/unit", ge=0)
     payment_days: int = Field(0, description="Proposed payment days", ge=0)
     use_treds: bool = Field(False, description="Whether to propose TReDS financing")
@@ -220,6 +260,22 @@ class NegotiationAction(Action):
         ge=0.0,
         le=0.95,
         description="Annualized discount for early payment as a fraction (e.g. 0.08 = 8%).",
+    )
+    # Multi-agent Theme #1 extensions — all optional with defaults
+    split_deal_buyer_a_days: Optional[int] = Field(
+        None, ge=0, description="Days offered to buyer_a in a split-deal proposal."
+    )
+    split_deal_buyer_b_days: Optional[int] = Field(
+        None, ge=0, description="Days offered to buyer_b in a split-deal proposal."
+    )
+    split_deal_buyer_a_price: Optional[float] = Field(
+        None, ge=0.0, description="Price offered to buyer_a in a split-deal proposal."
+    )
+    split_deal_buyer_b_price: Optional[float] = Field(
+        None, ge=0.0, description="Price offered to buyer_b in a split-deal proposal."
+    )
+    distress_disclosure_level: Optional[Literal["low", "medium", "high"]] = Field(
+        None, description="Level of SME financial distress disclosed when action_type='signal_distress'."
     )
 
     @model_validator(mode="before")
@@ -301,7 +357,8 @@ class LiquidityObservation(NegotiationObservation):
     projected_penalties: Optional[list[float]] = None
     last_tool_name: Optional[str] = None
     last_tool_args: Optional[dict[str, Any]] = None
-    last_tool_result: Optional[dict[str, Any]] = None
+    last_tool_result: Optional[ToolResultEnvelope] = None
+    reward_component_report: Optional[RewardComponentReport] = None
     history: list[HistoryEvent] = Field(default_factory=list)
 
 
@@ -397,6 +454,15 @@ class LiquidityEnvironmentState(State):
     last_tool_call: Optional[ToolCallRecord] = None
     history_tail: list[HistoryEvent] = Field(default_factory=list)
     pending_tool_bonus: float = 0.0
+    active_reward_component_report: Optional[RewardComponentReport] = None
+    tool_call_count: int = Field(0, ge=0)
+    tool_effective_count: int = Field(0, ge=0)
+    duplicate_tool_count: int = Field(0, ge=0)
+    invalid_action_count: int = Field(0, ge=0)
+    stall_step_count: int = Field(0, ge=0)
+    terminated_by_step_cap: bool = False
+    episode_step_cap: int = Field(0, ge=0)
+    tool_backend_mode: Literal["deterministic", "live"] = "deterministic"
 
 
 def default_negotiation_state(
@@ -468,3 +534,103 @@ def default_negotiation_state(
         financier_id=financier_id,
         deal_id=deal_id,
     )
+
+
+HistoryEvent.model_rebuild()
+ToolCallRecord.model_rebuild()
+LiquidityObservation.model_rebuild()
+LiquidityEnvironmentState.model_rebuild()
+
+
+# ======================================================================= #
+# Multi-Agent Theme #1 data contracts                                       #
+# These classes are defined here to avoid circular imports with the        #
+# sme_negotiator_env.agents sub-package.                                   #
+# ======================================================================= #
+
+class RegulatoryWarning(BaseModel):
+    """A live MSMED Act / Section 43B(h) warning for one deal-buyer pair."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    deal_id: str
+    buyer_id: str
+    violation_type: Literal[
+        "exceeds_45_days",
+        "no_penalty_clause",
+        "discount_rate_cap",
+        "tax_deduction_at_risk",
+    ]
+    penalty_exposure_inr: float = Field(0.0, ge=0.0)
+    section_reference: str = ""
+    is_active: bool = True
+    issued_period: int = Field(0, ge=0)
+    issued_by_sme: bool = False
+
+
+class FinancierBid(BaseModel):
+    """One financing bid from a competitive financier in the auction."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    financier_id: str
+    financier_type: Literal["treds_platform", "bank", "nbfc", "microfinance"]
+    annual_rate: float = Field(ge=0.0, le=1.0)
+    max_tenor_days: int = Field(ge=0)
+    advance_amount: float = Field(ge=0.0)
+    approval_probability: float = Field(0.9, ge=0.0, le=1.0)
+    conditions: list[str] = Field(default_factory=list)
+
+
+class OpponentSignal(BaseModel):
+    """A structured signal emitted by a non-SME agent during a negotiation step."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    sender_id: str
+    sender_type: Literal["buyer", "financier", "regulator", "coalition"]
+    signal_type: Literal[
+        "counter_offer",
+        "coalition_formed",
+        "coalition_dissolved",
+        "financier_bid",
+        "regulatory_warning",
+        "defection_intent",
+        "distress_ack",
+    ]
+    payload: dict[str, Any] = Field(default_factory=dict)
+    round_number: int = Field(0, ge=0)
+
+
+class CoalitionStatus(BaseModel):
+    """Serializable snapshot of the current buyer coalition lifecycle state."""
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    is_active: bool
+    buyer_ids: list[str] = Field(default_factory=list)
+    formed_at_round: Optional[int] = Field(None, ge=0)
+    joint_demand_days: Optional[int] = Field(None, ge=0)
+    defection_risk: float = Field(0.0, ge=0.0, le=1.0)
+
+
+class MultiAgentObservation(LiquidityObservation):
+    """Theme #1 observation extending LiquidityObservation with multi-agent signals.
+
+    All new fields have safe defaults so existing code that consumes
+    LiquidityObservation (or NegotiationObservation) continues to work
+    without modification.
+    """
+
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+    opponent_signals: list[OpponentSignal] = Field(default_factory=list)
+    coalition_status: Optional[CoalitionStatus] = None
+    regulatory_warnings: list[RegulatoryWarning] = Field(default_factory=list)
+    financier_bids: list[FinancierBid] = Field(default_factory=list)
+    sme_belief_estimate: dict[str, Any] = Field(default_factory=dict)
+    social_welfare_score: float = Field(0.0, ge=0.0, le=1.0)
+    buyer_surplus_estimate: float = Field(0.0, ge=0.0, le=1.0)
+
+
+MultiAgentObservation.model_rebuild()

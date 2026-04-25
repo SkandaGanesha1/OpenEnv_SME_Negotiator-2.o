@@ -15,10 +15,11 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Optional
 
-from rl.bridge import make_environment_factory
+from rl.bridge import NegotiatorEnvFactory, make_environment_factory
 from rl.curriculum import CurriculumManager, DEFAULT_CURRICULUM_LEVELS
 from rl.episode_logging import EpisodeSummary, combine_rewards
 from rl.opponents import OpponentPolicyManager
+from rl.reward_functions import make_all_reward_funcs
 from rl.rubrics import persona_reward
 from rl.self_rewarding_dpo import build_preference_examples, write_preference_dataset
 
@@ -88,13 +89,10 @@ def configure_tokenizer(tokenizer: Any) -> Any:
 
 
 def _default_fake_rubric_scorer(episode_log: str) -> dict[str, float]:
-    baseline = min(1.0, max(0.0, len(episode_log) / 6000.0))
-    return {
-        "solvency": baseline,
-        "compliance": min(1.0, baseline + 0.1),
-        "relationship": max(0.0, baseline - 0.05),
-        "growth": min(1.0, baseline + 0.05),
-    }
+    # Replaced by rule-based scorer from self_rewarding_dpo; kept as thin wrapper
+    # for backward compatibility with any callers that reference this symbol directly.
+    from rl.self_rewarding_dpo import build_rule_based_rubric_scorer
+    return build_rule_based_rubric_scorer()(episode_log)
 
 
 def load_rubric_scorer(spec: Optional[str], *, enable_rubrics: bool = False):
@@ -119,10 +117,16 @@ def summarize_batch(summaries: list[EpisodeSummary]) -> dict[str, float]:
         return {}
     return {
         "episode/avg_base_rl_reward": mean(item.base_rl_reward for item in summaries),
+        "episode/avg_verifiable_reward": mean(item.verifiable_reward for item in summaries),
+        "episode/avg_total_reward": mean(item.total_reward for item in summaries),
+        "episode/avg_tool_bonus": mean(item.tool_bonus_total for item in summaries),
         "episode/success_rate": mean(1.0 if item.success_no_default_positive_npv else 0.0 for item in summaries),
         "episode/avg_final_payment_days": mean(item.average_final_payment_days for item in summaries),
         "episode/avg_tool_usage_count": mean(float(item.tool_usage_count) for item in summaries),
+        "episode/avg_tool_call_count": mean(float(item.tool_call_count) for item in summaries),
+        "episode/avg_tool_effective_count": mean(float(item.tool_effective_count) for item in summaries),
         "episode/avg_resolved_deal_count": mean(float(item.resolved_deal_count) for item in summaries),
+        "episode/timeout_or_stepcap_rate": mean(1.0 if item.terminated_by_step_cap else 0.0 for item in summaries),
         "episode/avg_curriculum_level": mean(float(item.curriculum_level) for item in summaries),
     }
 
@@ -138,7 +142,19 @@ def make_reward_function(
     def reward_func(environments: list[Any], **kwargs: Any) -> list[float]:
         rewards: list[float] = []
         for env in environments:
-            base_reward = float(env.compute_final_reward())
+            # Prefer the verifiable reward (solvency+liquidity+NPV+compliance) when
+            # world state is available; fall back to the environment's own scorer.
+            inner_env = getattr(env, "env", env)
+            world_state = getattr(inner_env, "_world_state", None)
+            trajectory = getattr(env, "_trajectory_states", [])
+            if world_state is not None and trajectory:
+                try:
+                    from sme_negotiator_env.graders import compute_verifiable_reward  # type: ignore[import]
+                    base_reward = float(compute_verifiable_reward(world_state, trajectory))
+                except Exception:
+                    base_reward = float(env.compute_final_reward())
+            else:
+                base_reward = float(env.compute_final_reward())
             final_reward = base_reward
             episode_log = env.build_episode_log()
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
@@ -421,11 +437,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(args.model_name))
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
     summary_buffer = EpisodeSummaryBuffer()
-    reward_func = make_reward_function(
+
+    # Split reward functions: [outcome, format, process, anti_hack]
+    # Weights:               [1.0,     0.3,    0.2,     1.0]
+    reward_funcs, reward_weights = make_all_reward_funcs(
         rubric_scorer=rubric_scorer,
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
     )
+
+    grpo_kwargs = build_grpo_config_kwargs(args)
+    grpo_kwargs["reward_weights"] = reward_weights
+    grpo_kwargs["log_completions"] = True   # enables generation inspection
+    training_args = GRPOConfig(**grpo_kwargs)
+
+    # Build monitoring callback (reward hacking detector + per-component logs)
+    try:
+        from rl.monitoring import RewardMonitorCallback
+        monitoring_cb = RewardMonitorCallback(
+            log_every_n_steps=10,
+            generation_sample_every_n_steps=50,
+        )
+    except ImportError:
+        monitoring_cb = None
+
     callbacks = [
         build_metrics_callback(
             summary_buffer,
@@ -445,15 +480,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 output_dir=args.output_dir,
             )
         )
-    training_args = GRPOConfig(**build_grpo_config_kwargs(args))
+    if monitoring_cb is not None:
+        callbacks.append(monitoring_cb)
 
+    # NegotiatorEnvFactory is the drop-in environment_factory for GRPOTrainer.
+    # It exposes propose_terms / accept_offer / reject_offer / use_tool /
+    # advance_period as tools and surfaces reward_breakdown for split reward fns.
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=reward_func,
+        reward_funcs=reward_funcs,
         train_dataset=dataset,
         args=training_args,
-        environment_factory=env_factory,
+        environment_factory=NegotiatorEnvFactory,
         callbacks=callbacks,
     )
     trainer.train()

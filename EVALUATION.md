@@ -40,6 +40,33 @@ Stage 2 also adds config-only stress tasks for the liquidity environment:
 These are not wired into `openenv.yaml` yet, so they do not alter the live
 OpenEnv evaluation manifest.
 
+## Theme 3.1 Positioning
+
+Theme 3.1 is centered on the in-process liquidity path, not the public HTTP server.
+
+- Canonical professional-task environment:
+  - `SMELiquidityEnvironment`
+  - persistent `WorldState`
+  - multi-step treasury workflow
+  - deterministic tools with normalized provenance envelopes
+- Truthful live surface:
+  - `server.app`
+  - `openenv.yaml`
+  - legacy single-deal `payment-terms-*` tasks only
+- Optional realism:
+  - `Live*Backend` adapters normalize into the same envelope shape
+  - deterministic fallback remains the benchmark source of truth
+
+### Theme 3.1 Audit Table
+
+| Requirement | Current deterministic implementation | Optional live-adapter path | Evidence artifact |
+|---|---|---|---|
+| Stateful world model | `WorldState`, deal trajectories, macro periods | Same world, live-backed tools | `server/environment.py` |
+| Tool/API interaction | `QUERY_TREDS`, `CHECK_COMPLIANCE`, `RUN_CASHFLOW_SIM`, `simulate_plan` | `LiveTredsBackend`, `LiveComplianceBackend`, `LiveCashflowBackend` | `sme_negotiator_env/tool_backends.py` |
+| Causal consequences | Accepted deals and period advances mutate economic state | Same downstream state transitions after normalization | `tests/test_liquidity_environment.py` |
+| Hard-to-game rewards | Verifiable reward + shaping + bounded tool bonus | Same reward semantics | `tests/test_reward_monotonicity.py` |
+| Workflow integrity | duplicate tool counts, invalid action counts, stall counts, step cap | Same counters with live fallback provenance | `tests/test_stage4_tools.py` |
+
 ## Stage 4 Tool Notes
 
 - `RUN_CASHFLOW_SIM` is the enterprise-tool wrapper around the Stage 3 pure

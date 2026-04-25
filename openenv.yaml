@@ -2,11 +2,11 @@ spec_version: 1
 version: 0.2.0
 name: openenv-sme-negotiator
 description: >
-  OpenEnv environment for B2B payment-term negotiation and multi-period SME
-  liquidity management. Three live single-deal tasks are served over the public
-  HTTP/WebSocket API (port 7860). Two additional in-process tasks cover
-  multi-deal world states and long-horizon treasury planning with tool use;
-  these are accessible via SMELiquidityEnvironment and rl/bridge.py directly.
+  OpenEnv environment for B2B payment-term negotiation. The public FastAPI
+  server exposes only the live single-deal baseline tasks used for
+  compatibility and evaluation. The stronger multi-deal liquidity and
+  tool-using workflow environment is available separately as an in-process
+  training/demo path via SMELiquidityEnvironment and rl/bridge.py.
 type: text
 runtime: fastapi
 app: server.app:app
@@ -16,25 +16,26 @@ action:
   type: object
   description: >
     Negotiation action with price, payment days, and optional financing clauses
-    (TReDS, late-payment penalty, dynamic discounting). Extended action types
-    (tool, advance_period) are supported in the in-process liquidity path.
+    such as TReDS, late-payment penalties, and dynamic discounting. The live
+    HTTP server uses the legacy single-deal negotiation surface.
   schema_ref: NegotiationAction
 
 observation:
   type: object
   description: >
-    Round observation containing buyer counter-offer, SME financial context
-    (working-capital gap, liquidity threshold, TReDS availability), and optional
-    macro state (open deal ids, cashflow projection) for the liquidity path.
+    Round observation containing the buyer counter-offer and SME financial
+    context for the live single-deal negotiation path. The in-process
+    liquidity path extends this contract internally with macro state and tool
+    evidence.
   schema_ref: NegotiationObservation
 
 tasks:
-  # ── Live HTTP tasks (served by server.app via OpenEnv HTTP/WebSocket API) ──
   - id: payment-terms-easy
     name: payment-terms-easy
     description: >
-      Single SME vs cooperative buyer. Reduce settlement terms from 90 days
-      toward 60 days or better. Graded by liquidity-threshold compliance.
+      Single SME versus a cooperative buyer. Reduce settlement terms from
+      90 days toward 60 days or better. Graded by liquidity-threshold
+      compliance.
     difficulty: easy
     mode: http
     env_class: server.environment.SMENegotiatorEnvironment
@@ -53,41 +54,8 @@ tasks:
     name: payment-terms-hard
     description: >
       Hard single-deal setting with dynamic discounting and NPV-vs-status-quo
-      scoring. Agent must invoke TReDS, negotiate dynamic-discounting terms,
-      and outperform the baseline NPV to earn a non-trivial reward.
+      scoring. The agent must negotiate dynamic-discounting terms and
+      outperform the baseline NPV to earn a non-trivial reward.
     difficulty: hard
     mode: http
     env_class: server.environment.SMENegotiatorEnvironment
-
-  # ── In-process tasks (SMELiquidityEnvironment via rl/bridge.py or direct) ──
-  - id: sme-liquidity-multi-deal
-    name: liquidity-correlation-hard
-    description: >
-      Multi-deal SME liquidity management across two macro periods. The agent
-      negotiates several simultaneous purchase orders, routes stressed deals
-      through TReDS, and manages cashflow settlement to avoid default.
-      Graded by solvency, liquidity buffer, NPV delta, and legal compliance.
-    difficulty: medium
-    mode: in-process
-    env_class: server.environment.SMELiquidityEnvironment
-    env_kwargs:
-      total_periods: 2
-      task_name: liquidity-correlation-hard
-      difficulty: hard
-
-  - id: sme-liquidity-long-horizon-tools
-    name: liquidity-correlation-hard
-    description: >
-      Long-horizon SME treasury management over six macro periods with the full
-      professional tool suite: QUERY_TREDS, CHECK_COMPLIANCE, RUN_CASHFLOW_SIM,
-      and SIMULATE_PLAN. The agent must reason across multiple deal timelines,
-      proactively invoke tools to avoid late-payment penalties and default, and
-      maintain adequate working-capital buffers throughout the episode.
-      Targets Theme 3.1 (Scaler AI Labs) professional workflow tools.
-    difficulty: hard
-    mode: in-process
-    env_class: server.environment.SMELiquidityEnvironment
-    env_kwargs:
-      total_periods: 6
-      task_name: liquidity-correlation-hard
-      difficulty: hard

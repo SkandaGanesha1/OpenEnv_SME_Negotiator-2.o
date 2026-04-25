@@ -78,12 +78,27 @@ def run_heuristic_episode(
         if observation.done:
             break
 
+    state = env.state
+    summary = None
+    if state is not None:
+        summary = {
+            "tool_call_count": int(state.tool_call_count),
+            "tool_effective_count": int(state.tool_effective_count),
+            "duplicate_tool_count": int(state.duplicate_tool_count),
+            "invalid_action_count": int(state.invalid_action_count),
+            "stall_step_count": int(state.stall_step_count),
+            "terminated_by_step_cap": bool(state.terminated_by_step_cap),
+            "resolved_deal_count": len(state.resolved_deal_ids),
+            "verifiable_reward": float(state.latest_verifiable_reward or 0.0),
+        }
+
     return {
         "seed": seed,
         "total_reward": round(total_reward, 6),
         "steps": max(0, len(transcript_lines) // 2),
         "done": bool(observation.done),
         "transcript": "\n".join(transcript_lines),
+        "summary": summary,
     }
 
 
@@ -113,9 +128,14 @@ def demo_train_grpo(
             self.avg_reward: list[float] = []
 
         def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
-            if logs and "episode/avg_base_rl_reward" in logs:
+            reward_key = None
+            if logs and "episode/avg_total_reward" in logs:
+                reward_key = "episode/avg_total_reward"
+            elif logs and "episode/avg_base_rl_reward" in logs:
+                reward_key = "episode/avg_base_rl_reward"
+            if logs and reward_key is not None:
                 self.steps.append(int(getattr(state, "global_step", 0) or 0))
-                self.avg_reward.append(float(logs["episode/avg_base_rl_reward"]))
+                self.avg_reward.append(float(logs[reward_key]))
             return control
 
     rows = build_training_rows(

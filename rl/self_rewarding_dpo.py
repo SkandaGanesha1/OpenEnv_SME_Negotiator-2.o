@@ -64,6 +64,42 @@ def build_preference_examples(
     return examples
 
 
+def build_rule_based_rubric_scorer() -> Callable[[str], dict[str, float]]:
+    """Return a deterministic rubric scorer derived from episode log lines.
+
+    Parses [STEP] and [END] log lines to compute four rubric dimensions without
+    any LLM call. Use this as a zero-cost fallback judge for demos and unit tests.
+    """
+
+    def scorer(episode_log: str) -> dict[str, float]:
+        lines = episode_log.split("\n")
+        final_score = 0.0
+        for line in lines:
+            if line.startswith("[END]") and "score=" in line:
+                try:
+                    score_part = next(p for p in line.split() if p.startswith("score="))
+                    final_score = float(score_part.split("=", 1)[1])
+                except (StopIteration, ValueError):
+                    pass
+        treds_count = sum(1 for ln in lines if "use_treds=true" in ln.lower())
+        step_count = sum(1 for ln in lines if ln.startswith("[STEP]"))
+        step_count = max(1, step_count)
+
+        solvency = round(min(1.0, final_score * 1.05), 4)
+        compliance = round(min(1.0, final_score), 4)
+        relationship = round(min(1.0, 0.3 + treds_count * 0.2), 4)
+        efficiency_bonus = max(0.0, 1.0 - step_count / 16.0) * 0.1
+        growth = round(min(1.0, final_score * 0.9 + efficiency_bonus), 4)
+        return {
+            "solvency": solvency,
+            "compliance": compliance,
+            "relationship": relationship,
+            "growth": growth,
+        }
+
+    return scorer
+
+
 def load_episode_logs(path: str | Path) -> list[str]:
     """Load episode-log strings from a simple JSONL file."""
     logs: list[str] = []

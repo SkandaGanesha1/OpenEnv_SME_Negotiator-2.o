@@ -18,6 +18,7 @@ from server.sme_environment import SMELiquidityEnvironment, SMENegotiatorEnviron
 from sme_negotiator_env.llm_action_parser import parse_llm_text_to_negotiation_action
 from sme_negotiator_env.models import NegotiationAction
 from sme_negotiator_env.simulation import simulate_cashflow
+from sme_negotiator_env.tool_backends import build_tool_backend_registry
 from sme_negotiator_env.tools import check_compliance, query_treds, run_cashflow_sim
 
 
@@ -130,6 +131,10 @@ def test_tool_action_is_non_mutating_and_populates_liquidity_observation() -> No
     assert tool_observation.last_tool_name == "QUERY_TREDS"
     assert tool_observation.last_tool_args == {"invoice_id": deal_id, "deal_id": deal_id}
     assert tool_observation.last_tool_result is not None
+    assert tool_observation.last_tool_result.source == "deterministic"
+    assert tool_observation.last_tool_result.backend_name == "DeterministicTredsBackend"
+    assert tool_observation.last_tool_result.cache_hit is False
+    assert tool_observation.last_tool_result.normalized_payload["invoice_id"] == deal_id
     assert tool_observation.history[-1].event_type == "tool_call"
     assert env.state is not None
     assert env.state.world_state.smes[0].cash_balance == before_cash
@@ -224,8 +229,45 @@ def test_duplicate_tool_calls_only_apply_bounded_spam_penalty() -> None:
 
     assert spam_flag_obs.metadata["pending_tool_bonus"] == pytest.approx(-0.005)
     assert spam_flag_obs.metadata["tool_spam_flag"] is True
+    assert spam_flag_obs.last_tool_result is not None
+    assert spam_flag_obs.last_tool_result.cache_hit is True
     assert spam_reward.metadata["tool_bonus_applied"] == pytest.approx(0.005)
     assert spam_reward.reward == pytest.approx(single_reward.reward - 0.005)
+
+
+def test_live_backend_falls_back_to_deterministic_envelope_shape() -> None:
+    env = SMELiquidityEnvironment(total_periods=2)
+    observation = env.reset(seed=13, difficulty="medium")
+    assert env.state is not None
+
+    deal_id = observation.open_deal_ids[0]
+    world_state = env.state.world_state
+    deterministic_registry = build_tool_backend_registry(mode="deterministic")
+    deterministic_result = deterministic_registry["QUERY_TREDS"].invoke(
+        world_state=world_state,
+        tool_args={"invoice_id": deal_id, "deal_id": deal_id},
+        context_fingerprint="test-context",
+        negotiation_state=env.state.current_negotiations[deal_id],
+    )
+
+    def _boom(**kwargs):
+        raise RuntimeError("live adapter unavailable")
+
+    live_registry = build_tool_backend_registry(
+        mode="live",
+        live_adapters={"QUERY_TREDS": _boom},
+    )
+    fallback_result = live_registry["QUERY_TREDS"].invoke(
+        world_state=world_state,
+        tool_args={"invoice_id": deal_id, "deal_id": deal_id},
+        context_fingerprint="test-context",
+        negotiation_state=env.state.current_negotiations[deal_id],
+    )
+
+    assert deterministic_result.normalized_payload == fallback_result.normalized_payload
+    assert fallback_result.source == "deterministic"
+    assert fallback_result.requested_source == "live"
+    assert "unavailable" in str(fallback_result.fallback_reason)
 
 
 def test_legacy_environment_rejects_tool_action_deterministically() -> None:

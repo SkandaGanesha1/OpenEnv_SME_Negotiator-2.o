@@ -166,6 +166,22 @@ def test_run_cashflow_sim_returns_string_and_increments_tool_count() -> None:
     assert wrapper.tool_counts["RUN_CASHFLOW_SIM"] == 1
 
 
+def test_simulate_plan_returns_string_and_preserves_read_only_flow() -> None:
+    wrapper = _make_wrapper()
+    assert wrapper.last_observation is not None
+    deal_id = wrapper.last_observation.open_deal_ids[0]
+    plan = {
+        "deal_decisions": {
+            deal_id: {"decision": "accept", "price": 95.0, "payment_days": 45, "use_treds": False}
+        }
+    }
+    result = wrapper.simulate_plan(plan=plan, horizon=1, deal_id=deal_id)
+    assert isinstance(result, str)
+    assert wrapper.last_observation is not None
+    assert wrapper.last_observation.simulation_projection is not None
+    assert wrapper.tool_counts["RUN_CASHFLOW_SIM"] == 0
+
+
 # ---------------------------------------------------------------------------
 # reward property (TRL compatibility)
 # ---------------------------------------------------------------------------
@@ -231,6 +247,9 @@ def test_summarize_episode_returns_correct_types() -> None:
     assert isinstance(summary.base_rl_reward, float)
     assert isinstance(summary.tool_usage_count, int)
     assert summary.tool_usage_count >= 1
+    assert isinstance(summary.verifiable_reward, float)
+    assert isinstance(summary.total_reward, float)
+    assert summary.tool_call_count >= 1
 
 
 def test_build_episode_log_returns_nonempty_string_with_config() -> None:
@@ -379,6 +398,10 @@ def test_summarize_batch_produces_expected_keys() -> None:
     ]
     metrics = summarize_batch(summaries)
     assert "episode/avg_base_rl_reward" in metrics
+    assert "episode/avg_total_reward" in metrics
+    assert "episode/avg_verifiable_reward" in metrics
     assert "episode/success_rate" in metrics
     assert "episode/avg_tool_usage_count" in metrics
+    assert "episode/avg_tool_call_count" in metrics
+    assert "episode/avg_tool_effective_count" in metrics
     assert metrics["episode/success_rate"] == pytest.approx(1.0)

@@ -255,10 +255,108 @@ class OpponentPolicyManager:
             self._financier_cache[cache_key] = SnapshotLLMFinancierPolicy(snapshot_path)
         return self._financier_cache[cache_key]
 
-    def sample_policies(self, *, seed: int) -> tuple[TextPolicy, FinancierPolicy, str, str]:
-        """Sample buyer and financier policies deterministically from the zoo."""
-        buyer_snapshot = self._sample_snapshot_path(seed + 17)
+    def sample_policies(
+        self,
+        *,
+        seed: int,
+        enable_strategic_buyers: bool = False,
+        buyer_index: int = 0,
+        difficulty: str = "medium",
+    ) -> tuple[TextPolicy, FinancierPolicy, str, str]:
+        """Sample buyer and financier policies deterministically from the zoo.
+
+        Parameters
+        ----------
+        enable_strategic_buyers:
+            If True, sample a StrategicBuyerAgentPolicy instead of the
+            heuristic/snapshot buyer. Requires sme_negotiator_env.agents.
+        buyer_index:
+            Index of the buyer in a multi-buyer episode (used for latent type assignment).
+        difficulty:
+            Task difficulty for latent type assignment.
+        """
+        if enable_strategic_buyers:
+            buyer_policy: TextPolicy = StrategicBuyerAgentPolicy(
+                buyer_id=f"buyer_{buyer_index}",
+                latent_type_name=_seeded_latent_type(
+                    seed=seed, buyer_index=buyer_index, difficulty=difficulty
+                ),
+                seed=seed,
+            )
+        else:
+            buyer_snapshot = self._sample_snapshot_path(seed + 17)
+            buyer_policy = self._buyer_policy_for_snapshot(buyer_snapshot)
+
         financier_snapshot = self._sample_snapshot_path(seed + 29)
-        buyer_policy = self._buyer_policy_for_snapshot(buyer_snapshot)
         financier_policy = self._financier_policy_for_snapshot(financier_snapshot)
         return buyer_policy, financier_policy, buyer_policy.policy_id, financier_policy.policy_id
+
+
+# ======================================================================= #
+# StrategicBuyerAgentPolicy — wraps StrategicBuyerAgent as a TextPolicy    #
+# ======================================================================= #
+
+def _seeded_latent_type(
+    *,
+    seed: int,
+    buyer_index: int,
+    difficulty: str,
+) -> str:
+    """Deterministic latent type selection matching assign_latent_type()."""
+    try:
+        from sme_negotiator_env.belief_state import assign_latent_type
+        return assign_latent_type(
+            buyer_index=buyer_index, difficulty=difficulty, seed=seed
+        ).name
+    except Exception:
+        return "neutral"
+
+
+class StrategicBuyerAgentPolicy(TextPolicy):
+    """Wraps StrategicBuyerAgent as a TextPolicy for OpponentPolicyManager zoo.
+
+    This allows the training-side self-play loop to use strategic buyers with
+    theory-of-mind adaptation alongside frozen LLM snapshot buyers.
+    """
+
+    def __init__(
+        self,
+        buyer_id: str,
+        latent_type_name: str = "neutral",
+        seed: int = 42,
+    ) -> None:
+        self._buyer_id = buyer_id
+        self._latent_type_name = latent_type_name
+        self._seed = seed
+        self._agent = self._build_agent()
+
+    def _build_agent(self):
+        try:
+            from sme_negotiator_env.agents.buyer_agent import make_strategic_buyer
+            from sme_negotiator_env.belief_state import get_latent_type
+            latent_type = get_latent_type(self._latent_type_name)
+            from random import Random
+            agent = make_strategic_buyer(
+                self._buyer_id,
+                buyer_index=0,
+                difficulty="medium",
+                seed=self._seed,
+                rng=Random(self._seed),
+            )
+            # Override latent type to the one specified
+            object.__setattr__(agent, "_latent_type", latent_type)
+            return agent
+        except Exception:
+            return None
+
+    @property
+    def policy_id(self) -> str:
+        return f"strategic_buyer:{self._buyer_id}:{self._latent_type_name}"
+
+    def act(self, observation: NegotiationObservation) -> NegotiationAction:
+        if self._agent is not None:
+            try:
+                return self._agent.act(observation)
+            except Exception:
+                pass
+        return conservative_default_action(observation)

@@ -15,15 +15,18 @@ import math
 from dataclasses import replace
 from datetime import datetime, timezone
 from random import Random
-from typing import TYPE_CHECKING, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 from openenv.core import Environment
 
+from sme_negotiator_env.action_validator import ActionValidator
+from sme_negotiator_env.process_supervisor import ProcessSupervisor
 from sme_negotiator_env.graders import (
     TASK_GRADERS,
+    compute_legacy_terminal_breakdown,
+    compute_reward_component_report,
     compute_shaping_rewards,
     compute_tool_use_bonus,
-    compute_total_sme_reward,
     compute_verifiable_reward,
     grade_task_payment_terms_medium,
 )
@@ -39,15 +42,18 @@ from sme_negotiator_env.models import (
     NegotiationAction,
     NegotiationObservation,
     NegotiationState,
+    RewardComponentReport,
     SMEAccountState,
     ToolCallRecord,
+    ToolResultEnvelope,
     WorldState,
     WorldSnapshot,
     default_negotiation_state,
 )
 from sme_negotiator_env.simulation import advance_world_state, apply_plan_to_world_state, simulate_cashflow
 from sme_negotiator_env.task_config import TaskConfig, resolve_task_id, TASK_REGISTRY
-from sme_negotiator_env.tools import check_compliance, query_treds, run_cashflow_sim
+from sme_negotiator_env.tools import run_cashflow_sim
+from sme_negotiator_env.tool_backends import BaseToolBackend, LiveToolAdapter, build_tool_backend_registry
 
 if TYPE_CHECKING:
     from rl.opponents import FinancierPolicy, FinancierQuote, TextPolicy
@@ -104,6 +110,11 @@ class SMENegotiatorEnvironment(Environment):
         self._last_sme_proposed_price: Optional[float] = None
         self._buyer_policy = buyer_policy
         self._buyer_policy_role = str(buyer_policy_role or "buyer")
+        # Phase 7: per-episode validator, process supervisor, mutation lock
+        self._validator: ActionValidator = ActionValidator()
+        self._supervisor: Optional[ProcessSupervisor] = None
+        self._step_in_progress: bool = False
+        self._step_penalties: list[float] = []
 
     @property
     def state(self) -> Optional[NegotiationState]:
@@ -115,6 +126,33 @@ class SMENegotiatorEnvironment(Environment):
         """Backward-compatible accessor for direct Python callers."""
 
         return self._state
+
+    def state_info(self) -> dict[str, Any]:
+        """Return a structured dict snapshot of current episode state.
+
+        Satisfies the OpenEnv first-class state() contract. Callers that only
+        need the raw NegotiationState should use get_state() / state instead.
+        """
+        if self._state is None:
+            return {"episode_id": None, "step_count": 0, "deal_reached": False,
+                    "history": [], "cumulative_reward": 0.0}
+        history = []
+        for evt in getattr(self._state, "history_events", []):
+            if hasattr(evt, "model_dump"):
+                history.append(evt.model_dump())
+            elif hasattr(evt, "dict"):
+                history.append(evt.dict())
+            else:
+                history.append(str(evt))
+        return {
+            "episode_id": self._state.episode_id,
+            "step_count": int(self._state.step_count),
+            "deal_reached": bool(self._state.deal_reached),
+            "history": history,
+            "cumulative_reward": round(float(self._state.cumulative_reward), 6),
+            "task_name": self._task_config.name,
+            "difficulty": self._task_config.difficulty,
+        }
 
     def _now_utc_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -256,18 +294,37 @@ class SMENegotiatorEnvironment(Environment):
         self._state.step_count += 1
         self._state.negotiation_round = self._state.step_count
 
-        step_reward, reward_branch = self._compute_reward(
-            proposed_price,
-            proposed_days,
-            current_buyer_price=prior_buyer_price,
-            current_buyer_days=prior_buyer_days,
-        )
+        _use_v2_reward = os.getenv("SME_REWARD_V2", "0").strip() not in ("0", "false", "False")
+        if _use_v2_reward:
+            step_reward, reward_branch = self._compute_reward_v2(
+                proposed_price,
+                proposed_days,
+                current_buyer_price=prior_buyer_price,
+                current_buyer_days=prior_buyer_days,
+                used_tool_this_step=bool(originating_action.use_treds),
+            )
+        else:
+            step_reward, reward_branch = self._compute_reward(
+                proposed_price,
+                proposed_days,
+                current_buyer_price=prior_buyer_price,
+                current_buyer_days=prior_buyer_days,
+            )
 
         self._cumulative_reward += step_reward
         self._state.cumulative_reward = self._cumulative_reward
         self._state.buyer_price = self._buyer_price
         self._state.buyer_days = self._buyer_days
-        self._state.message = buyer_action.reason or "Buyer countered"
+        # Build an informative counter-offer message the LLM can read next turn.
+        buyer_days_delta = prior_buyer_days - self._buyer_days
+        tc = self._task_config
+        buyer_msg = (
+            f"Buyer countered: days={self._buyer_days} "
+            f"(was {prior_buyer_days}, conceded {buyer_days_delta} days), "
+            f"price={self._buyer_price:.2f} (was {prior_buyer_price:.2f}). "
+            f"To close: payment_days<={tc.liquidity_threshold}, price>={tc.cost_threshold:.2f}."
+        )
+        self._state.message = buyer_msg
         self._reward_debug_print(reward_branch, step_reward)
 
         done = self._check_done()
@@ -344,7 +401,6 @@ class SMENegotiatorEnvironment(Environment):
         liq = int(pct.liquidity_threshold)
         init_p = float(self._initial_buyer_price)
         cur_d = int(current_buyer_days)
-        cur_p = float(current_buyer_price)
 
         if proposed_price < cost:
             return 0.12, "invalid_below_cost"
@@ -352,10 +408,9 @@ class SMENegotiatorEnvironment(Environment):
         if proposed_days > cur_d:
             return 0.1, "no_progress_days_worse_than_buyer"
 
-        days_delta_frac = max(0.0, min(1.0, float(cur_d - proposed_days) / max(float(cur_d), 1.0)))
-        days_gap = max(1, cur_d - liq)
-        days_toward_threshold = max(0.0, min(1.0, float(cur_d - proposed_days) / float(days_gap)))
-        days_improve = max(0.0, min(1.0, 0.45 * days_delta_frac + 0.55 * days_toward_threshold))
+        # Baseline-anchored progress avoids denominator-shrink artifacts across rounds.
+        days_span = max(1, int(self._initial_buyer_days) - liq)
+        days_improve = max(0.0, min(1.0, float(int(self._initial_buyer_days) - proposed_days) / float(days_span)))
 
         price_span = max(1e-9, init_p - cost)
         price_improve = max(0.0, min(1.0, (float(proposed_price) - cost) / price_span))
@@ -367,8 +422,61 @@ class SMENegotiatorEnvironment(Environment):
 
         raw = 0.2 + 0.6 * improvement
         partial = min(0.3, raw * 0.3)
-        detail = f"improvement={improvement:.3f}|days={days_improve:.3f}|price={price_improve:.3f}"
+        detail = (
+            f"improvement={improvement:.3f}|days_baseline={days_improve:.3f}|price_baseline={price_improve:.3f}"
+        )
         return round(partial, 4), f"partial_progress:{detail}"
+
+    def _compute_reward_v2(
+        self,
+        proposed_price: float,
+        proposed_days: int,
+        *,
+        current_buyer_price: float,
+        current_buyer_days: int,
+        used_tool_this_step: bool = False,
+    ) -> Tuple[float, str]:
+        """V2 shaping: convergence-toward-agreement reward. Activated by SME_REWARD_V2=1.
+
+        Unlike V1 which measures SME profitability (penalising price concessions),
+        V2 measures how close the current proposal is to closing the deal. This
+        produces a naturally increasing reward signal as negotiation converges —
+        a cleaner gradient for RL training.
+        """
+        pct = self._task_config
+        cost = float(pct.cost_threshold)
+        liq = int(pct.liquidity_threshold)
+
+        if proposed_price < cost:
+            return 0.05, "v2_below_cost"
+        if proposed_days > current_buyer_days:
+            return 0.05, "v2_days_worse_than_buyer"
+
+        max_days = max(1, int(self._initial_buyer_days))
+        days_span = max(1, max_days - liq)
+        # days_proximity: 0.0 when days=max_days (start), 1.0 when days=liq (goal)
+        days_proximity = max(0.0, min(1.0, (max_days - proposed_days) / days_span))
+
+        # Gap bonus: reward closing the gap between SME proposal and buyer counter-offer
+        day_gap = max(0, proposed_days - current_buyer_days)
+        gap_fraction = 1.0 - min(1.0, day_gap / max(1, days_span))
+        gap_bonus = 0.15 * gap_fraction
+
+        combined = 0.70 * days_proximity + 0.15 * gap_bonus
+        shaped = 0.10 + 0.60 * combined  # range: [0.10, 0.70]
+
+        if used_tool_this_step:
+            shaped = min(0.75, shaped + 0.05)
+
+        # Alignment bonus: proposals at the goal zone with no gap earn extra
+        if day_gap == 0 and proposed_days <= liq:
+            shaped = min(0.75, shaped + 0.10)
+
+        detail = (
+            f"days_prox={days_proximity:.3f}|gap_bonus={gap_bonus:.3f}"
+            f"|combined={combined:.3f}|tool={used_tool_this_step}"
+        )
+        return round(min(0.75, shaped), 4), f"v2_convergence:{detail}"
 
     def _reward_debug_print(self, branch: str, step_reward: float) -> None:
         """Emit reward branch diagnostics when ``REWARD_DEBUG`` is enabled."""
@@ -492,6 +600,15 @@ class SMENegotiatorEnvironment(Environment):
 
         episode_id = str(kwargs.get("episode_id") or f"{tc.difficulty}_{self._seed}")
 
+        # Reset per-episode validation and supervision state
+        self._validator.reset()
+        self._step_in_progress = False
+        self._step_penalties = []
+        self._supervisor = ProcessSupervisor(
+            target_days=int(tc.liquidity_threshold),
+            difficulty=tc.difficulty,
+        )
+
         self._state = default_negotiation_state(
             episode_id=episode_id,
             seed=self._seed,
@@ -520,6 +637,9 @@ class SMENegotiatorEnvironment(Environment):
                 f"| Episode reset @ {self._now_utc_iso()} (task_id={tc.name}, base_concede={self._base_concede:.4f})"
             ),
         )
+
+        # Seed validator with initial buyer offer so accept can verify against it at round 0
+        self._validator.record_buyer_offer(episode_id, self._buyer_price, self._buyer_days)
 
         msg = self._state.message
         return self._obs_from_state(
@@ -579,7 +699,54 @@ class SMENegotiatorEnvironment(Environment):
             )
 
         action_type = str(action.action_type).lower()
+
+        # --- Mutation lock: detect re-entrant step() calls ---
+        if self._step_in_progress:
+            raise RuntimeError(
+                "Re-entrant step() call detected — SMENegotiatorEnvironment is not thread-safe. "
+                "Use separate environment instances for concurrent episodes."
+            )
+        self._step_in_progress = True
+
+        # --- Anti-cheat / anti-hack validation (supplements existing checks) ---
+        _validator_penalty = 0.0
+        deal_id = self._state.episode_id
+        if action_type in ("propose", "accept", "tool", "advance_period"):
+            _vresult = self._validator.validate(action, deal_id=deal_id)
+            if not _vresult.is_valid or _vresult.penalty != 0.0:
+                _validator_penalty = float(_vresult.penalty)
+                self._step_penalties.append(_validator_penalty)
+                # Hard violation on invalid_accept: terminate now with penalty
+                # (The existing accept validation below will also catch mismatches;
+                # this path handles cases where the validator fires first.)
+                if _vresult.should_terminate and _vresult.violation_type == "invalid_accept":
+                    terminal_reward = max(
+                        _strict_unit_interval(0.0),
+                        _strict_unit_interval(0.0) + _validator_penalty,
+                    )
+                    terminal_reward = _strict_unit_interval(max(0.0, terminal_reward))
+                    self._state.step_count += 1
+                    self._state.negotiation_round = self._state.step_count
+                    self._cumulative_reward += terminal_reward
+                    self._state.cumulative_reward = self._cumulative_reward
+                    self._state.message = _vresult.message
+                    self._step_in_progress = False
+                    return self._obs_from_state(
+                        buyer_accepted=False,
+                        negotiation_done=True,
+                        step_reward=terminal_reward,
+                        message=_vresult.message,
+                        reward=terminal_reward,
+                        done=True,
+                        metadata=self._episode_meta(
+                            "validator_invalid_accept",
+                            success=False,
+                            termination_reason="validator_invalid_accept",
+                        ),
+                    )
+
         if action_type in {"simulate_plan", "advance_period", "tool"}:
+            self._step_in_progress = False
             terminal_reward = _strict_unit_interval(0.0)
             self._state.step_count += 1
             self._state.negotiation_round = self._state.step_count
@@ -610,7 +777,15 @@ class SMENegotiatorEnvironment(Environment):
             reduction = self._rng.randint(5, 15)
             self._buyer_min_days_floor = max(0, self._buyer_min_days_floor - reduction)
             self._treds_used = True
-            message = f"TReDS lowered buyer day floor by {reduction} days"
+            wc_gap = float(getattr(self._state, "working_capital_gap", 0.0) or 0.0)
+            fin_rate = round(float(tc.interest_rate_annual) * 1.05, 4)
+            fin_approved = round(wc_gap * 0.8, 2)
+            coverage_pct = min(100, int(fin_approved / max(wc_gap, 1.0) * 100))
+            message = (
+                f"TReDS activated: buyer day floor reduced {reduction} days. "
+                f"Financier: rate={fin_rate:.1%}/yr, approved=INR {fin_approved:,.0f} "
+                f"({coverage_pct}% of WC gap)."
+            )
 
         auto_accept = (
             self._buyer_price <= proposed_price
@@ -642,6 +817,8 @@ class SMENegotiatorEnvironment(Environment):
             self._state.buyer_price = self._buyer_price
             self._state.buyer_days = self._buyer_days
             self._reward_debug_print("reject_episode", terminal_reward)
+            self._validator.mark_deal_resolved(deal_id)
+            self._step_in_progress = False
             return self._obs_from_state(
                 buyer_accepted=False,
                 negotiation_done=True,
@@ -664,6 +841,7 @@ class SMENegotiatorEnvironment(Environment):
             self._state.cumulative_reward = self._cumulative_reward
             self._state.message = "ACCEPT failed validation"
             self._reward_debug_print("invalid_accept_mismatch", terminal_reward)
+            self._step_in_progress = False
             return self._obs_from_state(
                 buyer_accepted=False,
                 negotiation_done=True,
@@ -702,6 +880,29 @@ class SMENegotiatorEnvironment(Environment):
             self._state.buyer_days = self._buyer_days
             self._reward_debug_print("terminal_agreement", terminal_reward)
             success = bool(self._deal_reached)
+            self._validator.mark_deal_resolved(deal_id)
+            # Supervisor: record accept + build breakdown for metadata
+            _accept_bd_meta: dict[str, Any] = {}
+            if self._supervisor is not None:
+                try:
+                    _rq_accept, _plan_bonus = self._supervisor.on_accept(deal_id, action, agreed_days)
+                except Exception:
+                    pass
+            try:
+                _bd_accept = compute_legacy_terminal_breakdown(
+                    self._state, task_name=self._task_config.name
+                )
+                _accept_bd_meta = _bd_accept.to_dict()
+            except Exception:
+                pass
+            _accept_meta = self._episode_meta(
+                "terminal_agreement", success=success, termination_reason="buyer_accepted_deal"
+            )
+            if _accept_bd_meta:
+                _accept_meta["reward_breakdown"] = _accept_bd_meta
+            if self._step_penalties:
+                _accept_meta["validator_penalties"] = list(self._step_penalties)
+            self._step_in_progress = False
             return self._obs_from_state(
                 buyer_accepted=True,
                 negotiation_done=True,
@@ -709,11 +910,7 @@ class SMENegotiatorEnvironment(Environment):
                 message="Deal reached",
                 reward=terminal_reward,
                 done=True,
-                metadata=self._episode_meta(
-                    "terminal_agreement",
-                    success=success,
-                    termination_reason="buyer_accepted_deal",
-                ),
+                metadata=_accept_meta,
             )
 
         prior_buyer_price = float(self._buyer_price)
@@ -722,6 +919,11 @@ class SMENegotiatorEnvironment(Environment):
         if action_type == "propose":
             self._last_sme_proposed_days = proposed_days
             self._last_sme_proposed_price = proposed_price
+            # Process supervision: track reasoning quality
+            if self._supervisor is not None:
+                _rq = self._supervisor.on_propose(deal_id, action)
+                # format_compliance: 1.0 if reason provided, 0.0 otherwise
+                _fmt = 1.0 if (action.reason and len(str(action.reason).strip()) >= 5) else 0.0
 
         price_jitter = self._rng.uniform(0.85, 1.15)
         price_drop = (
@@ -745,17 +947,46 @@ class SMENegotiatorEnvironment(Environment):
         self._state.step_count += 1
         self._state.negotiation_round = self._state.step_count
 
-        step_reward, reward_branch = self._compute_reward(
-            proposed_price,
-            proposed_days,
-            current_buyer_price=prior_buyer_price,
-            current_buyer_days=prior_buyer_days,
-        )
+        _use_v2 = os.getenv("SME_REWARD_V2", "0").strip() not in ("0", "false", "False")
+        if _use_v2:
+            step_reward, reward_branch = self._compute_reward_v2(
+                proposed_price,
+                proposed_days,
+                current_buyer_price=prior_buyer_price,
+                current_buyer_days=prior_buyer_days,
+                used_tool_this_step=use_treds,
+            )
+        else:
+            step_reward, reward_branch = self._compute_reward(
+                proposed_price,
+                proposed_days,
+                current_buyer_price=prior_buyer_price,
+                current_buyer_days=prior_buyer_days,
+            )
+
+        # Apply soft validator penalty to step reward (proposal_loop, tool_dedup)
+        step_reward = round(step_reward + _validator_penalty, 6)
 
         self._cumulative_reward += step_reward
         self._state.cumulative_reward = self._cumulative_reward
         self._state.buyer_price = self._buyer_price
         self._state.buyer_days = self._buyer_days
+
+        # Update validator with new buyer offer so future accepts can verify
+        self._validator.record_buyer_offer(deal_id, self._buyer_price, self._buyer_days)
+        # Process supervision: per-step progress tracking
+        if self._supervisor is not None:
+            self._supervisor.on_step_outcome(self._buyer_days)
+
+        # Enrich counter-offer message so LLM knows what the buyer conceded and what's needed to close.
+        buyer_days_delta = prior_buyer_days - self._buyer_days
+        if not message.startswith("TReDS"):
+            message = (
+                f"Buyer countered: days={self._buyer_days} "
+                f"(was {prior_buyer_days}, conceded {buyer_days_delta} days), "
+                f"price={self._buyer_price:.2f} (was {prior_buyer_price:.2f}). "
+                f"To close: payment_days<={tc.liquidity_threshold}, price>={tc.cost_threshold:.2f}."
+            )
         self._state.message = message
 
         self._reward_debug_print(reward_branch, step_reward)
@@ -776,6 +1007,22 @@ class SMENegotiatorEnvironment(Environment):
             termination_reason = "max_rounds_no_deal"
             success = False
 
+        # Build reward breakdown for metadata (legacy path: compliance-based approximation)
+        _bd_meta: dict[str, Any] = {}
+        if done and self._state is not None:
+            try:
+                _bd = compute_legacy_terminal_breakdown(self._state, task_name=self._task_config.name)
+                _bd_meta = _bd.to_dict()
+            except Exception:
+                pass
+
+        _step_meta = self._episode_meta(reward_branch, success=success, termination_reason=termination_reason)
+        if _bd_meta:
+            _step_meta["reward_breakdown"] = _bd_meta
+        if self._step_penalties:
+            _step_meta["validator_penalties"] = list(self._step_penalties)
+
+        self._step_in_progress = False
         return self._obs_from_state(
             buyer_accepted=False,
             negotiation_done=done,
@@ -783,11 +1030,7 @@ class SMENegotiatorEnvironment(Environment):
             message=self._state.message,
             reward=step_reward,
             done=done,
-            metadata=self._episode_meta(
-                reward_branch,
-                success=success,
-                termination_reason=termination_reason,
-            ),
+            metadata=_step_meta,
         )
 
 _LEGACY_SME_NEGOTIATOR_STEP = SMENegotiatorEnvironment.step
@@ -922,6 +1165,8 @@ class SMELiquidityEnvironment(Environment):
         financier_policy: Optional["FinancierPolicy"] = None,
         buyer_variance: float = 0.0,
         financier_variance: float = 0.0,
+        tool_backend_mode: Literal["deterministic", "live"] = "deterministic",
+        live_tool_adapters: Optional[dict[str, LiveToolAdapter]] = None,
     ) -> None:
         self._rng = Random()
         self._seed = 1000
@@ -956,10 +1201,27 @@ class SMELiquidityEnvironment(Environment):
         self._last_tool_call: Optional[ToolCallRecord] = None
         self._last_tool_name: Optional[str] = None
         self._last_tool_args: Optional[dict[str, object]] = None
-        self._last_tool_result: Optional[dict[str, object]] = None
+        self._last_tool_result: Optional[ToolResultEnvelope] = None
         self._pending_tool_bonus_by_deal: dict[str, float] = {}
         self._pending_tool_call_by_deal: dict[str, ToolCallRecord] = {}
         self._tool_spam_flag_by_deal: dict[str, bool] = {}
+        self._tool_backend_mode: Literal["deterministic", "live"] = (
+            "live" if str(tool_backend_mode).lower() == "live" else "deterministic"
+        )
+        self._tool_backends: dict[str, BaseToolBackend] = build_tool_backend_registry(
+            mode=self._tool_backend_mode,
+            live_adapters=live_tool_adapters,
+        )
+        self._tool_result_cache: dict[str, ToolResultEnvelope] = {}
+        self._active_reward_component_report: Optional[RewardComponentReport] = None
+        self._tool_call_count: int = 0
+        self._tool_effective_count: int = 0
+        self._duplicate_tool_count: int = 0
+        self._invalid_action_count: int = 0
+        self._stall_step_count: int = 0
+        self._terminated_by_step_cap: bool = False
+        self._episode_done: bool = False
+        self._episode_step_cap: int = 0
 
     @property
     def state(self) -> Optional[LiquidityEnvironmentState]:
@@ -1079,6 +1341,86 @@ class SMELiquidityEnvironment(Environment):
             return False
         return bool(self._tool_spam_flag_by_deal.get(self._active_deal_id, False))
 
+    def _episode_step_cap_for_world(self) -> int:
+        assert self._world_state is not None
+        deal_slots_per_period = max(1, len(self._world_state.buyers))
+        per_deal_budget = max(1, int(self._task_config.max_rounds)) + 4
+        macro_budget = max(1, int(self._world_state.total_periods))
+        return max(8, macro_budget * deal_slots_per_period * per_deal_budget + macro_budget)
+
+    def _tool_cache_key(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict[str, object],
+        context_fingerprint: str,
+    ) -> str:
+        return json.dumps(
+            {
+                "tool_name": str(tool_name).upper(),
+                "tool_args": tool_args,
+                "context_fingerprint": context_fingerprint,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            default=str,
+            separators=(",", ":"),
+        )
+
+    def _current_reward_component_report(self, *, tool_bonus: float = 0.0) -> Optional[RewardComponentReport]:
+        assert self._world_state is not None
+        deal_id = self._active_deal_id
+        if deal_id is None:
+            return None
+        trajectory = self._deal_trajectories.get(deal_id, [])
+        if not trajectory:
+            return None
+        return compute_reward_component_report(
+            self._world_state,
+            trajectory,
+            lambda_shaping=float(self._world_state.reward_lambda_shaping),
+            tool_bonus=float(tool_bonus),
+        )
+
+    def _failure_termination_reason(self) -> Optional[str]:
+        assert self._world_state is not None
+        for sme in self._world_state.smes:
+            if bool(sme.defaulted):
+                return "sme_defaulted"
+            if float(sme.cash_balance) < 0.0:
+                return "negative_cash_balance"
+            if float(sme.current_utilization) > float(sme.credit_limit):
+                return "credit_limit_breached"
+        return None
+
+    def _tool_error_envelope(
+        self,
+        *,
+        tool_name: str,
+        tool_args: dict[str, object],
+        context_fingerprint: str,
+        detail: str,
+        error_code: str,
+    ) -> ToolResultEnvelope:
+        return ToolResultEnvelope(
+            source="deterministic",
+            backend_name="ToolErrorEnvelope",
+            request_id=self._tool_cache_key(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                context_fingerprint=context_fingerprint,
+            ),
+            latency_ms=0,
+            cache_hit=False,
+            stale=False,
+            normalized_payload={
+                "error": error_code,
+                "tool_name": str(tool_name).upper(),
+                "detail": detail,
+            },
+            requested_source=self._tool_backend_mode,
+        )
+
     def _deal_context_fingerprint(self, deal_id: Optional[str]) -> str:
         assert self._world_state is not None
         deal_payload: dict[str, object] = {"deal_id": deal_id}
@@ -1114,7 +1456,7 @@ class SMELiquidityEnvironment(Environment):
         deal_id: Optional[str] = None,
         tool_name: Optional[str] = None,
         tool_args: Optional[dict[str, object]] = None,
-        tool_result: Optional[dict[str, object]] = None,
+        tool_result: Optional[ToolResultEnvelope] = None,
     ) -> None:
         assert self._world_state is not None
         self._history.append(
@@ -1150,13 +1492,16 @@ class SMELiquidityEnvironment(Environment):
         latest_reward_branch: Optional[str] = None,
         total_sme_reward: Optional[float] = None,
         tool_bonus_applied: float = 0.0,
+        termination_reason: Optional[str] = None,
     ) -> dict[str, object]:
         assert self._world_state is not None
+        reward_component_report = self._active_reward_component_report
         metadata: dict[str, object] = {
             "reward_mode": "stage3_long_horizon",
             "active_deal_id": self._active_deal_id,
             "current_period": int(self._world_state.current_period),
             "episode_step": int(self._world_state.episode_step),
+            "episode_step_cap": int(self._episode_step_cap),
             "legacy_inner_reward": self._legacy_last_reward,
             "legacy_reward_branch": latest_reward_branch,
             "latest_shaping_reward": latest_shaping_reward,
@@ -1165,10 +1510,17 @@ class SMELiquidityEnvironment(Environment):
             "resolved_deal_count": len(self._resolved_deal_ids),
             "defaulted_sme_count": sum(1 for sme in self._world_state.smes if sme.defaulted),
             "last_tool_name": self._last_tool_name,
+            "tool_backend_mode": self._tool_backend_mode,
             "tool_bonus_applied": round(float(tool_bonus_applied), 6),
             "pending_tool_bonus": round(self._current_pending_tool_bonus(), 6),
             "tool_spam_flag": self._current_tool_spam_flag(),
             "tool_history_length": len(self._tool_history),
+            "tool_call_count": int(self._tool_call_count),
+            "tool_effective_count": int(self._tool_effective_count),
+            "duplicate_tool_count": int(self._duplicate_tool_count),
+            "invalid_action_count": int(self._invalid_action_count),
+            "stall_step_count": int(self._stall_step_count),
+            "terminated_by_step_cap": bool(self._terminated_by_step_cap),
         }
         if self._active_deal_id is not None:
             metadata["trajectory_length"] = len(self._deal_trajectories.get(self._active_deal_id, []))
@@ -1176,6 +1528,14 @@ class SMELiquidityEnvironment(Environment):
             metadata["shaping_lambda"] = float(self._world_state.reward_lambda_shaping)
         if total_sme_reward is not None:
             metadata["total_sme_reward"] = total_sme_reward
+        if reward_component_report is not None:
+            metadata["reward_component_report"] = reward_component_report.model_dump()
+        if self._last_tool_result is not None:
+            metadata["last_tool_source"] = self._last_tool_result.source
+            metadata["last_tool_backend_name"] = self._last_tool_result.backend_name
+            metadata["last_tool_cache_hit"] = bool(self._last_tool_result.cache_hit)
+        if termination_reason is not None:
+            metadata["termination_reason"] = termination_reason
         return metadata
 
     def _build_observation(
@@ -1220,7 +1580,12 @@ class SMELiquidityEnvironment(Environment):
                 "projected_penalties": _proj.period_penalties if _proj is not None else None,
                 "last_tool_name": self._last_tool_name,
                 "last_tool_args": dict(self._last_tool_args) if self._last_tool_args is not None else None,
-                "last_tool_result": dict(self._last_tool_result) if self._last_tool_result is not None else None,
+                "last_tool_result": self._last_tool_result.model_copy(deep=True)
+                if self._last_tool_result is not None
+                else None,
+                "reward_component_report": self._active_reward_component_report.model_copy(deep=True)
+                if self._active_reward_component_report is not None
+                else None,
                 "history": self._history_tail(),
             }
         )
@@ -1526,6 +1891,9 @@ class SMELiquidityEnvironment(Environment):
 
         active_trajectory = self._deal_trajectories.get(current_negotiation.deal_id or "", [])
         active_shaping = self._deal_shaping_rewards.get(current_negotiation.deal_id or "", [])
+        self._active_reward_component_report = self._current_reward_component_report(
+            tool_bonus=self._current_pending_tool_bonus(),
+        )
         self._state = LiquidityEnvironmentState(
             episode_id=current_negotiation.episode_id,
             seed=self._seed,
@@ -1564,16 +1932,38 @@ class SMELiquidityEnvironment(Environment):
             else None,
             history_tail=self._history_tail(),
             pending_tool_bonus=round(self._current_pending_tool_bonus(), 6),
+            active_reward_component_report=self._active_reward_component_report.model_copy(deep=True)
+            if self._active_reward_component_report is not None
+            else None,
+            tool_call_count=int(self._tool_call_count),
+            tool_effective_count=int(self._tool_effective_count),
+            duplicate_tool_count=int(self._duplicate_tool_count),
+            invalid_action_count=int(self._invalid_action_count),
+            stall_step_count=int(self._stall_step_count),
+            terminated_by_step_cap=bool(self._terminated_by_step_cap),
+            episode_step_cap=int(self._episode_step_cap),
+            tool_backend_mode=self._tool_backend_mode,
         )
 
-    def _error_observation(self, message: str, *, done: bool = False) -> LiquidityObservation:
+    def _error_observation(
+        self,
+        message: str,
+        *,
+        done: bool = False,
+        invalid_action: bool = False,
+        termination_reason: Optional[str] = None,
+    ) -> LiquidityObservation:
+        if invalid_action:
+            self._invalid_action_count += 1
+            if self._world_state is not None:
+                self._rebuild_state_snapshot()
         basis = self._current_basis_observation()
         observation = basis.model_copy(update={"message": message})
         return self._build_observation(
             observation,
             reward_override=0.0,
             done_override=done,
-            extra_metadata=self._metadata_bundle(),
+            extra_metadata=self._metadata_bundle(termination_reason=termination_reason),
             simulation_projection=self._last_simulation_result,
         )
 
@@ -1611,6 +2001,16 @@ class SMELiquidityEnvironment(Environment):
         self._pending_tool_bonus_by_deal = {}
         self._pending_tool_call_by_deal = {}
         self._tool_spam_flag_by_deal = {}
+        self._tool_result_cache = {}
+        self._active_reward_component_report = None
+        self._tool_call_count = 0
+        self._tool_effective_count = 0
+        self._duplicate_tool_count = 0
+        self._invalid_action_count = 0
+        self._stall_step_count = 0
+        self._terminated_by_step_cap = False
+        self._episode_done = False
+        self._episode_step_cap = 0
 
         requested_task = kwargs.get("task_name") or kwargs.get("task")
         task_id = resolve_task_id(
@@ -1619,6 +2019,7 @@ class SMELiquidityEnvironment(Environment):
         )
         self._task_config = TASK_REGISTRY[task_id]
         self._world_state = self._build_world_state()
+        self._episode_step_cap = self._episode_step_cap_for_world()
         self._spawn_period_deals(0)
         self._rebuild_state_snapshot()
         return self._build_observation(
@@ -1650,16 +2051,73 @@ class SMELiquidityEnvironment(Environment):
         )
         return projection, tool_result
 
+    def _terminate_episode(
+        self,
+        *,
+        termination_reason: str,
+        terminated_by_step_cap: bool = False,
+    ) -> LiquidityObservation:
+        assert self._world_state is not None
+        self._close_open_deals_for_episode_end()
+        self._latest_verifiable_reward = self._macro_terminal_reward()
+        self._terminated_by_step_cap = bool(terminated_by_step_cap)
+        self._episode_done = True
+        reward_value = float(self._latest_verifiable_reward or 0.0)
+        self._append_history_event(
+            actor="SYSTEM",
+            event_type="episode_termination",
+            deal_id=None,
+            summary=(
+                f"terminate reason={termination_reason} "
+                f"step_cap={bool(terminated_by_step_cap)} reward={reward_value:.6f}"
+            ),
+        )
+        self._rl_reward_trace.append(reward_value)
+        self._rebuild_state_snapshot()
+        return self._build_observation(
+            self._current_basis_observation(),
+            reward_override=reward_value,
+            done_override=True,
+            extra_metadata=self._metadata_bundle(
+                total_sme_reward=reward_value,
+                termination_reason=termination_reason,
+            ),
+            simulation_projection=self._last_simulation_result,
+        )
+
+    def _enforce_terminal_conditions(self, observation: LiquidityObservation) -> LiquidityObservation:
+        assert self._world_state is not None
+        if bool(observation.done):
+            self._episode_done = True
+            return observation
+        failure_reason = self._failure_termination_reason()
+        if failure_reason is not None:
+            return self._terminate_episode(termination_reason=failure_reason)
+        if int(self._episode_step_cap) > 0 and int(self._world_state.episode_step) >= int(self._episode_step_cap):
+            return self._terminate_episode(
+                termination_reason="episode_step_cap",
+                terminated_by_step_cap=True,
+            )
+        return observation
+
     def _step_negotiation(self, action: NegotiationAction) -> LiquidityObservation:
         assert self._world_state is not None
 
         deal_id = action.deal_id or self._active_deal_id
         if not deal_id or deal_id not in self._deal_envs:
-            return self._error_observation("No active deal is available for a negotiation action.")
+            return self._error_observation(
+                "No active deal is available for a negotiation action.",
+                invalid_action=True,
+                termination_reason="missing_active_deal",
+            )
 
         deal = self._get_deal_state(deal_id)
         if deal.status != "open":
-            return self._error_observation(f"Deal '{deal_id}' is already resolved.")
+            return self._error_observation(
+                f"Deal '{deal_id}' is already resolved.",
+                invalid_action=True,
+                termination_reason="deal_already_resolved",
+            )
 
         previous_state = self._current_negotiations.get(deal_id)
         self._world_state.episode_step += 1
@@ -1778,6 +2236,15 @@ class SMELiquidityEnvironment(Environment):
             pending_tool_bonus=float(self._pending_tool_bonus_by_deal.get(deal_id, 0.0)),
         )
         reward_value = round(float(self._world_state.reward_lambda_shaping) * latest_shaping + tool_bonus, 6)
+        pending_tool_call = self._pending_tool_call_by_deal.get(deal_id)
+        if pending_tool_call is not None and float(tool_bonus) > 0.0:
+            self._tool_effective_count += 1
+        if (
+            str(action.action_type).lower() == "propose"
+            and not bool(observation.done)
+            and float(reward_value) <= 0.0
+        ):
+            self._stall_step_count += 1
         self._append_history_event(
             actor="SME",
             event_type="negotiation_step",
@@ -1794,6 +2261,13 @@ class SMELiquidityEnvironment(Environment):
         self._tool_spam_flag_by_deal.pop(deal_id, None)
         self._rl_reward_trace.append(reward_value)
         self._rebuild_state_snapshot()
+        self._active_reward_component_report = self._current_reward_component_report(tool_bonus=tool_bonus)
+        if self._state is not None:
+            self._state.active_reward_component_report = (
+                self._active_reward_component_report.model_copy(deep=True)
+                if self._active_reward_component_report is not None
+                else None
+            )
         return self._build_observation(
             observation,
             reward_override=reward_value,
@@ -1850,39 +2324,12 @@ class SMELiquidityEnvironment(Environment):
         self._legacy_last_reward = None
         self._latest_verifiable_reward = None
 
-        valid_tool = tool_name in {"QUERY_TREDS", "CHECK_COMPLIANCE", "RUN_CASHFLOW_SIM"}
-        try:
-            if tool_name == "QUERY_TREDS":
-                invoice_id = str(tool_args.get("invoice_id") or tool_args.get("deal_id") or deal_id or "")
-                tool_result = query_treds(self._world_state, invoice_id)
-                simulation_projection = self._last_simulation_result
-            elif tool_name == "CHECK_COMPLIANCE":
-                contract_id = str(tool_args.get("contract_id") or tool_args.get("deal_id") or deal_id or "")
-                tool_result = check_compliance(
-                    self._world_state,
-                    contract_id,
-                    negotiation_state=self._current_negotiations.get(contract_id),
-                )
-                simulation_projection = self._last_simulation_result
-            elif tool_name == "RUN_CASHFLOW_SIM":
-                projection, tool_result = self._run_cashflow_projection(
-                    plan=tool_args.get("plan") if isinstance(tool_args.get("plan"), dict) else {},
-                    horizon=int(tool_args.get("horizon")) if tool_args.get("horizon") is not None else None,
-                )
-                self._last_simulation_result = projection
-                simulation_projection = projection
-            else:
-                tool_result = {"error": "unknown_tool", "tool_name": tool_name}
-                simulation_projection = self._last_simulation_result
-        except (KeyError, TypeError, ValueError) as exc:
-            tool_result = {
-                "error": "tool_execution_failed",
-                "tool_name": tool_name,
-                "detail": str(exc),
-            }
-            simulation_projection = self._last_simulation_result
-
         context_fingerprint = self._deal_context_fingerprint(deal_id)
+        cache_key = self._tool_cache_key(
+            tool_name=tool_name,
+            tool_args=tool_args,
+            context_fingerprint=context_fingerprint,
+        )
         duplicate_tool = False
         previous_tool = self._pending_tool_call_by_deal.get(deal_id or "")
         if previous_tool is not None:
@@ -1892,12 +2339,52 @@ class SMELiquidityEnvironment(Environment):
                 and previous_tool.context_fingerprint == context_fingerprint
                 and int(previous_tool.period_index) == int(self._world_state.current_period)
             )
+        self._tool_call_count += 1
+        if duplicate_tool:
+            self._duplicate_tool_count += 1
 
         if deal_id is not None:
             self._pending_tool_bonus_by_deal[deal_id] = -0.005 if duplicate_tool else 0.0
             self._tool_spam_flag_by_deal[deal_id] = duplicate_tool
 
+        backend = self._tool_backends.get(tool_name)
+        valid_tool = backend is not None
         if valid_tool:
+            cached_result = self._tool_result_cache.get(cache_key)
+            if cached_result is not None:
+                tool_result = cached_result.model_copy(update={"cache_hit": True, "latency_ms": 0})
+            else:
+                try:
+                    tool_result = backend.invoke(
+                        world_state=self._world_state,
+                        tool_args=tool_args,
+                        context_fingerprint=context_fingerprint,
+                        negotiation_state=self._current_negotiations.get(deal_id or ""),
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    self._invalid_action_count += 1
+                    tool_result = self._tool_error_envelope(
+                        tool_name=tool_name,
+                        tool_args=tool_args,
+                        context_fingerprint=context_fingerprint,
+                        detail=str(exc),
+                        error_code="tool_execution_failed",
+                    )
+                else:
+                    self._tool_result_cache[cache_key] = tool_result.model_copy(deep=True)
+
+            payload = dict(tool_result.normalized_payload)
+            if tool_name == "RUN_CASHFLOW_SIM" and "error" not in payload:
+                projection = CashflowProjection(
+                    period_balances=[float(item) for item in payload.get("period_balances", [])],
+                    period_defaults=[bool(item) for item in payload.get("period_defaults", [])],
+                    period_penalties=[float(item) for item in payload.get("period_penalties", [])],
+                )
+                self._last_simulation_result = projection
+                simulation_projection = projection
+            else:
+                simulation_projection = self._last_simulation_result
+
             record = ToolCallRecord(
                 step_index=int(self._world_state.episode_step),
                 period_index=int(self._world_state.current_period),
@@ -1911,13 +2398,24 @@ class SMELiquidityEnvironment(Environment):
             self._last_tool_call = record
             self._last_tool_name = tool_name
             self._last_tool_args = dict(tool_args)
-            self._last_tool_result = dict(tool_result)
-            if deal_id is not None:
+            self._last_tool_result = tool_result.model_copy(deep=True)
+            if deal_id is not None and "error" not in payload:
                 self._pending_tool_call_by_deal[deal_id] = record
+            elif deal_id is not None:
+                self._pending_tool_call_by_deal.pop(deal_id, None)
         else:
+            self._invalid_action_count += 1
+            tool_result = self._tool_error_envelope(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                context_fingerprint=context_fingerprint,
+                detail=f"Unknown tool '{tool_name}'",
+                error_code="unknown_tool",
+            )
+            simulation_projection = self._last_simulation_result
             self._last_tool_name = tool_name
             self._last_tool_args = dict(tool_args)
-            self._last_tool_result = dict(tool_result)
+            self._last_tool_result = tool_result.model_copy(deep=True)
 
         self._append_history_event(
             actor="TOOL",
@@ -1942,7 +2440,12 @@ class SMELiquidityEnvironment(Environment):
         assert self._world_state is not None
 
         if int(self._world_state.current_period) >= int(self._world_state.total_periods):
-            return self._error_observation("Macro episode already completed.", done=True)
+            return self._error_observation(
+                "Macro episode already completed.",
+                done=True,
+                invalid_action=True,
+                termination_reason="post_terminal_action",
+            )
 
         self._world_state.episode_step += 1
         self._world_state = advance_world_state(self._world_state)
@@ -1960,6 +2463,7 @@ class SMELiquidityEnvironment(Environment):
             reward_value = self._latest_verifiable_reward
             done = True
             total_sme_reward = self._latest_verifiable_reward
+            self._episode_done = True
 
         self._append_history_event(
             actor="SYSTEM",
@@ -1976,7 +2480,10 @@ class SMELiquidityEnvironment(Environment):
             self._current_basis_observation(),
             reward_override=reward_value,
             done_override=done,
-            extra_metadata=self._metadata_bundle(total_sme_reward=total_sme_reward),
+            extra_metadata=self._metadata_bundle(
+                total_sme_reward=total_sme_reward,
+                termination_reason="macro_horizon_end" if done else None,
+            ),
             simulation_projection=self._last_simulation_result,
         )
 
@@ -1986,14 +2493,29 @@ class SMELiquidityEnvironment(Environment):
         if self._world_state is None:
             self.reset(seed=self._seed, difficulty=self._task_config.difficulty, **kwargs)
             assert self._world_state is not None
+        if self._episode_done:
+            return self._error_observation(
+                "Episode already completed.",
+                done=True,
+                invalid_action=True,
+                termination_reason="post_terminal_action",
+            )
 
         action_type = str(action.action_type).lower()
         if action_type in {"propose", "accept", "reject"}:
-            return self._step_negotiation(action)
+            observation = self._step_negotiation(action)
+            return self._enforce_terminal_conditions(observation)
         if action_type == "simulate_plan":
-            return self._step_simulation(action)
+            observation = self._step_simulation(action)
+            return self._enforce_terminal_conditions(observation)
         if action_type == "advance_period":
-            return self._step_advance_period()
+            observation = self._step_advance_period()
+            return self._enforce_terminal_conditions(observation)
         if action_type == "tool":
-            return self._step_tool(action)
-        return self._error_observation(f"Unsupported liquidity action type '{action_type}'.")
+            observation = self._step_tool(action)
+            return self._enforce_terminal_conditions(observation)
+        return self._error_observation(
+            f"Unsupported liquidity action type '{action_type}'.",
+            invalid_action=True,
+            termination_reason="unsupported_action_type",
+        )

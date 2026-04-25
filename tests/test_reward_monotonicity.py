@@ -9,7 +9,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from sme_negotiator_env.graders import compute_verifiable_reward
+from sme_negotiator_env.graders import (
+    compute_reward_component_report,
+    compute_total_sme_reward,
+    compute_verifiable_reward,
+)
 from sme_negotiator_env.models import (
     BuyerState,
     FinancierState,
@@ -149,3 +153,32 @@ def test_verifiable_reward_prefers_compliance_repair_via_penalty_clause() -> Non
     reward_repaired = compute_verifiable_reward(world_state, [baseline, repaired])
 
     assert reward_repaired > reward_non_compliant
+
+
+def test_reward_component_report_reconstructs_scalar_total_with_bounded_tool_bonus() -> None:
+    world_state = _base_world_state()
+    baseline = _baseline_state()
+    improved = baseline.model_copy(
+        update={
+            "deal_reached": True,
+            "final_price": 95.0,
+            "final_days": 45,
+            "agreed_terms": 45,
+            "buyer_days": 45,
+            "late_payment_penalty_agreed": False,
+            "message": "improved",
+        }
+    )
+
+    report = compute_reward_component_report(
+        world_state,
+        [baseline, improved],
+        lambda_shaping=0.1,
+        tool_bonus=0.01,
+    )
+    expected_total = round(compute_total_sme_reward(world_state, [baseline, improved], lambda_shaping=0.1) + 0.01, 6)
+
+    assert report.total_reward == expected_total
+    assert report.verifiable_reward == compute_verifiable_reward(world_state, [baseline, improved])
+    assert abs(report.tool_bonus) <= 0.01
+    assert report.success_no_default_positive_npv is True

@@ -31,6 +31,15 @@ class EpisodeSummary:
     persona_name: Optional[str] = None
     buyer_policy_id: Optional[str] = None
     financier_policy_id: Optional[str] = None
+    verifiable_reward: float = 0.0
+    total_reward: float = 0.0
+    tool_call_count: int = 0
+    tool_effective_count: int = 0
+    duplicate_tool_count: int = 0
+    invalid_action_count: int = 0
+    stall_step_count: int = 0
+    terminated_by_step_cap: bool = False
+    tool_backend_mode: Optional[str] = None
 
 
 def build_episode_log(wrapper: object) -> str:
@@ -89,13 +98,22 @@ def build_episode_log(wrapper: object) -> str:
                 "Summary: "
                 f"episode_completed={episode_summary.episode_completed} "
                 f"base_rl_reward={episode_summary.base_rl_reward:.6f} "
+                f"verifiable_reward={episode_summary.verifiable_reward:.6f} "
+                f"total_reward={episode_summary.total_reward:.6f} "
                 f"tool_bonus_total={episode_summary.tool_bonus_total:.6f} "
                 f"env_reward_total={episode_summary.env_reward_total:.6f} "
                 f"success_no_default_positive_npv={episode_summary.success_no_default_positive_npv} "
                 f"average_final_payment_days={episode_summary.average_final_payment_days:.3f} "
                 f"tool_usage_count={episode_summary.tool_usage_count} "
+                f"tool_call_count={episode_summary.tool_call_count} "
+                f"tool_effective_count={episode_summary.tool_effective_count} "
+                f"duplicate_tool_count={episode_summary.duplicate_tool_count} "
+                f"invalid_action_count={episode_summary.invalid_action_count} "
+                f"stall_step_count={episode_summary.stall_step_count} "
                 f"resolved_deal_count={episode_summary.resolved_deal_count} "
                 f"defaulted_sme_count={episode_summary.defaulted_sme_count} "
+                f"terminated_by_step_cap={episode_summary.terminated_by_step_cap} "
+                f"tool_backend_mode={episode_summary.tool_backend_mode} "
                 f"curriculum_level={episode_summary.curriculum_level} "
                 f"persona_name={episode_summary.persona_name} "
                 f"buyer_policy_id={episode_summary.buyer_policy_id} "

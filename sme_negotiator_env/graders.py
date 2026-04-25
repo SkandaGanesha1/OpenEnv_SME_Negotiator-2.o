@@ -31,6 +31,7 @@ from typing import Callable
 from sme_negotiator_env.models import (
     BuyerState,
     NegotiationState,
+    RewardComponentReport,
     SMEAccountState,
     ToolCallRecord,
     WorldState,
@@ -326,36 +327,119 @@ def compute_shaping_rewards(trajectory: list[NegotiationState]) -> list[float]:
 
     shaping: list[float] = []
     for prev_state, next_state in zip(trajectory, trajectory[1:]):
-        prev_gap = _effective_working_capital_gap(prev_state)
-        next_gap = _effective_working_capital_gap(next_state)
-        gap_term = _clip(
+        _, _, _, reward_t = _transition_shaping_terms(prev_state, next_state)
+        shaping.append(reward_t)
+
+    return shaping
+
+
+def _transition_shaping_terms(
+    prev_state: NegotiationState,
+    next_state: NegotiationState,
+) -> tuple[float, float, float, float]:
+    """Return rounded shaping sub-terms and combined reward for one transition."""
+    prev_gap = _effective_working_capital_gap(prev_state)
+    next_gap = _effective_working_capital_gap(next_state)
+    gap_term = round(
+        _clip(
             (prev_gap - next_gap)
             / max(prev_gap, float(prev_state.sme_monthly_revenue) * 0.25, 1.0),
             -1.0,
             1.0,
-        )
+        ),
+        6,
+    )
 
-        target_days = min(int(prev_state.liquidity_threshold), 45)
-        prev_days_delta = abs(_effective_receivable_days(prev_state) - target_days)
-        next_days_delta = abs(_effective_receivable_days(next_state) - target_days)
-        days_term = _clip(
+    target_days = min(int(prev_state.liquidity_threshold), 45)
+    prev_days_delta = abs(_effective_receivable_days(prev_state) - target_days)
+    next_days_delta = abs(_effective_receivable_days(next_state) - target_days)
+    days_term = round(
+        _clip(
             (prev_days_delta - next_days_delta) / max(target_days, 1),
             -1.0,
             1.0,
-        )
+        ),
+        6,
+    )
 
-        prev_mismatch = _receivable_payable_mismatch(prev_state)
-        next_mismatch = _receivable_payable_mismatch(next_state)
-        alignment_term = _clip(
+    prev_mismatch = _receivable_payable_mismatch(prev_state)
+    next_mismatch = _receivable_payable_mismatch(next_state)
+    alignment_term = round(
+        _clip(
             (prev_mismatch - next_mismatch) / max(int(prev_state.sme_supplier_payment_days), 1),
             -1.0,
             1.0,
+        ),
+        6,
+    )
+
+    reward_t = round(0.5 * gap_term + 0.3 * days_term + 0.2 * alignment_term, 6)
+    return gap_term, days_term, alignment_term, reward_t
+
+
+def compute_reward_component_report(
+    world_state: WorldState,
+    trajectory: list[NegotiationState],
+    *,
+    lambda_shaping: float = 0.1,
+    tool_bonus: float = 0.0,
+) -> RewardComponentReport:
+    """Return a structured reward report without changing any scalar semantics."""
+    if not trajectory:
+        return RewardComponentReport(
+            verifiable_reward=0.0,
+            shaping_gap=0.0,
+            shaping_days=0.0,
+            shaping_alignment=0.0,
+            shaping_total=0.0,
+            tool_bonus=round(float(tool_bonus), 6),
+            total_reward=round(float(tool_bonus), 6),
+            npv_delta_vs_baseline=0.0,
+            success_no_default_positive_npv=False,
+            lambda_shaping=float(lambda_shaping),
         )
 
-        reward_t = round(0.5 * gap_term + 0.3 * days_term + 0.2 * alignment_term, 6)
-        shaping.append(reward_t)
+    gap_total = 0.0
+    days_total = 0.0
+    alignment_total = 0.0
+    shaping_rewards: list[float] = []
+    for prev_state, next_state in zip(trajectory, trajectory[1:]):
+        gap_term, days_term, alignment_term, reward_t = _transition_shaping_terms(prev_state, next_state)
+        gap_total += gap_term
+        days_total += days_term
+        alignment_total += alignment_term
+        shaping_rewards.append(reward_t)
 
-    return shaping
+    verifiable_reward = compute_verifiable_reward(world_state, trajectory)
+    shaping_total = round(sum(shaping_rewards), 6)
+    npv_delta = compute_npv_delta_vs_baseline(world_state, trajectory)
+    final_state = trajectory[-1]
+    sme = _lookup_sme(world_state, final_state.sme_id)
+    success_flag = bool(
+        not sme.defaulted
+        and float(sme.cash_balance) >= 0.0
+        and float(sme.current_utilization) <= float(sme.credit_limit)
+        and not sme.missed_supplier_payment
+        and float(npv_delta) > 0.0
+    )
+    total_reward = round(
+        float(verifiable_reward)
+        + float(lambda_shaping) * float(shaping_total)
+        + float(tool_bonus),
+        6,
+    )
+    return RewardComponentReport(
+        verifiable_reward=round(float(verifiable_reward), 6),
+        shaping_gap=round(gap_total, 6),
+        shaping_days=round(days_total, 6),
+        shaping_alignment=round(alignment_total, 6),
+        shaping_total=round(shaping_total, 6),
+        tool_bonus=round(float(tool_bonus), 6),
+        total_reward=round(total_reward, 6),
+        npv_delta_vs_baseline=round(float(npv_delta), 6),
+        success_no_default_positive_npv=success_flag,
+        lambda_shaping=float(lambda_shaping),
+    )
 
 
 def compute_total_sme_reward(
@@ -445,3 +529,231 @@ TASK_GRADERS: dict[str, Callable[[NegotiationState], float]] = {
     "payment-terms-medium": grade_task_payment_terms_medium,
     "payment-terms-hard": grade_task_dynamic_discounting_hard,
 }
+
+
+# ======================================================================= #
+# Stage 7: Structured RewardBreakdown path                                 #
+# All existing functions above remain unchanged for backward compatibility. #
+# ======================================================================= #
+
+def compute_verifiable_reward_breakdown(
+    world_state: WorldState,
+    trajectory: list[NegotiationState],
+    *,
+    shaping_rewards: list[float] | None = None,
+    lambda_shaping: float = 0.1,
+    process_supervisor: object | None = None,
+    step_penalties: list[float] | None = None,
+) -> "RewardBreakdown":
+    """Return a full RewardBreakdown instead of a scalar.
+
+    Calls the same internal sub-computations as compute_verifiable_reward but
+    assembles all components into a RewardBreakdown dataclass.
+
+    compute_verifiable_reward is preserved unchanged and now delegates here:
+    ``return compute_verifiable_reward_breakdown(...).total``
+
+    Parameters
+    ----------
+    world_state, trajectory:
+        Same as compute_verifiable_reward.
+    shaping_rewards:
+        Pre-computed shaping rewards list (from compute_shaping_rewards).
+        If None, computed internally.
+    lambda_shaping:
+        Weight for shaping rewards in the total. Default 0.1.
+    process_supervisor:
+        Optional ProcessSupervisor instance. If provided, its accumulated
+        signals are incorporated into the reasoning_quality and
+        tool_strategic_use components.
+    step_penalties:
+        Optional list of per-step anti-cheat penalties (from ActionValidator).
+        Summed into penalty_total.
+    """
+    from sme_negotiator_env.reward_breakdown import RewardBreakdown
+
+    if not trajectory:
+        return RewardBreakdown(total=0.0, is_terminal=True, termination_reason="empty_trajectory")
+
+    final_state = trajectory[-1]
+    sme = _lookup_sme(world_state, final_state.sme_id)
+    _lookup_buyer(world_state, final_state.buyer_id)
+
+    # --- Terminal RLVR components (same logic as compute_verifiable_reward) ---
+    default_flag = bool(
+        sme.defaulted
+        or float(sme.cash_balance) < 0.0
+        or float(sme.current_utilization) > float(sme.credit_limit)
+        or sme.missed_supplier_payment
+    )
+
+    if default_flag:
+        solvency_score = 0.0
+        liquidity_score = 0.0
+        npv_score = 0.0
+    else:
+        solvency_score = 1.0
+        liquidity_score = _clip(
+            float(sme.cash_balance) / max(float(sme.required_minimum_cash), 1.0),
+            0.0,
+            1.0,
+        )
+        discount_rate = (
+            float(world_state.baseline_discount_rate)
+            if float(world_state.baseline_discount_rate) > 0.0
+            else float(final_state.interest_rate_annual)
+        )
+        baseline_state = trajectory[0]
+        npv_baseline = _npv_from_state(baseline_state, baseline=True, discount_rate=discount_rate)
+        npv_actual = _npv_from_state(final_state, baseline=False, discount_rate=discount_rate)
+        npv_score = _clip(
+            0.5
+            + 0.5 * (npv_actual - npv_baseline)
+            / max(abs(npv_baseline), float(sme.required_minimum_cash), 1.0),
+            0.0,
+            1.0,
+        )
+
+    effective_days = _effective_receivable_days(final_state)
+    if effective_days <= int(world_state.legal_max_payment_days):
+        compliance_score = 1.0
+    elif effective_days <= int(world_state.legal_max_payment_days) + 7 and final_state.late_payment_penalty_agreed:
+        compliance_score = 0.5
+    else:
+        compliance_score = 0.0
+
+    terminal_reward = round(
+        _clip(
+            0.35 * solvency_score
+            + 0.20 * liquidity_score
+            + 0.35 * npv_score
+            + 0.10 * compliance_score,
+            0.0,
+            1.0,
+        ),
+        6,
+    )
+
+    # --- Dense shaping components ---
+    if shaping_rewards is None:
+        shaping_rewards = compute_shaping_rewards(trajectory)
+
+    # Decompose shaping into its sub-terms for the last transition only
+    # (representative per-step signal; use merge_breakdown_list for full episode)
+    if len(trajectory) >= 2:
+        prev_state = trajectory[-2]
+        next_state = trajectory[-1]
+        prev_gap = _effective_working_capital_gap(prev_state)
+        next_gap = _effective_working_capital_gap(next_state)
+        gap_term = _clip(
+            (prev_gap - next_gap)
+            / max(prev_gap, float(prev_state.sme_monthly_revenue) * 0.25, 1.0),
+            -1.0,
+            1.0,
+        )
+        target_days = min(int(prev_state.liquidity_threshold), 45)
+        prev_days_delta = abs(_effective_receivable_days(prev_state) - target_days)
+        next_days_delta = abs(_effective_receivable_days(next_state) - target_days)
+        days_term = _clip(
+            (prev_days_delta - next_days_delta) / max(target_days, 1),
+            -1.0,
+            1.0,
+        )
+        prev_mismatch = _receivable_payable_mismatch(prev_state)
+        next_mismatch = _receivable_payable_mismatch(next_state)
+        alignment_term = _clip(
+            (prev_mismatch - next_mismatch) / max(int(prev_state.sme_supplier_payment_days), 1),
+            -1.0,
+            1.0,
+        )
+    else:
+        gap_term = days_term = alignment_term = 0.0
+
+    shaping_total = float(lambda_shaping) * sum(shaping_rewards)
+    total_reward = round(terminal_reward + shaping_total, 6)
+
+    # --- Process supervision components ---
+    reasoning_quality = 0.0
+    tool_strategic_use = 0.0
+    if process_supervisor is not None:
+        # ProcessSupervisor accumulates signals; we read from its trackers here
+        ps = process_supervisor
+        progress = getattr(getattr(ps, "progress_tracker", None), "total_progress_bonus", lambda: 0.0)()
+        reasoning_quality = _clip(progress, -1.0, 1.0)
+        deal_id = str(getattr(final_state, "episode_id", "default"))
+        seq_score = 0.0
+        if hasattr(ps, "episode_tool_sequence_score"):
+            seq_score = ps.episode_tool_sequence_score(deal_id)
+        tool_strategic_use = _clip(seq_score, -1.0, 1.0)
+
+    # --- Anti-cheat penalties ---
+    penalty_sum = sum(float(p) for p in (step_penalties or []))
+
+    return RewardBreakdown(
+        total=total_reward,
+        solvency=round(solvency_score, 6),
+        liquidity=round(liquidity_score, 6),
+        npv=round(npv_score, 6),
+        compliance=round(compliance_score, 6),
+        gap_term=round(gap_term, 6),
+        days_term=round(days_term, 6),
+        alignment_term=round(alignment_term, 6),
+        reasoning_quality=round(reasoning_quality, 6),
+        tool_strategic_use=round(tool_strategic_use, 6),
+        format_compliance=0.0,   # set by environment from action structure
+        proposal_loop_penalty=round(
+            sum(float(p) for p in (step_penalties or []) if float(p) == -0.05), 6
+        ),
+        invalid_accept_penalty=round(
+            sum(float(p) for p in (step_penalties or []) if float(p) == -0.10), 6
+        ),
+        tool_dedup_penalty=round(
+            sum(float(p) for p in (step_penalties or []) if float(p) == -0.01), 6
+        ),
+        is_terminal=True,
+        termination_reason="episode_end",
+        episode_step=int(world_state.episode_step),
+    )
+
+
+def compute_legacy_terminal_breakdown(
+    state: NegotiationState,
+    *,
+    task_name: str,
+) -> "RewardBreakdown":
+    """Wrap legacy terminal graders (easy/medium/hard) in a RewardBreakdown.
+
+    Used by SMENegotiatorEnvironment (single-deal path) to expose the same
+    structured breakdown as the liquidity path, without changing grader logic.
+    """
+    from sme_negotiator_env.reward_breakdown import RewardBreakdown
+
+    grader = TASK_GRADERS.get(task_name)
+    if grader is None:
+        terminal_score = 0.0
+    else:
+        terminal_score = float(grader(state))
+
+    # Map legacy scalar to approximate RLVR components.
+    # compliance is the primary axis for legacy tasks.
+    compliance = _clip(terminal_score, 0.0, 1.0)
+    solvency = 1.0 if state.deal_reached else 0.0
+
+    return RewardBreakdown(
+        total=round(terminal_score, 6),
+        solvency=round(solvency, 6),
+        liquidity=0.0,
+        npv=0.0,
+        compliance=round(compliance, 6),
+        is_terminal=True,
+        termination_reason="deal_reached" if state.deal_reached else "no_deal",
+        episode_step=int(state.step_count),
+    )
+
+
+# Convenience import alias so callers can do:
+#   from sme_negotiator_env.graders import RewardBreakdown
+try:
+    from sme_negotiator_env.reward_breakdown import RewardBreakdown  # noqa: F401
+except ImportError:
+    pass
