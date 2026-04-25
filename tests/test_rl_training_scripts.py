@@ -34,6 +34,7 @@ from rl.train_grpo_trl import (
     make_training_args,
     make_reward_function,
     prepare_model_for_grpo,
+    _require_rollout_func_support,
 )
 from rl.train_grpo_unsloth import (
     build_grpo_config_kwargs as unsloth_build_grpo_config_kwargs,
@@ -602,8 +603,9 @@ def test_trl_main_passes_rollout_func_and_not_environment_factory(monkeypatch) -
             self.kwargs = kwargs
 
     class _FakeGRPOTrainer:
-        def __init__(self, **kwargs) -> None:
+        def __init__(self, rollout_func=None, **kwargs) -> None:
             captured.update(kwargs)
+            captured["rollout_func"] = rollout_func
 
         def train(self) -> None:
             captured["trained"] = True
@@ -653,7 +655,7 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
             self.kwargs = kwargs
 
     class _FakeGRPOTrainer:
-        def __init__(self, **kwargs) -> None:
+        def __init__(self, rollout_func=None, **kwargs) -> None:
             self.kwargs = kwargs
 
     fake_trl.GRPOConfig = _FakeGRPOConfig
@@ -684,6 +686,21 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
         "rollout_func",
         "callbacks",
     }
+
+
+def test_require_rollout_func_support_rejects_older_trl_signature() -> None:
+    class _OldTrainer:
+        def __init__(self, model=None, args=None, callbacks=None) -> None:
+            self.model = model
+            self.args = args
+            self.callbacks = callbacks
+
+    try:
+        _require_rollout_func_support(_OldTrainer)
+    except ImportError as exc:
+        assert "rollout_func" in str(exc)
+    else:
+        raise AssertionError("Older TRL signatures should be rejected before model loading.")
 
 
 def test_metrics_callback_saves_reward_curve_without_matplotlib_dependency(monkeypatch) -> None:
@@ -734,6 +751,7 @@ def test_colab_notebook_defaults_to_qwen3_thin_wrapper() -> None:
 
     assert 'MODEL_NAME = "Qwen/Qwen3-0.6B"' in source
     assert "build_training_session" in source
+    assert 'trl==0.29.0' in source
 
 
 def test_colab_notebook_drops_legacy_generate_rollout_completions_and_environment_factory() -> None:

@@ -25,7 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-rl = ["transformers>=5.2.0", "trl", "datasets", "accelerate", "peft>=0.19.1"]
+rl = ["transformers>=5.2.0", "trl>=0.25.1", "datasets", "accelerate", "peft>=0.19.1"]
 rl-unsloth = [
     "unsloth; platform_system != 'Windows'",
     "vllm; platform_system != 'Windows'",

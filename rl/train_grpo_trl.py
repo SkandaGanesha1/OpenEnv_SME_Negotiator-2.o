@@ -1409,12 +1409,35 @@ def _import_trl_grpo_symbols() -> tuple[Any, Any]:
     raise ImportError("TRL GRPO import failed for an unknown reason.")
 
 
+def _trl_version() -> Optional[str]:
+    """Return the installed TRL version when available."""
+    try:
+        return importlib.metadata.version("trl")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _require_rollout_func_support(grpo_trainer_cls: Any) -> None:
+    """Fail fast when the installed TRL build does not support explicit rollouts."""
+    parameters = inspect.signature(grpo_trainer_cls.__init__).parameters
+    if "rollout_func" in parameters:
+        return
+
+    version = _trl_version() or "unknown"
+    raise ImportError(
+        "Installed TRL version does not support the canonical explicit-rollout training path: "
+        f"GRPOTrainer.__init__ has no 'rollout_func' parameter (detected trl=={version}). "
+        "Install a rollout-capable TRL release such as trl>=0.25.1, then restart the runtime and rerun the install cell."
+    )
+
+
 def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     """Build the canonical explicit-rollout GRPO training bundle."""
     components = _resolve_training_components(args)
 
     from transformers import TrainerCallback
     GRPOConfig, GRPOTrainer = _import_trl_grpo_symbols()
+    _require_rollout_func_support(GRPOTrainer)
 
     dataset = build_dataset(components["rows"])
     model, tokenizer = load_training_model_and_tokenizer(args.model_name)
