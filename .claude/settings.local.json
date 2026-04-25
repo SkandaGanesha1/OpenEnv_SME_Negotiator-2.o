@@ -8,7 +8,8 @@
       "WebFetch(domain:github.com)",
       "Bash(python -m pytest tests/test_multi_agent_init.py tests/test_determinism.py tests/test_reward_monotonicity.py tests/test_demo_helper.py -v --tb=short)",
       "Bash(uv run *)",
-      "WebFetch(domain:unsloth.ai)"
+      "WebFetch(domain:unsloth.ai)",
+      "Bash(grep -E \"\\\\.py$|\\\\.md$\")"
     ]
   }
 }

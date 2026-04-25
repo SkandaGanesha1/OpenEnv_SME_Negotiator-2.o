@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from statistics import mean
@@ -29,6 +30,46 @@ DEFAULT_PROMPT = (
     "Use explicit tools when useful, negotiate responsibly across multiple deals, "
     "advance macro periods when appropriate, and finish the episode without default."
 )
+
+
+def _training_log_backend(env: Optional[dict[str, str]] = None) -> str:
+    source = os.environ if env is None else env
+    value = str(source.get("TRAINING_LOG_BACKEND", "none") or "none").strip().lower()
+    if value in {"wandb", "tensorboard", "none"}:
+        return value
+    return "none"
+
+
+def _save_reward_curve_plot(
+    reward_curve: list[float],
+    success_curve: list[float],
+    *,
+    output_dir: str,
+) -> Path:
+    if len(reward_curve) < 2:
+        raise ValueError("Need at least two reward points to save a curve.")
+
+    import matplotlib.pyplot as plt
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    figure_path = output_path / "reward_curve.png"
+
+    fig, (ax_reward, ax_success) = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
+    ax_reward.plot(reward_curve, label="avg_total_reward")
+    ax_reward.set_ylabel("Avg Total Reward")
+    ax_reward.legend()
+
+    ax_success.plot(success_curve, label="success_rate", color="green")
+    ax_success.set_ylabel("Success Rate")
+    ax_success.set_xlabel("Log Step")
+    ax_success.legend()
+
+    fig.suptitle("SME Negotiator - GRPO Training Curves")
+    fig.tight_layout()
+    fig.savefig(figure_path, dpi=120)
+    plt.close(fig)
+    return figure_path
 
 
 @dataclass
@@ -245,10 +286,18 @@ def build_metrics_callback(
     class RollingEpisodeMetricsCallback(trainer_callback_base):
         """Attach summarized episode metrics, curriculum promotion, and optional preference export."""
 
+        def __init__(self) -> None:
+            super().__init__()
+            self.reward_curve: list[float] = []
+            self.success_curve: list[float] = []
+
         def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
             summaries, episode_logs = summary_buffer.drain()
             if summaries and logs is not None:
                 logs.update(summarize_batch(summaries))
+                if "episode/avg_total_reward" in logs:
+                    self.reward_curve.append(float(logs["episode/avg_total_reward"]))
+                    self.success_curve.append(float(logs.get("episode/success_rate", 0.0)))
                 if curriculum is not None:
                     for summary in summaries:
                         curriculum.record_episode(summary.base_rl_reward, summary.defaulted_sme_count > 0)
@@ -264,6 +313,20 @@ def build_metrics_callback(
                     output_path = Path(output_dir) / "preferences" / f"step_{int(getattr(state, 'global_step', 0)):06d}.jsonl"
                     write_preference_dataset(output_path, examples)
                     logs["preferences/written"] = float(len(examples))
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):  # type: ignore[override]
+            if len(self.reward_curve) < 2:
+                return control
+            try:
+                figure_path = _save_reward_curve_plot(
+                    self.reward_curve,
+                    self.success_curve,
+                    output_dir=str(args.output_dir),
+                )
+                print(f"[TRAINING] Reward curve saved to {figure_path}", flush=True)
+            except Exception as exc:
+                print(f"[TRAINING] Could not save reward curve: {exc}", flush=True)
             return control
 
     return RollingEpisodeMetricsCallback()
@@ -314,7 +377,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "max_completion_length": 1536,
         "logging_steps": 1,
         "save_steps": 50,
-        "report_to": "none",
+        "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
     if bool(args.use_vllm):

@@ -125,38 +125,46 @@ python -m uvicorn server.app:app --log-level debug
 
 ---
 
-## OpenAI API Issues
+## Router / LLM API Issues
 
-### Problem: "OPENAI_API_KEY not set"
+### Problem: "HF_TOKEN not set" or router auth fails
 
-**Error**: `ERROR: OPENAI_API_KEY environment variable not set`
+**Error**:
+- `[WARN] HF_TOKEN is empty. Hugging Face router usually requires HF_TOKEN in .env.`
+- `AuthenticationError` from the OpenAI-compatible client
 
 **Solution**:
 
 On **Linux/Mac**:
 ```bash
 # Set for current session
-export OPENAI_API_KEY="sk-..."
+export HF_TOKEN="hf_..."
 
 # Verify it's set
-echo $OPENAI_API_KEY
+echo $HF_TOKEN
 
 # Make permanent (add to ~/.bashrc or ~/.zshrc)
-echo "export OPENAI_API_KEY='sk-...'" >> ~/.bashrc
+echo "export HF_TOKEN='hf_...'" >> ~/.bashrc
 source ~/.bashrc
 ```
 
 On **Windows (PowerShell)**:
 ```powershell
 # Set for current session
-$env:OPENAI_API_KEY="sk-..."
+$env:HF_TOKEN="hf_..."
 
 # Verify
-Write-Host $env:OPENAI_API_KEY
+Write-Host $env:HF_TOKEN
 
 # Make permanent
-[Environment]::SetEnvironmentVariable("OPENAI_API_KEY", "sk-...", "User")
+[Environment]::SetEnvironmentVariable("HF_TOKEN", "hf_...", "User")
 ```
+
+Compatibility fallbacks:
+
+- `API_KEY` is accepted as an alias for `HF_TOKEN`
+- `OPENAI_API_KEY` is also accepted, but lower precedence than `HF_TOKEN`
+- For a local OpenAI-compatible server, set `API_BASE_URL=http://127.0.0.1:11434/v1` and leave `HF_TOKEN` empty
 
 ---
 
@@ -165,7 +173,7 @@ Write-Host $env:OPENAI_API_KEY
 **Error**: `AuthenticationError: Incorrect API key provided`
 
 **Solution**:
-1. Verify API key at https://platform.openai.com/account/api-keys
+1. Verify the Hugging Face token at https://huggingface.co/settings/tokens
 2. Copy it exactly (no extra spaces)
 3. If still fails, regenerate new key
 4. Check key is not expired/revoked
@@ -593,7 +601,7 @@ If you're stuck:
 | Problem | Quick Fix |
 |---------|-----------|
 | Everything broken | `pip install -e .` then `make test` |
-| API fails | `echo $OPENAI_API_KEY` (verify set) |
+| API fails | Check `HF_TOKEN` and `API_BASE_URL` first |
 | Server won't start | Kill process on port 7860 |
 | Scores low | Check `price > cost` and `days < 120` |
 | JSON parse error | Safe fallback used, not a blocker |

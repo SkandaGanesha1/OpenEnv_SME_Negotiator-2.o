@@ -9,6 +9,7 @@ from rl.bridge import format_observation, make_environment_factory, parse_action
 from rl.train_grpo_trl import (
     DEFAULT_MODEL_NAME,
     DEFAULT_PROMPT,
+    _training_log_backend,
     EpisodeSummaryBuffer,
     build_dataset,
     build_metrics_callback,
@@ -16,7 +17,6 @@ from rl.train_grpo_trl import (
     configure_tokenizer,
     make_reward_function,
 )
-from server.environment import SMELiquidityEnvironment
 from sme_negotiator_env.models import LiquidityObservation, NegotiationAction
 
 
@@ -60,17 +60,47 @@ def run_heuristic_episode(
     max_steps: int = 20,
 ) -> dict[str, Any]:
     """Run one deterministic heuristic episode for notebook baselines."""
-    env = SMELiquidityEnvironment(total_periods=total_periods)
-    observation = env.reset(seed=seed, difficulty=difficulty, task_name=task_name)
-    total_reward = float(observation.reward)
+    wrapper_cls = make_environment_factory(
+        task_name=task_name,
+        difficulty=difficulty,
+        total_periods=total_periods,
+        seed=seed,
+        prompt=DEFAULT_PROMPT,
+    )
+    wrapper = wrapper_cls()
+    wrapper.reset(
+        seed=seed,
+        difficulty=difficulty,
+        task_name=task_name,
+        total_periods=total_periods,
+        prompt=DEFAULT_PROMPT,
+    )
+    observation = wrapper.last_observation
+    assert observation is not None
+    total_reward = float(wrapper.env_reward_total)
     transcript_lines = [f"RESET :: {format_observation(observation)}"]
 
     for step_index in range(max_steps):
         if observation.done:
             break
         action = make_demo_action(observation)
-        observation = env.step(action)
-        total_reward += float(observation.reward)
+        if action.action_type == "tool":
+            wrapper.query_treds(invoice_id=action.deal_id or "")
+        elif action.action_type == "accept":
+            wrapper.accept(
+                price=float(action.price),
+                payment_days=int(action.payment_days),
+                use_treds=bool(action.use_treds),
+                deal_id=action.deal_id,
+                reason=action.reason,
+            )
+        elif action.action_type == "advance_period":
+            wrapper.advance_period()
+        else:
+            raise ValueError(f"Unexpected heuristic demo action: {action.action_type!r}")
+        observation = wrapper.last_observation
+        assert observation is not None
+        total_reward = float(wrapper.env_reward_total)
         transcript_lines.append(
             f"STEP {step_index + 1} :: action[{_action_to_text(action)}] :: reward={float(observation.reward):.6f}"
         )
@@ -78,19 +108,25 @@ def run_heuristic_episode(
         if observation.done:
             break
 
-    state = env.state
-    summary = None
-    if state is not None:
-        summary = {
-            "tool_call_count": int(state.tool_call_count),
-            "tool_effective_count": int(state.tool_effective_count),
-            "duplicate_tool_count": int(state.duplicate_tool_count),
-            "invalid_action_count": int(state.invalid_action_count),
-            "stall_step_count": int(state.stall_step_count),
-            "terminated_by_step_cap": bool(state.terminated_by_step_cap),
-            "resolved_deal_count": len(state.resolved_deal_ids),
-            "verifiable_reward": float(state.latest_verifiable_reward or 0.0),
-        }
+    episode_summary = wrapper.summarize_episode()
+    summary = {
+        "base_rl_reward": float(episode_summary.base_rl_reward),
+        "verifiable_reward": float(episode_summary.verifiable_reward),
+        "total_reward": float(episode_summary.total_reward),
+        "tool_bonus_total": float(episode_summary.tool_bonus_total),
+        "env_reward_total": float(episode_summary.env_reward_total),
+        "success_no_default_positive_npv": bool(episode_summary.success_no_default_positive_npv),
+        "average_final_payment_days": float(episode_summary.average_final_payment_days),
+        "tool_usage_count": int(episode_summary.tool_usage_count),
+        "tool_call_count": int(episode_summary.tool_call_count),
+        "tool_effective_count": int(episode_summary.tool_effective_count),
+        "duplicate_tool_count": int(episode_summary.duplicate_tool_count),
+        "invalid_action_count": int(episode_summary.invalid_action_count),
+        "stall_step_count": int(episode_summary.stall_step_count),
+        "resolved_deal_count": int(episode_summary.resolved_deal_count),
+        "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
+        "terminated_by_step_cap": bool(episode_summary.terminated_by_step_cap),
+    }
 
     return {
         "seed": seed,
@@ -181,7 +217,7 @@ def demo_train_grpo(
         max_steps=max(1, int(steps)),
         logging_steps=1,
         save_steps=max(1, int(steps)),
-        report_to="none",
+        report_to=_training_log_backend(),
     )
 
     trainer = GRPOTrainer(

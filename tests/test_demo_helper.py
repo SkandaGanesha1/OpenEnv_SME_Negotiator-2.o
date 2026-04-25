@@ -28,3 +28,7 @@ def test_run_heuristic_episode_is_stable_and_download_free() -> None:
     assert isinstance(first["total_reward"], float)
     assert isinstance(first["transcript"], str)
     assert len(first["transcript"]) > 0
+    assert first["summary"] is not None
+    assert "verifiable_reward" in first["summary"]
+    assert "tool_call_count" in first["summary"]
+    assert "terminated_by_step_cap" in first["summary"]

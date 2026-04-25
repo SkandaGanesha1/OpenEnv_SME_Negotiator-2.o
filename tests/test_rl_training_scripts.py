@@ -16,7 +16,11 @@ from rl.curriculum import CurriculumManager
 from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
 from rl.train_grpo_trl import (
+    EpisodeSummaryBuffer,
+    build_arg_parser,
     build_environment_factory,
+    build_grpo_config_kwargs,
+    build_metrics_callback,
     build_snapshot_callback,
     build_training_rows,
     configure_tokenizer,
@@ -206,3 +210,98 @@ def test_environment_factory_picks_up_curriculum_config_and_opponents() -> None:
     assert wrapper.financier_variance == curriculum.current_config().financier_variance
     assert wrapper.curriculum_level == curriculum.current_level()
     assert wrapper.opponent_manager is opponent_manager
+
+
+def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> None:
+    args = build_arg_parser().parse_args([])
+
+    monkeypatch.setenv("TRAINING_LOG_BACKEND", "tensorboard")
+    assert build_grpo_config_kwargs(args)["report_to"] == "tensorboard"
+
+    monkeypatch.setenv("TRAINING_LOG_BACKEND", "unsupported")
+    assert build_grpo_config_kwargs(args)["report_to"] == "none"
+
+
+def test_metrics_callback_saves_reward_curve_without_matplotlib_dependency(monkeypatch) -> None:
+    tmp_path = _workspace_tmp_dir("metrics_callback")
+    summary_buffer = EpisodeSummaryBuffer()
+    callback = build_metrics_callback(
+        summary_buffer,
+        object,
+        curriculum=None,
+        build_preference_dataset=False,
+        scorer=None,
+        output_dir=str(tmp_path),
+    )
+
+    def _fake_save(reward_curve, success_curve, *, output_dir):
+        path = Path(output_dir) / "reward_curve.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"png")
+        return path
+
+    monkeypatch.setattr("rl.train_grpo_trl._save_reward_curve_plot", _fake_save)
+
+    control = SimpleNamespace()
+    args = SimpleNamespace(output_dir=str(tmp_path))
+    for index, reward in enumerate((0.2, 0.5), start=1):
+        summary_buffer.append(
+            EpisodeSummary(
+                episode_completed=True,
+                base_rl_reward=reward,
+                verifiable_reward=reward,
+                total_reward=reward,
+                tool_bonus_total=0.01,
+                env_reward_total=reward,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=40.0,
+                tool_usage_count=1,
+                resolved_deal_count=2,
+                defaulted_sme_count=0,
+            )
+        )
+        callback.on_log(args, SimpleNamespace(global_step=index), control, logs={})
+
+    callback.on_train_end(args, SimpleNamespace(global_step=2), control)
+
+    assert (tmp_path / "reward_curve.png").exists()
+
+
+def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
+    tmp_path = _workspace_tmp_dir("metrics_callback_failure")
+    summary_buffer = EpisodeSummaryBuffer()
+    callback = build_metrics_callback(
+        summary_buffer,
+        object,
+        curriculum=None,
+        build_preference_dataset=False,
+        scorer=None,
+        output_dir=str(tmp_path),
+    )
+
+    monkeypatch.setattr(
+        "rl.train_grpo_trl._save_reward_curve_plot",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("plot failed")),
+    )
+
+    control = SimpleNamespace()
+    args = SimpleNamespace(output_dir=str(tmp_path))
+    for index, reward in enumerate((0.2, 0.4), start=1):
+        summary_buffer.append(
+            EpisodeSummary(
+                episode_completed=True,
+                base_rl_reward=reward,
+                verifiable_reward=reward,
+                total_reward=reward,
+                tool_bonus_total=0.0,
+                env_reward_total=reward,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=45.0,
+                tool_usage_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+            )
+        )
+        callback.on_log(args, SimpleNamespace(global_step=index), control, logs={})
+
+    callback.on_train_end(args, SimpleNamespace(global_step=2), control)

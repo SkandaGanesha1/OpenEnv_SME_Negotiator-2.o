@@ -10,7 +10,7 @@ import math
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Union
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -42,7 +42,6 @@ load_dotenv(override=True)
 # LLM: Hugging Face OpenAI-compatible router by default (override with API_BASE_URL in .env)
 API_BASE_URL = (os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1").strip()
 # Hackathon / dashboard may set either HF_TOKEN or API_KEY for the OpenAI client.
-HF_TOKEN = (os.getenv("HF_TOKEN") or os.getenv("API_KEY") or "").strip() or None
 # HF Router chat/completions only accepts models exposed as *chat* models — not every Hub id works.
 MODEL_NAME = (os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-7B-Instruct").strip()
 # Docker / HF Space image tag (validator builds). Inference uses HTTP or in-process env — not from_docker_image().
@@ -96,6 +95,21 @@ def _llm_url_looks_local(url: str) -> bool:
     return "127.0.0.1" in u or "localhost" in u
 
 
+def _resolve_router_token(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """Resolve inference token precedence without relying on module reloads."""
+    source = os.environ if env is None else env
+    return (
+        (source.get("HF_TOKEN") or source.get("API_KEY") or source.get("OPENAI_API_KEY") or "").strip() or None
+    )
+
+
+def _resolve_openai_client_key(api_base_url: str, env: Optional[Mapping[str, str]] = None) -> str:
+    token = _resolve_router_token(env)
+    if token:
+        return token
+    return "not-needed" if _llm_url_looks_local(api_base_url) else ""
+
+
 def _normalize_inference_env_mode(value: str) -> str:
     mode = (value or DEFAULT_INFERENCE_ENV_MODE).strip().lower()
     if mode not in {"legacy", "liquidity"}:
@@ -135,6 +149,7 @@ OPENENV_BASE_URL = os.getenv("OPENENV_BASE_URL", "http://127.0.0.1:7860")
 
 DEFAULT_INFERENCE_ENV_MODE = "liquidity"
 DEFAULT_INFERENCE_REWARD_MODE = "legacy+shadow_rlvr"
+HF_TOKEN = _resolve_router_token()
 
 NEGOTIATION_SYSTEM_PROMPT = """
 You represent an SME supplier in B2B negotiation (motivation: Razorpay Fix My Itch —
@@ -254,11 +269,27 @@ def _format_end_line(
     return base
 
 
+def _format_terminal_reward_line(
+    *,
+    verifiable_reward: float,
+    final_score: float,
+    success: bool,
+    source: str,
+) -> str:
+    return (
+        "[TERMINAL_REWARD] "
+        f"source={source} "
+        f"verifiable={float(verifiable_reward or 0.0):.4f} "
+        f"final_score={_format_score_for_log(final_score)} "
+        f"success={'true' if success else 'false'}"
+    )
+
+
 def _ascii_sparkline(rewards: List[float]) -> str:
     """Return a single-line ASCII bar chart summarising per-step rewards."""
     if not rewards:
         return ""
-    blocks = "▁▂▃▄▅▆▇█"
+    blocks = "._-:=+*#"
     mx = max(rewards) if max(rewards) > 0 else 1.0
     bars = [blocks[min(7, int(r / mx * 8))] for r in rewards]
     mn = min(rewards)
@@ -413,7 +444,7 @@ def _build_accept_from_last_proposal(
     return _enforce_task_contract_fields(out, observation, task_name)
 
 # Local OpenAI-compatible servers (Ollama, LM Studio) do not need a real key; HF router does.
-_OPENAI_API_KEY = HF_TOKEN or ("not-needed" if _llm_url_looks_local(API_BASE_URL) else "")
+_OPENAI_API_KEY = _resolve_openai_client_key(API_BASE_URL)
 client = OpenAI(base_url=API_BASE_URL, api_key=_OPENAI_API_KEY)
 
 
@@ -514,14 +545,10 @@ class InProcessLiquidityBridge:
             else:
                 raise ValueError(f"Unsupported tool_name for liquidity inference: {tool_name!r}")
         elif action_type == "simulate_plan":
-            self._wrapper._apply_action(  # type: ignore[attr-defined]
-                NegotiationAction(
-                    action_type="simulate_plan",
-                    simulation_plan=action.simulation_plan or {},
-                    simulation_horizon=action.simulation_horizon,
-                    deal_id=action.deal_id,
-                    reason=action.reason,
-                )
+            self._wrapper.simulate_plan(
+                plan=action.simulation_plan or {},
+                horizon=action.simulation_horizon,
+                deal_id=action.deal_id,
             )
         elif action_type == "advance_period":
             self._wrapper.advance_period()
@@ -951,28 +978,64 @@ def _print_liquidity_episode_summary(env: Any) -> dict[str, Any]:
         episode_summary = summarize()
         summary = {
             "base_rl_reward": float(episode_summary.base_rl_reward),
+            "verifiable_reward": float(episode_summary.verifiable_reward),
+            "total_reward": float(episode_summary.total_reward),
             "tool_bonus_total": float(episode_summary.tool_bonus_total),
             "env_reward_total": float(episode_summary.env_reward_total),
             "success_no_default_positive_npv": bool(episode_summary.success_no_default_positive_npv),
             "average_final_payment_days": float(episode_summary.average_final_payment_days),
             "tool_usage_count": int(episode_summary.tool_usage_count),
+            "tool_call_count": int(episode_summary.tool_call_count),
+            "tool_effective_count": int(episode_summary.tool_effective_count),
+            "duplicate_tool_count": int(episode_summary.duplicate_tool_count),
+            "invalid_action_count": int(episode_summary.invalid_action_count),
+            "stall_step_count": int(episode_summary.stall_step_count),
             "resolved_deal_count": int(episode_summary.resolved_deal_count),
             "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
+            "terminated_by_step_cap": bool(episode_summary.terminated_by_step_cap),
         }
         print(
             "[LIQUIDITY_SUMMARY] "
             f"base_rl_reward={summary['base_rl_reward']:.4f} "
+            f"verifiable_reward={summary['verifiable_reward']:.4f} "
+            f"total_reward={summary['total_reward']:.4f} "
             f"tool_bonus_total={summary['tool_bonus_total']:.4f} "
             f"env_reward_total={summary['env_reward_total']:.4f} "
             f"success_no_default_positive_npv={'true' if summary['success_no_default_positive_npv'] else 'false'} "
             f"average_final_payment_days={summary['average_final_payment_days']:.2f} "
             f"tool_usage_count={summary['tool_usage_count']} "
+            f"tool_call_count={summary['tool_call_count']} "
+            f"tool_effective_count={summary['tool_effective_count']} "
             f"resolved_deal_count={summary['resolved_deal_count']} "
-            f"defaulted_sme_count={summary['defaulted_sme_count']}",
+            f"defaulted_sme_count={summary['defaulted_sme_count']} "
+            f"terminated_by_step_cap={'true' if summary['terminated_by_step_cap'] else 'false'}",
             file=sys.stderr,
             flush=True,
         )
     return summary
+
+
+def _aggregate_liquidity_episode_summaries(episodes: List[Dict[str, Any]]) -> Dict[str, float]:
+    summaries = [
+        episode.get("episode_summary")
+        for episode in episodes
+        if isinstance(episode.get("episode_summary"), dict)
+    ]
+    if not summaries:
+        return {}
+
+    count = float(len(summaries))
+    return {
+        "avg_verifiable_reward": sum(float(item.get("verifiable_reward", 0.0) or 0.0) for item in summaries) / count,
+        "avg_tool_bonus": sum(float(item.get("tool_bonus_total", 0.0) or 0.0) for item in summaries) / count,
+        "avg_tool_call_count": sum(float(item.get("tool_call_count", 0.0) or 0.0) for item in summaries) / count,
+        "avg_tool_effective_count": sum(float(item.get("tool_effective_count", 0.0) or 0.0) for item in summaries) / count,
+        "avg_final_payment_days": sum(float(item.get("average_final_payment_days", 0.0) or 0.0) for item in summaries) / count,
+        "avg_resolved_deal_count": sum(float(item.get("resolved_deal_count", 0.0) or 0.0) for item in summaries) / count,
+        "timeout_or_stepcap_rate": sum(
+            1.0 if bool(item.get("terminated_by_step_cap", False)) else 0.0 for item in summaries
+        ) / count,
+    }
 
 
 EnvClient = Union[SMENegotiatorEnv, InProcessSMENegotiatorBridge, InProcessLiquidityBridge]
@@ -997,6 +1060,7 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
     reset_observation: Any = None
     step_actions: List[NegotiationAction] = []
     step_observations: List[Any] = []
+    shadow_summary: Optional[dict[str, Any]] = None
 
     try:
         result = await env.reset(seed=seed, difficulty=difficulty, episode_id=episode_id, task_name=task_name)
@@ -1119,6 +1183,17 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             success = bool(result.done and final_score > 0.0)
     finally:
         total_reward = sum(all_rewards)
+        shadow_report = None
+        if reward_mode != "legacy" and reset_observation is not None:
+            shadow_report = build_shadow_reward_report(
+                reset_observation=reset_observation,
+                actions=step_actions,
+                step_observations=step_observations,
+                seed=seed,
+                final_state=_legacy_final_state_from_env(env),
+            )
+            shadow_summary = shadow_report.to_dict()
+            _print_shadow_reward_summary(reward_mode, shadow_report, final_score)
         # Compute rule-based persona judge score from accumulated step log lines.
         judge_score: Optional[float] = None
         try:
@@ -1133,21 +1208,19 @@ async def run_episode(env: EnvClient, difficulty: str, seed: int) -> Dict[str, A
             judge_score = max(persona_reward(p, _rubric_scores) for p in PERSONAS)
         except Exception:
             pass
+        if shadow_report is not None:
+            print(
+                _format_terminal_reward_line(
+                    verifiable_reward=shadow_report.shadow_verifiable_reward,
+                    final_score=final_score,
+                    success=success,
+                    source="shadow_rlvr",
+                ),
+                flush=True,
+            )
         print(_format_end_line(success, round_number, final_score, all_rewards, judge_score), flush=True)
         if all_rewards:
             print(f"[REWARD_CURVE] {_ascii_sparkline(all_rewards)}", flush=True)
-
-    shadow_summary: Optional[dict[str, Any]] = None
-    if reward_mode != "legacy" and reset_observation is not None:
-        shadow_report = build_shadow_reward_report(
-            reset_observation=reset_observation,
-            actions=step_actions,
-            step_observations=step_observations,
-            seed=seed,
-            final_state=_legacy_final_state_from_env(env),
-        )
-        shadow_summary = shadow_report.to_dict()
-        _print_shadow_reward_summary(reward_mode, shadow_report, final_score)
 
     return {
         "difficulty": difficulty,
@@ -1250,6 +1323,15 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         judge_score_liq = max(persona_reward(p, _rubric_liq) for p in PERSONAS)
     except Exception:
         pass
+    print(
+        _format_terminal_reward_line(
+            verifiable_reward=float(episode_summary.get("verifiable_reward", 0.0) or 0.0),
+            final_score=final_score,
+            success=success,
+            source="liquidity_verifiable",
+        ),
+        flush=True,
+    )
     print(_format_end_line(success, round_number, final_score, all_rewards, judge_score_liq), flush=True)
     if all_rewards:
         print(f"[REWARD_CURVE] {_ascii_sparkline(all_rewards)}", flush=True)
@@ -1400,6 +1482,9 @@ async def _run_all_episodes(env: EnvClient, results: Dict[str, Any]) -> None:
                 "success_rate": sum(1 for success in successes if success) / len(successes),
             },
         }
+        liquidity_metrics = _aggregate_liquidity_episode_summaries(episode_results)
+        if liquidity_metrics:
+            results["tasks"][difficulty]["summary"].update(liquidity_metrics)
 
     _finalize_results_summary(results)
 
@@ -1426,6 +1511,14 @@ def _finalize_results_summary(results: Dict[str, Any]) -> None:
         "overall_mean_reward": sum(overall_rewards) / len(overall_rewards),
         "overall_success_rate": sum(1 for success in overall_successes if success) / len(overall_successes),
     }
+    all_episodes = [
+        episode
+        for task in results["tasks"].values()
+        for episode in task["episodes"]
+    ]
+    liquidity_metrics = _aggregate_liquidity_episode_summaries(all_episodes)
+    if liquidity_metrics:
+        results["summary"].update(liquidity_metrics)
 
     with open("inference_results.json", "w", encoding="utf-8") as handle:
         json.dump(results, handle, indent=2)

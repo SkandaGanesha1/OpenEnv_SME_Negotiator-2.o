@@ -7,6 +7,23 @@ sdk: docker
 pinned: false
 ---
 
+> [!IMPORTANT]
+> **TL;DR** -- SME Negotiator is a liquidity-first OpenEnv environment for Indian MSME payment-term negotiations with deterministic grading, tool-aware treasury workflows, and a truthful legacy public server surface.
+> Public legacy reference benchmark: **0.52 overall** on `payment-terms-*` single-deal tasks.
+> The in-process liquidity path is the judge-facing demo path and now emits explicit `[TERMINAL_REWARD]` lines plus additive liquidity metrics in `inference_results.json`.
+> Training runs save `reward_curve.png` into the trainer output directory; the repo keeps `docs/img/tiny_grpo_reward_curve.svg` as the checked-in illustrative artifact until a moderate run is generated locally.
+
+## Judge Quick Links
+
+| Resource | Link |
+|---|---|
+| HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator) |
+| GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb) |
+| Checked-in reward curve artifact | [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg) |
+| Current inference summary artifact | [inference_results.json](inference_results.json) |
+| Full evaluation notes | [EVALUATION.md](EVALUATION.md) |
+| OpenEnv manifest | [openenv.yaml](openenv.yaml) |
+
 <p align="center">
   <img src="logo.png" alt="OpenEnv SME Negotiator" width="340">
 </p>
@@ -416,6 +433,21 @@ In another terminal:
 uv run python inference.py
 ```
 
+### Using the HF Router (hackathon standard)
+
+```bash
+export API_BASE_URL="https://router.huggingface.co/v1"
+export HF_TOKEN="hf_xxx"
+export MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
+uv run python inference.py
+```
+
+Compatibility fallback for generic OpenAI-style examples:
+
+```bash
+export OPENAI_API_KEY="hf_xxx"
+```
+
 ### Run without a separate server
 
 ```bash
@@ -425,7 +457,11 @@ export OPENENV_IN_PROCESS=1
 uv run python inference.py
 ```
 
-Results are written to `inference_results.json`.
+Results are written to `inference_results.json`. In liquidity mode the task and
+overall summaries now also include `avg_verifiable_reward`,
+`avg_tool_bonus`, `avg_tool_call_count`, `avg_tool_effective_count`,
+`avg_final_payment_days`, `avg_resolved_deal_count`, and
+`timeout_or_stepcap_rate`.
 
 ## Stage 5 RL Training
 
@@ -448,6 +484,17 @@ Dry-run the optional Unsloth setup:
 ```bash
 uv run --extra rl --extra rl-unsloth python -m rl.train_grpo_unsloth --dry-run
 ```
+
+For a local judge-facing moderate run:
+
+```bash
+export TRAINING_LOG_BACKEND=none
+uv run --extra rl python -m rl.train_grpo_trl --num-samples 128 --output-dir outputs/grpo_sme_liquidity_trl
+```
+
+Each completed run now writes `reward_curve.png` into the chosen output
+directory. Copy the selected moderate-run artifact to `docs/img/reward_curve.png`
+when packaging a final submission.
 
 ## Stage 6 Self-Play
 
@@ -533,6 +580,8 @@ By default, `python inference.py` runs the in-process liquidity path so Theme
 
 - The per-step `reward=` values in `[STEP]` logs are dense shaping rewards, not
   the full long-horizon liquidity RL objective.
+- `[TERMINAL_REWARD]` isolates the final deterministic verifiable reward so the
+  episode-ending score is visible separately from the shaping curve.
 - Those shaping rewards can decline across steps when the buyer keeps conceding
   and the SME proposal stays nearly flat, because the marginal improvement vs
   the buyer's current terms gets smaller.
@@ -552,10 +601,21 @@ For reward debugging, use:
 
 ## Results
 
-Illustrative Stage 7 submission artifacts live in the repo so judges can see
+Checked-in judge-facing artifacts today:
+
+| Artifact | Overall value | Notes |
+|---|---|---|
+| Legacy single-deal reference benchmark | `0.52` overall score | Public server-compatible `payment-terms-*` baseline from `EVALUATION.md` |
+| Checked-in liquidity smoke artifact | `0.00` overall score / `0.0000` mean reward | Current `inference_results.json` confirms the in-process liquidity path, explicit terminal reward logs, and additive summary metrics |
+
+Illustrative Stage 7 submission artifacts stay in the repo so judges can see
 the training/demo path without running a long experiment.
 
 ![Illustrative tiny GRPO reward curve](docs/img/tiny_grpo_reward_curve.svg)
+
+Moderate GRPO runs now save `reward_curve.png` directly into the trainer output
+directory. For a judge-ready moderate run, copy that file into
+`docs/img/reward_curve.png` after the local training job completes.
 
 Example before/after trajectory excerpt (illustrative tiny-run snippet, not a
 benchmark claim):
@@ -667,6 +727,7 @@ The baseline runner emits parser-safe lines for evaluators:
 
 - `[START]` once per episode with task and model metadata
 - `[STEP]` after every action with serialized action, reward, done flag, and error field
+- `[TERMINAL_REWARD]` once per episode with the terminal verifiable reward source and final score
 - `[END]` once per episode with success flag, step count, and reward trace
 
 This makes it easy to audit rollouts and compare agent behavior across seeds.
@@ -677,6 +738,7 @@ Core environment variables:
 |----------|---------|
 | `HF_TOKEN` | Hugging Face token for router-backed inference |
 | `API_KEY` | Accepted as an alias for `HF_TOKEN` |
+| `OPENAI_API_KEY` | Generic OpenAI-style fallback env var; lower precedence than `HF_TOKEN` and `API_KEY` |
 | `API_BASE_URL` | OpenAI-compatible LLM endpoint |
 | `MODEL_NAME` | Chat-capable model id used by `chat/completions` |
 | `OPENENV_BASE_URL` | Negotiation server URL, default `http://127.0.0.1:7860` |

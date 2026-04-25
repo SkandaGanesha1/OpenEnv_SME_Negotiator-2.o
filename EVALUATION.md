@@ -40,6 +40,25 @@ Stage 2 also adds config-only stress tasks for the liquidity environment:
 These are not wired into `openenv.yaml` yet, so they do not alter the live
 OpenEnv evaluation manifest.
 
+## Understanding Step Log Fields
+
+When running `python inference.py` in liquidity mode, the runtime prints both
+step-level shaping information and terminal outcome information.
+
+| Field | Meaning | When non-zero |
+|---|---|---|
+| `[STEP] reward=` | Dense shaping reward for the current transition | Throughout the episode |
+| `[LIQUIDITY_REWARD] env_reward=` | Same per-step environment reward with higher precision | Throughout the episode |
+| `[LIQUIDITY_REWARD] latest_shaping_reward=` | Payment-gap / tenor / alignment shaping component | When a transition improves liquidity position |
+| `[LIQUIDITY_REWARD] latest_verifiable_reward=` | Deterministic solvency + NPV + compliance terminal reward | Final step only |
+| `[TERMINAL_REWARD] verifiable=` | Explicit terminal verifiable reward line for judge readability | Final step only |
+| `[END] score=` | Final normalized score shown in parser-safe episode output | Final step only |
+
+Early `latest_verifiable_reward=0.0000` values are expected. The verifiable
+reward only becomes meaningful when the macro episode actually terminates,
+while shaping rewards stay active from the first step onward so the policy
+receives gradient signal throughout the workflow.
+
 ## Theme 3.1 Positioning
 
 Theme 3.1 is centered on the in-process liquidity path, not the public HTTP server.
