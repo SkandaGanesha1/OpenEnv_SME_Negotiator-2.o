@@ -17,16 +17,88 @@ def choose_action(observation: NegotiationObservation, round_number: int) -> Neg
     buyer_days = int(observation.buyer_days)
     cost = float(observation.cost_threshold)
     liquidity = int(observation.liquidity_threshold)
+    difficulty = str(getattr(observation, "difficulty", "") or "").lower()
 
-    if round_number == 0:
-        target_price = round(max(cost + 2.0, buyer_price * 0.97), 2)
-        target_days = max(0, liquidity - 5)
+    if difficulty == "easy":
+        target_days = liquidity
+        target_price = round(cost + 10.0, 2)
+        if round_number > 0:
+            return NegotiationAction(
+                action_type="accept",
+                price=target_price,
+                payment_days=target_days,
+                use_treds=False,
+                reason="Close on the previously proposed liquidity-safe terms.",
+            )
+        if buyer_days <= target_days and buyer_price >= cost + 1.0:
+            return NegotiationAction(
+                action_type="accept",
+                price=buyer_price,
+                payment_days=buyer_days,
+                use_treds=False,
+                reason="Accept cooperative-buyer terms inside the liquidity threshold.",
+            )
         return NegotiationAction(
             action_type="propose",
             price=target_price,
             payment_days=target_days,
             use_treds=False,
+            reason="Easy task target: settle at or below the liquidity threshold.",
+        )
+
+    if difficulty == "hard":
+        target_days = min(45, liquidity)
+        target_price = round(cost + 10.0, 2)
+        if round_number > 0:
+            return NegotiationAction(
+                action_type="accept",
+                price=target_price,
+                payment_days=target_days,
+                use_treds=True,
+                propose_dynamic_discounting=True,
+                dynamic_discount_annual_rate=0.02,
+                reason="Close on previously proposed dynamic-discounting terms.",
+            )
+        if buyer_days <= target_days and buyer_price >= cost + 1.0:
+            return NegotiationAction(
+                action_type="accept",
+                price=buyer_price,
+                payment_days=buyer_days,
+                use_treds=True,
+                propose_dynamic_discounting=True,
+                dynamic_discount_annual_rate=0.02,
+                reason="Accept only after dynamic-discounting terms improve NPV versus status quo.",
+            )
+        return NegotiationAction(
+            action_type="propose",
+            price=target_price,
+            payment_days=target_days,
+            use_treds=True,
+            propose_dynamic_discounting=True,
+            dynamic_discount_annual_rate=0.02,
+            reason="Hard task target: dynamic discounting with faster payment and positive margin.",
+        )
+
+    if round_number == 0:
+        target_price = round(cost + 10.0, 2)
+        target_days = max(0, liquidity)
+        return NegotiationAction(
+            action_type="propose",
+            price=target_price,
+            payment_days=target_days,
+            use_treds=False,
+            propose_late_payment_penalty_clause=True,
             reason="Opening offer anchored slightly below the buyer's ask",
+        )
+
+    if round_number == 1:
+        return NegotiationAction(
+            action_type="accept",
+            price=round(cost + 10.0, 2),
+            payment_days=max(0, liquidity),
+            use_treds=False,
+            propose_late_payment_penalty_clause=True,
+            reason="Close on previously proposed liquidity-safe terms with penalty protection.",
         )
 
     if buyer_price > cost + 5:
@@ -37,6 +109,7 @@ def choose_action(observation: NegotiationObservation, round_number: int) -> Neg
             price=target_price,
             payment_days=target_days,
             use_treds=False,
+            propose_late_payment_penalty_clause=True,
             reason="Countering above cost with a modest price improvement",
         )
 
@@ -46,6 +119,7 @@ def choose_action(observation: NegotiationObservation, round_number: int) -> Neg
             price=buyer_price,
             payment_days=buyer_days,
             use_treds=False,
+            propose_late_payment_penalty_clause=True,
             reason="Current offer is viable within liquidity threshold",
         )
 
@@ -57,6 +131,7 @@ def choose_action(observation: NegotiationObservation, round_number: int) -> Neg
             price=target_price,
             payment_days=target_days,
             use_treds=True,
+            propose_late_payment_penalty_clause=True,
             reason="TReDS-enabled proposal to compress payment terms",
         )
 
@@ -67,6 +142,7 @@ def choose_action(observation: NegotiationObservation, round_number: int) -> Neg
         price=target_price,
         payment_days=target_days,
         use_treds=buyer_days > liquidity,
+        propose_late_payment_penalty_clause=True,
         reason="Incremental counter-offer based on observed buyer state",
     )
 

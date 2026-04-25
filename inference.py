@@ -39,11 +39,11 @@ logger = logging.getLogger(__name__)
 # Allow .env to override pre-set shell vars (e.g. stale Groq API_BASE_URL in the same terminal).
 load_dotenv(override=True)
 
-# LLM: Hugging Face OpenAI-compatible router by default (override with API_BASE_URL in .env)
-API_BASE_URL = (os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1").strip()
+# LLM: Hugging Face OpenAI-compatible router by default.
+API_BASE_URL = (os.getenv("OPENAI_BASE_URL") or os.getenv("API_BASE_URL") or "https://router.huggingface.co/v1").strip()
 # Hackathon / dashboard may set either HF_TOKEN or API_KEY for the OpenAI client.
 # HF Router chat/completions only accepts models exposed as *chat* models — not every Hub id works.
-MODEL_NAME = (os.getenv("MODEL_NAME") or "Qwen/Qwen2.5-7B-Instruct").strip()
+MODEL_NAME = (os.getenv("MODEL_NAME") or "meta-llama/Llama-3.1-8B-Instruct").strip()
 # Docker / HF Space image tag (validator builds). Inference uses HTTP or in-process env — not from_docker_image().
 LOCAL_IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME", "openenv-sme-negotiator:latest")
 
@@ -1803,7 +1803,7 @@ async def main() -> None:
     if "router.huggingface.co" in API_BASE_URL:
         print(
             "[CONFIG] Hugging Face router uses /v1/chat/completions — pick a chat/instruct model id "
-            "(e.g. Qwen/Qwen2.5-7B-Instruct). If you see 'not a chat model', change MODEL_NAME in .env.",
+            "(e.g. meta-llama/Llama-3.1-8B-Instruct). If you see 'not a chat model', change MODEL_NAME in .env.",
             file=sys.stderr, flush=True,
         )
     if _llm_url_looks_local(API_BASE_URL):

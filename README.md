@@ -800,6 +800,22 @@ GRPO checkpoint publishing assets are included under [`huggingface/`](huggingfac
 python scripts/publish_hf_model.py --repo-id YOUR_USERNAME/openenv-sme-negotiator-grpo
 ```
 
+### Judge Readiness Report
+
+For a clean submission artifact, generate deterministic compliance checks and
+task scores:
+
+```bash
+python scripts/judge_report.py
+```
+
+This writes `outputs/judge_report.json` and `outputs/judge_report.md` with:
+
+- OpenEnv manifest/server/client/training checklist
+- baseline scores for the three hosted `payment-terms-*` tasks
+- liquidity-task scores for the GRPO training environment
+- a short mapping to the hackathon judging criteria
+
 ---
 
 ## 🧪 Tests & Validation
