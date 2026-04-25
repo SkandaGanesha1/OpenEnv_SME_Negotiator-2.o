@@ -32,3 +32,11 @@ def test_run_heuristic_episode_is_stable_and_download_free() -> None:
     assert "verifiable_reward" in first["summary"]
     assert "tool_call_count" in first["summary"]
     assert "terminated_by_step_cap" in first["summary"]
+
+
+def test_run_heuristic_episode_summary_allows_attribute_access() -> None:
+    run = run_heuristic_episode(seed=19, total_periods=2, task_name="liquidity-correlation-hard")
+    summary = run["summary"]
+
+    assert isinstance(summary.success_no_default_positive_npv, bool)
+    assert isinstance(summary.total_reward, float)

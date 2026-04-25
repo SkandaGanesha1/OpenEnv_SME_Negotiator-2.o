@@ -722,6 +722,14 @@ def test_colab_notebook_requires_peft_and_no_inline_training_loop_fallback() -> 
     assert "build_training_session" in source
 
 
+def test_colab_notebook_baseline_handles_dict_or_attr_summary_shape() -> None:
+    source = _load_notebook_source()
+
+    assert "_baseline_success" in source
+    assert "summary.get(\"success_no_default_positive_npv\", False)" in source
+    assert "run[\"summary\"].success_no_default_positive_npv" not in source
+
+
 def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
     tmp_path = _workspace_tmp_dir("metrics_callback_failure")
     summary_buffer = EpisodeSummaryBuffer()

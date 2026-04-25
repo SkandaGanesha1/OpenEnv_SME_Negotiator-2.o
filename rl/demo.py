@@ -21,6 +21,20 @@ from rl.train_grpo_trl import (
 from sme_negotiator_env.models import LiquidityObservation, NegotiationAction
 
 
+class SummaryView(dict[str, Any]):
+    """Dict-like summary that also supports attribute access.
+
+    Notebook code sometimes uses `summary.foo` while tests and JSON paths use
+    `summary["foo"]`. This view supports both patterns safely.
+    """
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
 def _ensure_grpo_response_schema(tokenizer: Any) -> Any:
     """Set a tool-response schema for TRL versions that require one."""
     if getattr(tokenizer, "response_schema", None) is not None:
@@ -252,7 +266,7 @@ def run_heuristic_episode(
             break
 
     episode_summary = wrapper.summarize_episode()
-    summary = {
+    summary = SummaryView({
         "base_rl_reward": float(episode_summary.base_rl_reward),
         "verifiable_reward": float(episode_summary.verifiable_reward),
         "total_reward": float(episode_summary.total_reward),
@@ -269,7 +283,7 @@ def run_heuristic_episode(
         "resolved_deal_count": int(episode_summary.resolved_deal_count),
         "defaulted_sme_count": int(episode_summary.defaulted_sme_count),
         "terminated_by_step_cap": bool(episode_summary.terminated_by_step_cap),
-    }
+    })
 
     return {
         "seed": seed,
