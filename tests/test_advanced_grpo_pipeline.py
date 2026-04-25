@@ -99,18 +99,18 @@ def test_advanced_plan_and_manifest_include_expected_phases() -> None:
     assert manifest["plan"]["task"]["task_name"] == "liquidity-correlation-hard"
 
 
-def test_advanced_notebook_contains_all_pipeline_phases_and_artifacts() -> None:
+def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     source = _load_notebook_source("grpo_sme_liquidity.ipynb")
 
-    assert 'RUN_PROFILE = "submission"' in source
-    assert 'backend="trl"' in source
-    assert 'backend="unsloth"' in source
+    assert 'RUN_PROFILE = "tiny"' in source
+    assert "from rl.train_grpo_simple import (" in source
+    assert "make_training_args" in source
+    assert "build_canonical_training_args" in source
+    assert "build_run_plan" in source
+    assert "smoke_test_environment" in source
+    assert "run_simple_training" in source
     assert "plot_rewards" in source
-    assert "evaluate_policy_checkpoints" in source
-    assert "decide_curriculum_adjustment" in source
-    assert "evaluate_before_after_policies" in source
-    assert "save_run_manifest" in source
-    assert 'outputs/grpo_sme_liquidity_advanced' in source
-    assert "Submission ready:" in source
-    assert "Unsloth tiny run is required" in source
+    assert "Smoke test passed. Environment is ready for training." in source
+    assert 'outputs/grpo_sme_liquidity_simple' in source
+    assert "Checkpoint path:" in source
 
