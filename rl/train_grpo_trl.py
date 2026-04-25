@@ -13,6 +13,8 @@ import importlib
 import inspect
 import json
 import os
+import sys
+import types
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1221,12 +1223,66 @@ def _resolve_training_components(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _install_mergekit_stub() -> None:
+    """Install a minimal mergekit shim for TRL builds that import it eagerly."""
+    if "mergekit" in sys.modules:
+        return
+
+    mergekit_module = types.ModuleType("mergekit")
+    config_module = types.ModuleType("mergekit.config")
+    merge_module = types.ModuleType("mergekit.merge")
+
+    class MergeConfiguration:  # pragma: no cover - compatibility shim only
+        pass
+
+    class MergeOptions:  # pragma: no cover - compatibility shim only
+        pass
+
+    def run_merge(*args: Any, **kwargs: Any) -> None:  # pragma: no cover - compatibility shim only
+        raise RuntimeError(
+            "mergekit compatibility stub was invoked. This training path does not support model merging."
+        )
+
+    config_module.MergeConfiguration = MergeConfiguration
+    merge_module.MergeOptions = MergeOptions
+    merge_module.run_merge = run_merge
+    mergekit_module.config = config_module
+    mergekit_module.merge = merge_module
+
+    sys.modules["mergekit"] = mergekit_module
+    sys.modules["mergekit.config"] = config_module
+    sys.modules["mergekit.merge"] = merge_module
+
+
+def _import_trl_grpo_symbols() -> tuple[Any, Any]:
+    """Import GRPOConfig and GRPOTrainer with a clearer dependency error."""
+    try:
+        from trl import GRPOConfig, GRPOTrainer
+    except Exception as exc:  # pragma: no cover - import path depends on installed TRL build
+        if "mergekit" in str(exc).lower():
+            _install_mergekit_stub()
+            sys.modules.pop("trl.mergekit_utils", None)
+            sys.modules.pop("trl.trainer.callbacks", None)
+            sys.modules.pop("trl.trainer.grpo_trainer", None)
+            try:
+                from trl import GRPOConfig, GRPOTrainer
+            except Exception as retry_exc:
+                raise ImportError(
+                    "TRL GRPO import failed because this TRL build eagerly imports mergekit. "
+                    "A compatibility stub was installed, but the import still failed. "
+                    "Restart the runtime and rerun the notebook install cell."
+                ) from retry_exc
+            return GRPOConfig, GRPOTrainer
+        raise
+    return GRPOConfig, GRPOTrainer
+
+
 def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     """Build the canonical explicit-rollout GRPO training bundle."""
     components = _resolve_training_components(args)
 
     from transformers import TrainerCallback
-    from trl import GRPOConfig, GRPOTrainer
+    GRPOConfig, GRPOTrainer = _import_trl_grpo_symbols()
 
     dataset = build_dataset(components["rows"])
     model, tokenizer = load_training_model_and_tokenizer(args.model_name)
@@ -1388,7 +1444,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 0
 
-    from trl import GRPOTrainer
+    _, GRPOTrainer = _import_trl_grpo_symbols()
 
     session = build_training_session(args)
     trainer = GRPOTrainer(**session["trainer_kwargs"])
