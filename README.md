@@ -10,8 +10,9 @@ pinned: false
 > [!IMPORTANT]
 > **TL;DR** -- SME Negotiator is a liquidity-first OpenEnv environment for Indian MSME payment-term negotiations with deterministic grading, tool-aware treasury workflows, and a truthful legacy public server surface.
 > Public legacy reference benchmark: **0.52 overall** on `payment-terms-*` single-deal tasks.
-> The in-process liquidity path is the judge-facing demo path and now emits explicit `[TERMINAL_REWARD]`, `[VERIFIABLE_REWARD]`, `[PERIOD_SUMMARY]`, and terminal `termination_reason=` / `defaulted_sme_count=` fields.
+> The manifest-facing OpenEnv surface stays the legacy HTTP path; the in-process liquidity path is the canonical training/demo artifact for Theme #2 and Theme #3.1, and now emits explicit `[TERMINAL_REWARD]`, `[VERIFIABLE_REWARD]`, `[PERIOD_SUMMARY]`, and terminal `termination_reason=` / `defaulted_sme_count=` fields.
 > Set `INFERENCE_AGENT_MODE=heuristic` for a deterministic baseline path that does not depend on router quality.
+> For public HF router demos, prefer a long-context chat model such as `Qwen/Qwen2.5-7B-Instruct-1M`; keep `.env` overrideable and use the same `inference_results.json -> judge_pack` pipeline for every README metric.
 > Training runs save `reward_curve.png` into the trainer output directory; the repo keeps `docs/img/tiny_grpo_reward_curve.svg` as the checked-in illustrative artifact until a moderate run is generated locally.
 
 ## Judge Quick Links
@@ -504,7 +505,9 @@ python -m rl.judge_pack --results-file inference_results.json --output-dir outpu
 ```
 
 That command writes `judge_summary.json`, `judge_results.md`, `reward_curve.png`,
-and baseline/trained transcript artifacts into `outputs/judge_pack/`.
+`before_after_excerpt.md`, and baseline/trained transcript artifacts into
+`outputs/judge_pack/`. Copy README tables from `judge_summary.json`; do not
+hand-write metrics.
 
 ## Stage 6 Self-Play
 
@@ -593,8 +596,8 @@ By default, `python inference.py` runs the in-process liquidity path so Theme
 - If a macro period has no open deals left, the liquidity runner now
   auto-selects `advance_period` instead of asking the model to act on a null
   deal.
-- `[VERIFIABLE_REWARD]` prints the terminal solvency / liquidity / NPV /
-  compliance component breakdown in one judge-readable line.
+- `[VERIFIABLE_REWARD]` prints the canonical terminal breakdown when it is
+  available and otherwise prints `breakdown=unavailable` instead of fake zeroes.
 - `[TERMINAL_REWARD]` isolates the final deterministic verifiable reward so the
   episode-ending score is visible separately from the shaping curve.
 - Those shaping rewards can decline across steps when the buyer keeps conceding

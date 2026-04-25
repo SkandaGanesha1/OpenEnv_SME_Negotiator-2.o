@@ -171,3 +171,58 @@ def test_liquidity_normalizer_downgrades_invalid_accepts() -> None:
     assert out["action_type"] == "propose"
     assert out["deal_id"] == "deal-1"
     assert "Invalid accept downgraded" in out["reason"]
+
+
+def test_medium_contract_strips_dynamic_discount_fields() -> None:
+    observation = {
+        "active_deal_id": "deal-1",
+        "open_deal_ids": ["deal-1"],
+        "buyer_price": 94.0,
+        "buyer_days": 72,
+        "liquidity_threshold": 45,
+        "cost_threshold": 82.0,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {
+            "action_type": "propose",
+            "deal_id": "deal-1",
+            "price": 90.0,
+            "payment_days": 50,
+            "use_treds": False,
+            "propose_dynamic_discounting": True,
+            "dynamic_discount_annual_rate": 0.27,
+        },
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=2,
+        last_valid_proposal=None,
+    )
+
+    assert out["propose_dynamic_discounting"] is False
+    assert out["dynamic_discount_annual_rate"] == 0.0
+    assert out["propose_late_payment_penalty_clause"] is True
+
+
+def test_compact_step_serialization_omits_irrelevant_tool_fields() -> None:
+    action = inference.NegotiationAction(
+        action_type="tool",
+        deal_id="deal-1",
+        tool_name="QUERY_TREDS",
+        tool_args={"invoice_id": "deal-1", "deal_id": "deal-1"},
+        price=83.5,
+        payment_days=60,
+        use_treds=True,
+        propose_dynamic_discounting=True,
+        dynamic_discount_annual_rate=0.02,
+        reason="Inspect financing first.",
+    )
+
+    action_json = inference._serialize_step_action(action)
+
+    assert '"tool_name":"QUERY_TREDS"' in action_json
+    assert '"price"' not in action_json
+    assert '"payment_days"' not in action_json
+    assert '"dynamic_discount_annual_rate"' not in action_json
