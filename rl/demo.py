@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,6 +19,96 @@ from rl.train_grpo_trl import (
     make_reward_function,
 )
 from sme_negotiator_env.models import LiquidityObservation, NegotiationAction
+
+
+def _ensure_grpo_response_schema(tokenizer: Any) -> Any:
+    """Set a tool-response schema for TRL versions that require one."""
+    if getattr(tokenizer, "response_schema", None) is not None:
+        return tokenizer
+
+    try:
+        from trl.chat_template_utils import qwen3_schema
+
+        tokenizer.response_schema = qwen3_schema
+    except (ImportError, AttributeError):
+        tokenizer.response_schema = {
+            "x-regex": r"^(?P<content>.*?)(?:<\|im_end\|>|$)",
+            "type": "object",
+            "properties": {
+                "role": {"const": "assistant"},
+                "content": {"type": "string"},
+            },
+        }
+    return tokenizer
+
+
+def _cuda_training_dtype() -> Any:
+    """Return the lowest-risk CUDA dtype for Colab-class demo training."""
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _load_demo_model(model_cls: Any, model_name: str) -> Any:
+    """Load the demo model with memory-conscious defaults."""
+    model_kwargs: dict[str, Any] = {"low_cpu_mem_usage": True}
+    torch_dtype = _cuda_training_dtype()
+    if torch_dtype is not None:
+        model_kwargs["torch_dtype"] = torch_dtype
+    try:
+        return model_cls.from_pretrained(model_name, **model_kwargs)
+    except TypeError:
+        model_kwargs.pop("low_cpu_mem_usage", None)
+        return model_cls.from_pretrained(model_name, **model_kwargs)
+
+
+def _prepare_demo_model_for_training(model: Any, *, use_lora: bool) -> Any:
+    """Apply memory-saving training settings for tiny GRPO demos."""
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    if not use_lora:
+        return model
+
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError:
+        print("[demo_train_grpo] peft is not installed; falling back to full-parameter training.")
+        return model
+
+    lora_config = LoraConfig(
+        r=8,
+        lora_alpha=16,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+    return model
 
 
 def make_demo_action(observation: LiquidityObservation) -> NegotiationAction:
@@ -148,6 +239,8 @@ def demo_train_grpo(
     num_samples: int = 8,
     seed_base: int = 1000,
     output_dir: str = "outputs/grpo_sme_liquidity_demo",
+    use_lora: bool = True,
+    max_completion_length: int = 256,
 ) -> dict[str, Any]:
     """Run a tiny in-process GRPO demo and return reward history."""
     try:
@@ -194,8 +287,11 @@ def demo_train_grpo(
     reward_func = make_reward_function(summary_buffer=summary_buffer)
     output_path = Path(output_dir)
 
-    tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(model_name))
-    model = AutoModelForCausalLM.from_pretrained(model_name)
+    tokenizer = _ensure_grpo_response_schema(configure_tokenizer(AutoTokenizer.from_pretrained(model_name)))
+    model = _prepare_demo_model_for_training(
+        _load_demo_model(AutoModelForCausalLM, model_name),
+        use_lora=use_lora,
+    )
     metrics_callback = build_metrics_callback(
         summary_buffer,
         TrainerCallback,
@@ -205,20 +301,33 @@ def demo_train_grpo(
         output_dir=str(output_path),
     )
     history_callback = HistoryCallback()
-    training_args = GRPOConfig(
-        output_dir=str(output_path),
-        remove_unused_columns=False,
-        per_device_train_batch_size=1,
-        gradient_accumulation_steps=1,
-        num_generations=2,
-        learning_rate=5e-6,
-        max_prompt_length=512,
-        max_completion_length=512,
-        max_steps=max(1, int(steps)),
-        logging_steps=1,
-        save_steps=max(1, int(steps)),
-        report_to=_training_log_backend(),
-    )
+    grpo_kwargs = {
+        "output_dir": str(output_path),
+        "remove_unused_columns": False,
+        "per_device_train_batch_size": 1,
+        "gradient_accumulation_steps": 2,
+        "num_generations": 2,
+        "generation_batch_size": 2,
+        "learning_rate": 5e-6,
+        "max_prompt_length": 512,
+        "max_completion_length": max(64, int(max_completion_length)),
+        "max_steps": max(1, int(steps)),
+        "logging_steps": 1,
+        "save_steps": max(1, int(steps)),
+        "report_to": _training_log_backend(),
+        "gradient_checkpointing": True,
+        "gradient_checkpointing_kwargs": {"use_reentrant": False},
+    }
+    torch_dtype = _cuda_training_dtype()
+    if torch_dtype is not None:
+        dtype_name = str(torch_dtype)
+        grpo_kwargs["bf16"] = dtype_name == "torch.bfloat16"
+        grpo_kwargs["fp16"] = dtype_name == "torch.float16"
+    valid_grpo_keys = set(inspect.signature(GRPOConfig.__init__).parameters) - {"self"}
+    unsupported = sorted(key for key in grpo_kwargs if key not in valid_grpo_keys)
+    if unsupported:
+        print(f"[demo_train_grpo] Dropping unsupported GRPOConfig args for this TRL version: {unsupported}")
+    training_args = GRPOConfig(**{key: value for key, value in grpo_kwargs.items() if key in valid_grpo_keys})
 
     trainer = GRPOTrainer(
         model=model,
@@ -276,8 +385,25 @@ def run_policy_episode(
     except ImportError as exc:
         raise ImportError("Running a trained policy requires transformers to be installed.") from exc
 
+    checkpoint = Path(checkpoint_path)
     tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(checkpoint_path))
-    model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+    try:
+        from peft import PeftConfig, PeftModel
+    except ImportError:
+        model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+    else:
+        try:
+            peft_config = PeftConfig.from_pretrained(str(checkpoint))
+        except Exception:
+            model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+        else:
+            base_model_name = str(getattr(peft_config, "base_model_name_or_path", "") or DEFAULT_MODEL_NAME)
+            model = PeftModel.from_pretrained(
+                _load_demo_model(AutoModelForCausalLM, base_model_name),
+                str(checkpoint),
+            )
+    if hasattr(model, "eval"):
+        model.eval()
     env = SMELiquidityEnvironment(total_periods=total_periods)
     observation = env.reset(seed=seed, difficulty=difficulty, task_name=task_name)
     transcript_lines = [f"RESET :: {format_observation(observation)}"]

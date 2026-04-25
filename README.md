@@ -773,6 +773,18 @@ The repository is configured with Space frontmatter and Docker runtime metadata.
 
 - https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator
 
+### Hugging Face Model Card & Blog Draft
+
+GRPO checkpoint publishing assets are included under [`huggingface/`](huggingface/):
+
+- [`huggingface/model_card.md`](huggingface/model_card.md) can be uploaded as the model repo `README.md`.
+- [`huggingface/blog_post.md`](huggingface/blog_post.md) is a draft article for a Hugging Face Community post.
+- [`scripts/publish_hf_model.py`](scripts/publish_hf_model.py) uploads `outputs/colab_grpo_sme_liquidity/final-demo-model` to a Hub model repo.
+
+```bash
+python scripts/publish_hf_model.py --repo-id YOUR_USERNAME/openenv-sme-negotiator-grpo
+```
+
 ---
 
 ## 🧪 Tests & Validation
