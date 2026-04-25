@@ -763,6 +763,9 @@ def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) 
     assert GRPOTrainer.__name__ == "GRPOTrainer"
     assert state["stub_visible"] is True
     assert state["attempts"] >= 4
+    assert "weave.trace.context" in sys.modules
+    assert hasattr(sys.modules["weave"], "__path__")
+    assert callable(getattr(sys.modules["weave.trace.context"], "weave_client_context", None))
 
 
 def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:

@@ -1226,13 +1226,20 @@ def _resolve_training_components(args: argparse.Namespace) -> dict[str, Any]:
 
 def _install_optional_dependency_stub(module_name: str) -> bool:
     """Install a minimal shim for optional TRL imports we do not use."""
+    def _new_stub_module(name: str, *, is_package: bool = False) -> types.ModuleType:
+        module = types.ModuleType(name)
+        module.__file__ = f"<optional-stub:{name}>"
+        if is_package:
+            module.__path__ = []  # type: ignore[attr-defined]
+        return module
+
     if module_name == "mergekit":
         if "mergekit" in sys.modules:
             return True
 
-        mergekit_module = types.ModuleType("mergekit")
-        config_module = types.ModuleType("mergekit.config")
-        merge_module = types.ModuleType("mergekit.merge")
+        mergekit_module = _new_stub_module("mergekit", is_package=True)
+        config_module = _new_stub_module("mergekit.config")
+        merge_module = _new_stub_module("mergekit.merge")
 
         class MergeConfiguration:  # pragma: no cover - compatibility shim only
             pass
@@ -1258,67 +1265,47 @@ def _install_optional_dependency_stub(module_name: str) -> bool:
 
     if module_name == "llm_blender":
         if "llm_blender" not in sys.modules:
-            sys.modules["llm_blender"] = types.ModuleType("llm_blender")
+            sys.modules["llm_blender"] = _new_stub_module("llm_blender")
         return True
 
-    if module_name in {"weave", "comet_ml"}:
-        if module_name not in sys.modules:
-            stub_module = types.ModuleType(module_name)
+    if module_name == "weave":
+        if "weave" in sys.modules:
+            return True
 
-            class _OptionalDependencyProxy:  # pragma: no cover - compatibility shim only
-                def __init__(self, *args: Any, **kwargs: Any) -> None:
-                    self.args = args
-                    self.kwargs = kwargs
+        weave_module = _new_stub_module("weave", is_package=True)
+        trace_module = _new_stub_module("weave.trace", is_package=True)
+        context_module = _new_stub_module("weave.trace.context")
 
-                def __call__(self, *args: Any, **kwargs: Any):
-                    raise RuntimeError(
-                        f"Optional dependency stub '{module_name}' was invoked at runtime. "
-                        "This training path does not support that integration."
-                    )
-
-                def __getattr__(self, name: str):
-                    return _OptionalDependencyProxy()
-
-            def _module_getattr(name: str):
-                return _OptionalDependencyProxy
-
-            setattr(stub_module, "__getattr__", _module_getattr)
-            stub_module.__dict__.update(
-                {
-                    "EvaluationLogger": _OptionalDependencyProxy,
-                    "init": _OptionalDependencyProxy(),
-                    "log": _OptionalDependencyProxy(),
-                    "finish": _OptionalDependencyProxy(),
-                }
-            )
-            sys.modules[module_name] = stub_module
-        return True
-
-    if module_name and module_name not in sys.modules:
-        stub_module = types.ModuleType(module_name)
-
-        class _GenericOptionalProxy:  # pragma: no cover - compatibility shim only
+        class EvaluationLogger:  # pragma: no cover - compatibility shim only
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 self.args = args
                 self.kwargs = kwargs
 
-            def __call__(self, *args: Any, **kwargs: Any):
-                raise RuntimeError(
-                    f"Optional dependency stub '{module_name}' was invoked at runtime. "
-                    "This training path does not support that integration."
-                )
+        class _WeaveClientContext:  # pragma: no cover - compatibility shim only
+            def __enter__(self):
+                return None
 
-            def __getattr__(self, name: str):
-                return _GenericOptionalProxy()
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
 
-        def _module_getattr(name: str):
-            return _GenericOptionalProxy
+        def weave_client_context(*args: Any, **kwargs: Any) -> _WeaveClientContext:
+            return _WeaveClientContext()
 
-        setattr(stub_module, "__getattr__", _module_getattr)
-        sys.modules[module_name] = stub_module
+        weave_module.EvaluationLogger = EvaluationLogger
+        trace_module.context = context_module
+        context_module.weave_client_context = weave_client_context
+
+        sys.modules["weave"] = weave_module
+        sys.modules["weave.trace"] = trace_module
+        sys.modules["weave.trace.context"] = context_module
         return True
 
-    return module_name in sys.modules
+    if module_name == "comet_ml":
+        if module_name not in sys.modules:
+            sys.modules[module_name] = _new_stub_module(module_name)
+        return True
+
+    return False
 
 
 def _clear_trl_import_cache() -> None:
