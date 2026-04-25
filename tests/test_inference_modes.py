@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -22,13 +23,17 @@ def test_runtime_banner_matches_selected_mode() -> None:
 def test_inference_mode_defaults_and_normalization(monkeypatch) -> None:
     monkeypatch.delenv("INFERENCE_ENV_MODE", raising=False)
     monkeypatch.delenv("INFERENCE_REWARD_MODE", raising=False)
+    monkeypatch.delenv("INFERENCE_AGENT_MODE", raising=False)
     assert inference._inference_env_mode() == "liquidity"
     assert inference._inference_reward_mode() == "legacy+shadow_rlvr"
+    assert inference._inference_agent_mode() == "router"
 
     monkeypatch.setenv("INFERENCE_ENV_MODE", "LIQUIDITY")
     monkeypatch.setenv("INFERENCE_REWARD_MODE", "legacy+full_debug")
+    monkeypatch.setenv("INFERENCE_AGENT_MODE", "HEURISTIC")
     assert inference._inference_env_mode() == "liquidity"
     assert inference._inference_reward_mode() == "legacy+full_debug"
+    assert inference._inference_agent_mode() == "heuristic"
 
 
 def test_token_resolution_prefers_hf_then_api_key_then_openai() -> None:
@@ -122,9 +127,120 @@ def test_terminal_reward_line_marks_source() -> None:
     assert "success=true" in line
 
 
+def test_verifiable_reward_breakdown_line_formats_components() -> None:
+    line = inference._format_verifiable_reward_breakdown_line(
+        {
+            "solvency": 1.0,
+            "liquidity": 0.4,
+            "npv": 0.25,
+            "compliance": 0.8,
+            "total": 0.62,
+        }
+    )
+    assert line is not None
+    assert "[VERIFIABLE_REWARD]" in line
+    assert "solvency=1.0000" in line
+    assert "total=0.6200" in line
+
+
 def test_ascii_sparkline_uses_ascii_only() -> None:
     sparkline = inference._ascii_sparkline([0.0, 0.5, 1.0])
     assert sparkline.isascii()
+
+
+def test_auto_advance_liquidity_guardrail_detects_empty_period() -> None:
+    assert inference._should_auto_advance_liquidity_period(
+        {"open_deal_ids": [], "current_period": 1, "total_periods": 3}
+    ) is True
+    assert inference._should_auto_advance_liquidity_period(
+        {"open_deal_ids": ["deal-1"], "current_period": 1, "total_periods": 3}
+    ) is False
+    assert inference._should_auto_advance_liquidity_period(
+        {"open_deal_ids": [], "current_period": 3, "total_periods": 3}
+    ) is False
+    assert inference._should_auto_advance_liquidity_period(
+        {"open_deal_ids": [], "current_period": 1, "total_periods": 3},
+        done=True,
+    ) is False
+
+
+def test_run_liquidity_episode_auto_advances_without_calling_llm(monkeypatch) -> None:
+    class _FakeLiquidityEnv:
+        def __init__(self) -> None:
+            self.actions: list[str] = []
+
+        async def reset(self, **kwargs):
+            return SimpleNamespace(
+                done=False,
+                reward=0.0,
+                observation={
+                    "open_deal_ids": [],
+                    "resolved_deal_ids": [],
+                    "active_deal_id": None,
+                    "current_period": 0,
+                    "total_periods": 2,
+                    "reward": 0.0,
+                    "metadata": {},
+                },
+            )
+
+        async def step(self, action):
+            self.actions.append(action.action_type)
+            return SimpleNamespace(
+                done=True,
+                reward=0.4,
+                observation={
+                    "open_deal_ids": [],
+                    "resolved_deal_ids": ["deal_p0_buyer_0_0"],
+                    "active_deal_id": None,
+                    "current_period": 2,
+                    "total_periods": 2,
+                    "reward": 0.4,
+                    "done": True,
+                    "metadata": {
+                        "reward_breakdown": {
+                            "solvency": 1.0,
+                            "liquidity": 0.5,
+                            "npv": 0.4,
+                            "compliance": 1.0,
+                            "total": 0.68,
+                        }
+                    },
+                },
+            )
+
+        def summarize_episode(self):
+            return SimpleNamespace(
+                base_rl_reward=0.4,
+                verifiable_reward=0.4,
+                total_reward=0.4,
+                tool_bonus_total=0.0,
+                env_reward_total=0.4,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=45.0,
+                tool_usage_count=0,
+                tool_call_count=0,
+                tool_effective_count=0,
+                duplicate_tool_count=0,
+                invalid_action_count=0,
+                stall_step_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+                terminated_by_step_cap=False,
+            )
+
+        def build_episode_log(self) -> str:
+            return "fake-log"
+
+    def _unexpected_llm_call(*args, **kwargs):
+        raise AssertionError("LLM should not be called when no open deals remain.")
+
+    monkeypatch.setattr(inference, "get_liquidity_agent_action", _unexpected_llm_call)
+    result = asyncio.run(inference.run_liquidity_episode(_FakeLiquidityEnv(), "MEDIUM", 7))
+
+    assert result["steps"] == 1
+    assert result["success"] is True
+    assert result["final_score"] > 0.0
 
 
 def test_liquidity_summary_aggregation_adds_expected_keys() -> None:
@@ -138,6 +254,7 @@ def test_liquidity_summary_aggregation_adds_expected_keys() -> None:
                     "tool_effective_count": 1,
                     "average_final_payment_days": 45.0,
                     "resolved_deal_count": 3,
+                    "defaulted_sme_count": 0,
                     "terminated_by_step_cap": False,
                 }
             },
@@ -149,6 +266,7 @@ def test_liquidity_summary_aggregation_adds_expected_keys() -> None:
                     "tool_effective_count": 3,
                     "average_final_payment_days": 35.0,
                     "resolved_deal_count": 4,
+                    "defaulted_sme_count": 1,
                     "terminated_by_step_cap": True,
                 }
             },
@@ -161,4 +279,168 @@ def test_liquidity_summary_aggregation_adds_expected_keys() -> None:
     assert metrics["avg_tool_effective_count"] == 2.0
     assert metrics["avg_final_payment_days"] == 40.0
     assert metrics["avg_resolved_deal_count"] == 3.5
+    assert metrics["default_rate"] == 0.5
     assert metrics["timeout_or_stepcap_rate"] == 0.5
+
+
+def test_run_liquidity_episode_heuristic_mode_skips_router(monkeypatch) -> None:
+    class _FakeLiquidityEnv:
+        def __init__(self) -> None:
+            self.actions: list[object] = []
+
+        async def reset(self, **kwargs):
+            return SimpleNamespace(
+                done=False,
+                reward=0.0,
+                observation={
+                    "open_deal_ids": ["deal-1"],
+                    "resolved_deal_ids": [],
+                    "active_deal_id": "deal-1",
+                    "current_period": 0,
+                    "total_periods": 1,
+                    "buyer_price": 96.0,
+                    "buyer_days": 80,
+                    "liquidity_threshold": 45,
+                    "cost_threshold": 82.0,
+                    "metadata": {},
+                },
+            )
+
+        async def step(self, action):
+            self.actions.append(action)
+            return SimpleNamespace(
+                done=True,
+                reward=0.25,
+                observation={
+                    "open_deal_ids": [],
+                    "resolved_deal_ids": ["deal-1"],
+                    "active_deal_id": None,
+                    "current_period": 1,
+                    "total_periods": 1,
+                    "buyer_price": 96.0,
+                    "buyer_days": 80,
+                    "liquidity_threshold": 45,
+                    "cost_threshold": 82.0,
+                    "done": True,
+                    "metadata": {
+                        "reward_breakdown": {
+                            "solvency": 1.0,
+                            "liquidity": 0.2,
+                            "npv": 0.1,
+                            "compliance": 1.0,
+                            "total": 0.32,
+                        },
+                        "termination_reason": "episode_complete",
+                        "defaulted_sme_count": 0,
+                    },
+                },
+            )
+
+        def summarize_episode(self):
+            return SimpleNamespace(
+                base_rl_reward=0.25,
+                verifiable_reward=0.25,
+                total_reward=0.25,
+                tool_bonus_total=0.0,
+                env_reward_total=0.25,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=45.0,
+                tool_usage_count=1,
+                tool_call_count=1,
+                tool_effective_count=1,
+                duplicate_tool_count=0,
+                invalid_action_count=0,
+                stall_step_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+                terminated_by_step_cap=False,
+            )
+
+        def build_episode_log(self) -> str:
+            return "fake-trained-log"
+
+    def _unexpected_llm_call(*args, **kwargs):
+        raise AssertionError("Router path should not run in heuristic mode.")
+
+    monkeypatch.setenv("INFERENCE_AGENT_MODE", "heuristic")
+    monkeypatch.setattr(inference, "get_liquidity_agent_action", _unexpected_llm_call)
+    result = asyncio.run(inference.run_liquidity_episode(_FakeLiquidityEnv(), "HARD", 7))
+
+    assert result["steps"] == 1
+    assert result["termination_reason"] == "episode_complete"
+
+
+def test_run_liquidity_episode_logs_period_and_terminal_fields(monkeypatch, capsys) -> None:
+    class _FakeLiquidityEnv:
+        async def reset(self, **kwargs):
+            return SimpleNamespace(
+                done=False,
+                reward=0.0,
+                observation={
+                    "open_deal_ids": [],
+                    "resolved_deal_ids": [],
+                    "active_deal_id": None,
+                    "current_period": 0,
+                    "total_periods": 2,
+                    "reward": 0.0,
+                    "metadata": {},
+                },
+            )
+
+        async def step(self, action):
+            return SimpleNamespace(
+                done=True,
+                reward=0.4,
+                observation={
+                    "open_deal_ids": [],
+                    "resolved_deal_ids": ["deal-1"],
+                    "active_deal_id": None,
+                    "current_period": 1,
+                    "total_periods": 2,
+                    "reward": 0.4,
+                    "done": True,
+                    "metadata": {
+                        "termination_reason": "macro_horizon_end",
+                        "defaulted_sme_count": 1,
+                        "resolved_deal_count": 1,
+                        "reward_breakdown": {
+                            "solvency": 1.0,
+                            "liquidity": 0.5,
+                            "npv": 0.4,
+                            "compliance": 1.0,
+                            "total": 0.68,
+                        },
+                    },
+                },
+            )
+
+        def summarize_episode(self):
+            return SimpleNamespace(
+                base_rl_reward=0.4,
+                verifiable_reward=0.4,
+                total_reward=0.4,
+                tool_bonus_total=0.0,
+                env_reward_total=0.4,
+                success_no_default_positive_npv=False,
+                average_final_payment_days=45.0,
+                tool_usage_count=0,
+                tool_call_count=0,
+                tool_effective_count=0,
+                duplicate_tool_count=0,
+                invalid_action_count=0,
+                stall_step_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=1,
+                terminated_by_step_cap=False,
+            )
+
+        def build_episode_log(self) -> str:
+            return "fake-log"
+
+    asyncio.run(inference.run_liquidity_episode(_FakeLiquidityEnv(), "MEDIUM", 7))
+    captured = capsys.readouterr().out
+
+    assert "[PERIOD_SUMMARY]" in captured
+    assert "step_reward_raw=0.4000" in captured
+    assert "termination_reason=macro_horizon_end" in captured
+    assert "defaulted_sme_count=1" in captured

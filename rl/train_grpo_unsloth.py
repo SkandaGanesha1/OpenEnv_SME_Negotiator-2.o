@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from rl.train_grpo_trl import (
     DEFAULT_PROMPT,
+    _training_log_backend,
     EpisodeSummaryBuffer,
     build_curriculum_manager_from_args,
     build_dataset,
@@ -22,9 +23,9 @@ from rl.train_grpo_trl import (
     build_training_rows,
     configure_tokenizer,
     load_rubric_scorer,
-    make_reward_function,
     print_dry_run_summary,
 )
+from rl.reward_functions import make_all_reward_funcs
 
 DEFAULT_UNSLOTH_MODEL = "unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit"
 
@@ -73,7 +74,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "max_completion_length": 1536,
         "max_steps": 250,
         "logging_steps": 1,
-        "report_to": "none",
+        "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
     if bool(args.use_vllm):
@@ -143,7 +144,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     summary_buffer = EpisodeSummaryBuffer()
-    reward_func = make_reward_function(
+    reward_funcs, reward_weights = make_all_reward_funcs(
         rubric_scorer=rubric_scorer,
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
@@ -167,12 +168,15 @@ def main(argv: Optional[list[str]] = None) -> int:
                 output_dir=args.output_dir,
             )
         )
-    training_args = GRPOConfig(**build_grpo_config_kwargs(args))
+    grpo_kwargs = build_grpo_config_kwargs(args)
+    grpo_kwargs["reward_weights"] = reward_weights
+    grpo_kwargs["log_completions"] = True
+    training_args = GRPOConfig(**grpo_kwargs)
 
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
-        reward_funcs=reward_func,
+        reward_funcs=reward_funcs,
         train_dataset=dataset,
         args=training_args,
         environment_factory=env_factory,

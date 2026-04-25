@@ -1,4 +1,4 @@
-.PHONY: help install install-dev test test-fast lint format clean server docker-build docker-run baseline diagnostic examples
+.PHONY: help install install-dev test test-fast lint format clean server docker-build docker-run baseline diagnostic examples judge-pack
 
 help:
 	@echo "OpenEnv SME Negotiator - Development Commands"
@@ -7,6 +7,7 @@ help:
 	@echo "  make test          pytest tests/"
 	@echo "  make server        uvicorn on 0.0.0.0:7860"
 	@echo "  make baseline      python inference.py"
+	@echo "  make judge-pack    build judge-facing artifacts from inference_results.json"
 	@echo "  make diagnostic    import check + pytest"
 	@echo "  make docker-build / docker-run"
 
@@ -49,6 +50,9 @@ examples:
 
 baseline:
 	python inference.py
+
+judge-pack:
+	python -m rl.judge_pack --results-file inference_results.json --output-dir outputs/judge_pack
 
 diagnostic:
 	python -c "from server.app import app; print('app:', app.title)"

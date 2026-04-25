@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import types
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,7 +28,10 @@ from rl.train_grpo_trl import (
     main as trl_main,
     make_reward_function,
 )
-from rl.train_grpo_unsloth import main as unsloth_main
+from rl.train_grpo_unsloth import (
+    build_grpo_config_kwargs as unsloth_build_grpo_config_kwargs,
+    main as unsloth_main,
+)
 
 
 class _DummyTokenizer:
@@ -220,6 +224,74 @@ def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> 
 
     monkeypatch.setenv("TRAINING_LOG_BACKEND", "unsupported")
     assert build_grpo_config_kwargs(args)["report_to"] == "none"
+
+
+def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:
+    args = build_arg_parser().parse_args([])
+
+    monkeypatch.setenv("TRAINING_LOG_BACKEND", "wandb")
+    assert unsloth_build_grpo_config_kwargs(args)["report_to"] == "wandb"
+
+    monkeypatch.setenv("TRAINING_LOG_BACKEND", "unsupported")
+    assert unsloth_build_grpo_config_kwargs(args)["report_to"] == "none"
+
+
+def test_trl_main_passes_configured_environment_factory(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    sentinel_env_factory = object()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(trl_script, "build_curriculum_manager_from_args", lambda args: None)
+    monkeypatch.setattr(trl_script, "build_opponent_manager_from_args", lambda args: None)
+    monkeypatch.setattr(trl_script, "load_rubric_scorer", lambda spec, enable_rubrics=False: None)
+    monkeypatch.setattr(trl_script, "build_environment_factory", lambda *args, **kwargs: sentinel_env_factory)
+    monkeypatch.setattr(trl_script, "build_dataset", lambda rows: rows)
+    monkeypatch.setattr(trl_script, "configure_tokenizer", lambda tokenizer: tokenizer)
+    monkeypatch.setattr(trl_script, "make_all_reward_funcs", lambda **kwargs: ([lambda environments, **extra: [0.0]], [1.0]))
+    monkeypatch.setattr(trl_script, "build_metrics_callback", lambda *args, **kwargs: object())
+
+    fake_transformers = types.ModuleType("transformers")
+
+    class _FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(model_name):
+            return _DummyTokenizer()
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(model_name):
+            return object()
+
+    class _FakeTrainerCallback:
+        pass
+
+    fake_transformers.AutoTokenizer = _FakeAutoTokenizer
+    fake_transformers.AutoModelForCausalLM = _FakeAutoModel
+    fake_transformers.TrainerCallback = _FakeTrainerCallback
+
+    fake_trl = types.ModuleType("trl")
+
+    class _FakeGRPOConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    class _FakeGRPOTrainer:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        def train(self) -> None:
+            captured["trained"] = True
+
+    fake_trl.GRPOConfig = _FakeGRPOConfig
+    fake_trl.GRPOTrainer = _FakeGRPOTrainer
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "trl", fake_trl)
+
+    assert trl_main(["--num-samples", "1"]) == 0
+    assert captured["environment_factory"] is sentinel_env_factory
+    assert captured["trained"] is True
 
 
 def test_metrics_callback_saves_reward_curve_without_matplotlib_dependency(monkeypatch) -> None:

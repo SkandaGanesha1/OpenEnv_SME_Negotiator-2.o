@@ -114,3 +114,60 @@ def test_end_line_includes_score_field() -> None:
     line = inference._format_end_line(True, 4, 0.75, [0.1, 0.2, 0.15, 0.75])
     assert line.startswith("[END] success=true steps=4 score=0.75 rewards=")
     assert "0.10,0.20,0.15,0.75" in line
+
+
+def test_liquidity_normalizer_suppresses_rejects_into_counter_proposals() -> None:
+    observation = {
+        "active_deal_id": "deal-1",
+        "open_deal_ids": ["deal-1"],
+        "buyer_price": 96.0,
+        "buyer_days": 75,
+        "liquidity_threshold": 45,
+        "cost_threshold": 82.0,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {"action_type": "reject", "reason": "Counter offer does not meet thresholds."},
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=1,
+        last_valid_proposal=None,
+    )
+
+    assert out["action_type"] == "propose"
+    assert out["deal_id"] == "deal-1"
+    assert "Reject suppressed" in out["reason"]
+
+
+def test_liquidity_normalizer_downgrades_invalid_accepts() -> None:
+    observation = {
+        "active_deal_id": "deal-1",
+        "open_deal_ids": ["deal-1"],
+        "buyer_price": 96.0,
+        "buyer_days": 78,
+        "liquidity_threshold": 45,
+        "cost_threshold": 82.0,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {
+            "action_type": "accept",
+            "deal_id": "deal-1",
+            "price": 96.0,
+            "payment_days": 78,
+            "use_treds": False,
+            "reason": "Looks acceptable.",
+        },
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=2,
+        last_valid_proposal=None,
+    )
+
+    assert out["action_type"] == "propose"
+    assert out["deal_id"] == "deal-1"
+    assert "Invalid accept downgraded" in out["reason"]

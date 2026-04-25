@@ -51,6 +51,7 @@ step-level shaping information and terminal outcome information.
 | `[LIQUIDITY_REWARD] env_reward=` | Same per-step environment reward with higher precision | Throughout the episode |
 | `[LIQUIDITY_REWARD] latest_shaping_reward=` | Payment-gap / tenor / alignment shaping component | When a transition improves liquidity position |
 | `[LIQUIDITY_REWARD] latest_verifiable_reward=` | Deterministic solvency + NPV + compliance terminal reward | Final step only |
+| `[VERIFIABLE_REWARD] total=` | Terminal solvency / liquidity / NPV / compliance component breakdown | Final step only |
 | `[TERMINAL_REWARD] verifiable=` | Explicit terminal verifiable reward line for judge readability | Final step only |
 | `[END] score=` | Final normalized score shown in parser-safe episode output | Final step only |
 
@@ -58,6 +59,10 @@ Early `latest_verifiable_reward=0.0000` values are expected. The verifiable
 reward only becomes meaningful when the macro episode actually terminates,
 while shaping rewards stay active from the first step onward so the policy
 receives gradient signal throughout the workflow.
+
+The liquidity inference runner also auto-advances macro periods when
+`open_deal_ids=[]` and the episode is not done yet, so the demo does not get
+stuck asking the model to act on a null deal.
 
 ## Theme 3.1 Positioning
 

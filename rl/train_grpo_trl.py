@@ -16,7 +16,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Optional
 
-from rl.bridge import NegotiatorEnvFactory, make_environment_factory
+from rl.bridge import make_environment_factory
 from rl.curriculum import CurriculumManager, DEFAULT_CURRICULUM_LEVELS
 from rl.episode_logging import EpisodeSummary, combine_rewards
 from rl.opponents import OpponentPolicyManager
@@ -546,16 +546,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     if monitoring_cb is not None:
         callbacks.append(monitoring_cb)
 
-    # NegotiatorEnvFactory is the drop-in environment_factory for GRPOTrainer.
-    # It exposes propose_terms / accept_offer / reject_offer / use_tool /
-    # advance_period as tools and surfaces reward_breakdown for split reward fns.
+    # Use the configured zero-arg environment factory so curriculum, persona,
+    # and self-play wiring from the CLI all reach the trainer.
     trainer = GRPOTrainer(
         model=model,
         processing_class=tokenizer,
         reward_funcs=reward_funcs,
         train_dataset=dataset,
         args=training_args,
-        environment_factory=NegotiatorEnvFactory,
+        environment_factory=env_factory,
         callbacks=callbacks,
     )
     trainer.train()
