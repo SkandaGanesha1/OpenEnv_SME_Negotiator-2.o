@@ -94,7 +94,12 @@ def _recompute_world_metrics(world_state: WorldState) -> None:
         deal_count = 0
 
         for deal in world_state.deals:
-            if deal.sme_id != sme.sme_id or deal.failed or deal.settled:
+            if (
+                deal.sme_id != sme.sme_id
+                or deal.failed
+                or deal.settled
+                or deal.status != "agreed"
+            ):
                 continue
 
             buyer = _lookup_buyer(world_state, deal.buyer_id)

@@ -206,6 +206,96 @@ def test_medium_contract_strips_dynamic_discount_fields() -> None:
     assert out["propose_late_payment_penalty_clause"] is True
 
 
+def test_liquidity_contract_keeps_treds_when_terms_exceed_supplier_pay_cycle() -> None:
+    observation = {
+        "active_deal_id": "deal-1",
+        "open_deal_ids": ["deal-1"],
+        "buyer_price": 84.0,
+        "buyer_days": 40,
+        "liquidity_threshold": 40,
+        "cost_threshold": 82.0,
+        "sme_supplier_payment_days": 25,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {
+            "action_type": "accept",
+            "deal_id": "deal-1",
+            "price": 84.0,
+            "payment_days": 40,
+            "use_treds": False,
+            "propose_late_payment_penalty_clause": True,
+        },
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=8,
+        last_valid_proposal={
+            "action_type": "propose",
+            "price": 84.0,
+            "payment_days": 40,
+            "use_treds": False,
+            "propose_late_payment_penalty_clause": True,
+        },
+    )
+
+    assert out["action_type"] == "accept"
+    assert out["use_treds"] is True
+
+
+def test_liquidity_heuristic_rejects_later_deals_after_financing_is_committed() -> None:
+    observation = {
+        "active_deal_id": "deal-p1",
+        "open_deal_ids": ["deal-p1"],
+        "resolved_deal_ids": ["deal-p0-a", "deal-p0-b"],
+        "current_period": 1,
+        "buyer_days": 75,
+        "liquidity_threshold": 40,
+        "cost_threshold": 82.0,
+        "metadata": {},
+    }
+
+    out = inference._build_liquidity_heuristic_action(
+        observation,
+        task_name="liquidity-stress-medium",
+        round_number=17,
+        last_valid_proposal=None,
+    )
+
+    assert out["action_type"] == "reject"
+    assert out["deal_id"] == "deal-p1"
+    assert "overtrading" in out["reason"]
+
+
+def test_liquidity_normalizer_preserves_explicit_no_deal_rejection() -> None:
+    observation = {
+        "active_deal_id": "deal-p1",
+        "open_deal_ids": ["deal-p1"],
+        "buyer_price": 96.0,
+        "buyer_days": 75,
+        "liquidity_threshold": 40,
+        "cost_threshold": 82.0,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {
+            "action_type": "reject",
+            "deal_id": "deal-p1",
+            "reason": "No deal: treasury policy avoids overtrading.",
+        },
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=17,
+        last_valid_proposal=None,
+    )
+
+    assert out["action_type"] == "reject"
+    assert out["deal_id"] == "deal-p1"
+
+
 def test_compact_step_serialization_omits_irrelevant_tool_fields() -> None:
     action = inference.NegotiationAction(
         action_type="tool",

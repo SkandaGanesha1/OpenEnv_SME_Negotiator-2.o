@@ -170,6 +170,28 @@ def test_cashflow_projection_zero_horizon_returns_empty_lists() -> None:
     assert proj.period_penalties == []
 
 
+def test_open_purchase_orders_do_not_create_receivable_exposure_before_agreement() -> None:
+    ws = _minimal_world_state(cash=60_000.0)
+    ws.smes[0].credit_limit = 10_000.0
+    ws.deals.append(
+        DealState(
+            deal_id="deal_open",
+            sme_id="sme_0",
+            buyer_id="buyer_0",
+            status="open",
+            created_period=0,
+            invoice_amount=1_000_000.0,
+            supplier_payment_amount=800_000.0,
+            volume=10_000,
+        )
+    )
+
+    advanced = advance_world_state(ws)
+
+    assert advanced.smes[0].current_utilization == 0.0
+    assert advanced.smes[0].defaulted is False
+
+
 # ---------------------------------------------------------------------------
 # simulate_cashflow() pure-function guarantees
 # ---------------------------------------------------------------------------
