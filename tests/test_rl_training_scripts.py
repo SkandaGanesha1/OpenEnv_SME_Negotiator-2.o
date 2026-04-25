@@ -36,6 +36,7 @@ from rl.train_grpo_trl import (
     prepare_model_for_grpo,
     _require_rollout_func_support,
 )
+from rl.monitoring import RewardMonitorCallback
 from rl.train_grpo_unsloth import (
     build_grpo_config_kwargs as unsloth_build_grpo_config_kwargs,
     main as unsloth_main,
@@ -744,6 +745,14 @@ def test_metrics_callback_saves_reward_curve_without_matplotlib_dependency(monke
         callback.on_log(args, SimpleNamespace(global_step=index), control, logs={})
 
     callback.on_train_end(args, SimpleNamespace(global_step=2), control)
+
+
+def test_reward_monitor_callback_exposes_trainer_lifecycle_methods() -> None:
+    callback = RewardMonitorCallback()
+
+    assert hasattr(callback, "on_init_end")
+    assert callable(callback.on_init_end)
+    assert hasattr(callback, "on_log")
 
 
 def test_colab_notebook_defaults_to_qwen3_thin_wrapper() -> None:

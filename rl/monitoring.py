@@ -19,6 +19,14 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from transformers import TrainerCallback as _TrainerCallbackBase
+except ImportError:  # pragma: no cover - optional in lightweight utility contexts
+    class _TrainerCallbackBase:  # type: ignore[too-many-ancestors]
+        """Fallback base when transformers is unavailable."""
+
+        pass
+
 
 # ======================================================================= #
 # SuccessRateTracker                                                        #
@@ -143,7 +151,7 @@ class GenerationSampler:
 # RewardMonitorCallback                                                     #
 # ======================================================================= #
 
-class RewardMonitorCallback:
+class RewardMonitorCallback(_TrainerCallbackBase):
     """TrainerCallback that logs per-component reward columns and detects reward hacking.
 
     Compatible with both HuggingFace TrainerCallback (on_log / on_step_end)
@@ -172,6 +180,7 @@ class RewardMonitorCallback:
         generation_sample_file: Path = Path("logs/sampled_generations.jsonl"),
         hack_alert_threshold: float = 0.9,
     ) -> None:
+        super().__init__()
         self._log_every = int(log_every_n_steps)
         self._sample_every = int(generation_sample_every_n_steps)
         self._hack_threshold = float(hack_alert_threshold)
@@ -250,6 +259,10 @@ class RewardMonitorCallback:
     # ------------------------------------------------------------------ #
     # HuggingFace TrainerCallback interface                                #
     # ------------------------------------------------------------------ #
+
+    def on_init_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
+        """No-op init hook so Trainer can always register this callback safely."""
+        return control
 
     def on_step_end(self, args: Any, state: Any, control: Any, **kwargs: Any) -> Any:
         """Called by HuggingFace Trainer after each optimizer step."""
