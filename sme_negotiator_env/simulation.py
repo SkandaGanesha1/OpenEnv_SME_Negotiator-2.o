@@ -88,6 +88,19 @@ def _apply_initial_financing(world_state: WorldState, deal: DealState) -> None:
 
 
 def _recompute_world_metrics(world_state: WorldState) -> None:
+    """Refresh derived SME metrics after applying a plan or advancing periods.
+
+    Important: we deliberately do NOT flip ``missed_supplier_payment`` based
+    on a transient dip below ``required_minimum_cash``. The "minimum cash
+    buffer" is a *risk* threshold, not an insolvency event. It is reflected
+    smoothly in the verifiable reward via the liquidity component; treating
+    it as a default would (a) collapse the terminal reward to zero in tasks
+    whose initial cash ratio sits near the buffer, and (b) destroy the RL
+    learning signal because every rollout would terminate with reward 0.
+
+    A real "missed supplier payment" is set inside ``advance_world_state``
+    only when a supplier payment actually drives cash below zero.
+    """
     for sme in world_state.smes:
         open_gap = 0.0
         buyer_default_pressure = 0.0
@@ -113,7 +126,8 @@ def _recompute_world_metrics(world_state: WorldState) -> None:
         pressure = min(1.0, float(sme.current_utilization) / max(float(sme.credit_limit), 1.0))
         buyer_component = buyer_default_pressure / deal_count if deal_count else float(sme.risk_score)
         sme.risk_score = round(_clip(0.5 * buyer_component + 0.5 * pressure, 0.0, 1.0), 6)
-        sme.missed_supplier_payment = bool(float(sme.cash_balance) < float(sme.required_minimum_cash))
+        # Preserve any "missed_supplier_payment" flag set by advance_world_state;
+        # never re-derive it from a buffer dip.
         sme.defaulted = bool(
             float(sme.cash_balance) < 0.0
             or float(sme.current_utilization) > float(sme.credit_limit)
@@ -198,8 +212,11 @@ def advance_world_state(world_state: WorldState) -> WorldState:
 
         if deal.supplier_due_period == next_period and not deal.supplier_paid:
             sme = _lookup_sme(copied, deal.sme_id)
-            sme.cash_balance = round(float(sme.cash_balance) - float(deal.supplier_payment_amount), 2)
+            new_balance = round(float(sme.cash_balance) - float(deal.supplier_payment_amount), 2)
+            sme.cash_balance = new_balance
             deal.supplier_paid = True
+            if new_balance < 0.0:
+                sme.missed_supplier_payment = True
 
         if deal.buyer_due_period == next_period and not deal.settled:
             if deal.financed and copied.financier is not None:
