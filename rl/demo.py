@@ -112,18 +112,52 @@ def _prepare_demo_model_for_training(model: Any, *, use_lora: bool) -> Any:
 
 
 def make_demo_action(observation: LiquidityObservation) -> NegotiationAction:
-    """Return a deterministic baseline action for notebook demos."""
+    """Return a deterministic liquidity-aware baseline action for notebook demos."""
     if not observation.open_deal_ids:
         return NegotiationAction(action_type="advance_period")
 
     deal_id = observation.active_deal_id or observation.open_deal_ids[0]
-    use_treds = bool(observation.buyer_days > observation.liquidity_threshold)
-    if observation.last_tool_name != "QUERY_TREDS" and use_treds:
+    buyer_days = int(observation.buyer_days)
+    liquidity_threshold = int(observation.liquidity_threshold)
+    cost_threshold = float(observation.cost_threshold)
+    target_days = max(15, min(liquidity_threshold, int(observation.sme_supplier_payment_days) + 15))
+    target_price = round(max(float(observation.buyer_price), cost_threshold + 3.0), 2)
+    use_treds = bool(buyer_days > int(observation.sme_supplier_payment_days) + 10)
+
+    if observation.last_tool_name != "RUN_CASHFLOW_SIM" and buyer_days > liquidity_threshold:
         return NegotiationAction(
             action_type="tool",
             deal_id=deal_id,
-            tool_name="QUERY_TREDS",
-            tool_args={"invoice_id": deal_id, "deal_id": deal_id},
+            tool_name="RUN_CASHFLOW_SIM",
+            tool_args={
+                "deal_id": deal_id,
+                "plan": {
+                    "deal_decisions": {
+                        deal_id: {
+                            "decision": "accept",
+                            "price": target_price,
+                            "payment_days": target_days,
+                            "use_treds": use_treds,
+                            "late_payment_penalty_agreed": True,
+                            "propose_dynamic_discounting": True,
+                            "dynamic_discount_annual_rate": 0.12,
+                        }
+                    }
+                },
+            },
+        )
+
+    if buyer_days > liquidity_threshold:
+        return NegotiationAction(
+            action_type="propose",
+            deal_id=deal_id,
+            price=target_price,
+            payment_days=target_days,
+            use_treds=use_treds,
+            propose_late_payment_penalty_clause=True,
+            propose_dynamic_discounting=True,
+            dynamic_discount_annual_rate=0.12,
+            reason="Reduce payment days toward liquidity threshold while preserving positive margin.",
         )
 
     return NegotiationAction(
@@ -176,7 +210,25 @@ def run_heuristic_episode(
             break
         action = make_demo_action(observation)
         if action.action_type == "tool":
-            wrapper.query_treds(invoice_id=action.deal_id or "")
+            if action.tool_name == "RUN_CASHFLOW_SIM":
+                wrapper.run_cashflow_sim(
+                    plan=action.tool_args.get("plan") if action.tool_args else None,
+                    horizon=action.simulation_horizon,
+                    deal_id=action.deal_id,
+                )
+            else:
+                wrapper.query_treds(invoice_id=action.deal_id or "")
+        elif action.action_type == "propose":
+            wrapper.propose(
+                price=float(action.price),
+                payment_days=int(action.payment_days),
+                use_treds=bool(action.use_treds),
+                deal_id=action.deal_id,
+                reason=action.reason,
+                propose_late_payment_penalty_clause=bool(action.propose_late_payment_penalty_clause),
+                propose_dynamic_discounting=bool(action.propose_dynamic_discounting),
+                dynamic_discount_annual_rate=float(action.dynamic_discount_annual_rate),
+            )
         elif action.action_type == "accept":
             wrapper.accept(
                 price=float(action.price),
@@ -306,8 +358,8 @@ def demo_train_grpo(
         "remove_unused_columns": False,
         "per_device_train_batch_size": 1,
         "gradient_accumulation_steps": 2,
-        "num_generations": 2,
-        "generation_batch_size": 2,
+        "num_generations": 4,
+        "generation_batch_size": 4,
         "learning_rate": 5e-6,
         "max_prompt_length": 512,
         "max_completion_length": max(64, int(max_completion_length)),

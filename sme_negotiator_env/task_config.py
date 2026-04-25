@@ -208,7 +208,7 @@ def default_task_config(task_id: str) -> TaskConfig:
             context_note=(
                 "Correlated buyer risk, tight supplier terms, and limited financing force solvency and NPV trade-offs."
             ),
-            initial_cash_balance_ratio=0.15,
+            initial_cash_balance_ratio=0.30,
             credit_limit_multiplier=0.8,
             minimum_cash_buffer_ratio=0.25,
             primary_buyer_default_tendency=0.38,
@@ -216,7 +216,7 @@ def default_task_config(task_id: str) -> TaskConfig:
             financier_capital_multiplier=0.75,
             financier_risk_appetite=0.35,
             legal_max_payment_days=45,
-            reward_lambda_shaping=0.1,
+            reward_lambda_shaping=0.35,
         )
     raise KeyError(f"Unknown task_id: {task_id}")
 

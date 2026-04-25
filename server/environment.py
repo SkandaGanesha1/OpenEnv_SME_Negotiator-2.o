@@ -1651,7 +1651,7 @@ class SMELiquidityEnvironment(Environment):
                     risk_score=min(1.0, float(tc.buyer_power_score)),
                     required_minimum_cash=round(required_minimum_cash, 2),
                     defaulted=bool(initial_cash < 0.0),
-                    missed_supplier_payment=bool(initial_cash < required_minimum_cash),
+                    missed_supplier_payment=False,
                 )
             ],
             buyers=[
