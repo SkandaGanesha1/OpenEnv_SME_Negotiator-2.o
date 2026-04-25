@@ -245,32 +245,49 @@ Do NOT reduce payment_days by 1-2 per step — jump directly to your target.
 """.strip()
 
 LIQUIDITY_SYSTEM_PROMPT = """
-You represent an SME treasury agent operating in a long-horizon liquidity environment.
-Respond ONLY with valid JSON. Supported action types are:
-- propose
-- accept
-- reject
-- tool
-- simulate_plan
-- advance_period
+You are an SME treasury agent operating a multi-period, multi-buyer liquidity workflow.
+This is a Razorpay 'Fix My Itch' #82.8 problem: B2B payment-term negotiation against a
+hostile large buyer who exploits the SME's working-capital fragility.
 
-When action_type is:
-- propose / accept: include price, payment_days, use_treds, optionally deal_id and negotiation clause fields.
-- reject: include deal_id when available and a short reason.
-- tool: include tool_name in {QUERY_TREDS, CHECK_COMPLIANCE, RUN_CASHFLOW_SIM} and tool_args.
-- simulate_plan: include simulation_plan and optionally simulation_horizon.
-- advance_period: no extra fields required.
+ALWAYS respond with ONE valid JSON action object. No prose. Supported action_type values:
+  propose | accept | reject | tool | simulate_plan | advance_period
 
-Treasury priorities:
-- Avoid default and preserve positive NPV.
-- Use tools when tenor risk or compliance risk is unclear.
-- Advance macro periods only when open negotiation work is exhausted for now.
-- Include deal_id for deal-specific actions whenever possible.
+Required fields per action_type:
+  - propose / accept   : deal_id, price, payment_days, use_treds, optionally
+                         propose_late_payment_penalty_clause, propose_dynamic_discounting,
+                         dynamic_discount_annual_rate (0-0.05). reason MUST cite at least
+                         one numeric quantity from the observation (e.g. NPV gap, days
+                         delta, cash buffer, financier rate).
+  - reject             : deal_id and a short reason explaining the economic justification.
+  - tool               : tool_name in {QUERY_TREDS, CHECK_COMPLIANCE, RUN_CASHFLOW_SIM}
+                         and tool_args. Use ONCE per macro period (re-trigger on period change).
+  - simulate_plan      : simulation_plan and simulation_horizon.
+  - advance_period     : no extra fields.
 
-MANDATORY RULE - period advancement:
+NPV REASONING (CRITICAL):
+The SME's terminal score is dominated by NPV uplift versus the buyer's status-quo terms
+(price=initial_buyer_price, days=initial_buyer_days). The verifiable reward is
+0.35*solvency + 0.20*liquidity + 0.35*npv + 0.10*compliance. Racing the price to the
+cost_threshold floor at maximum days compression usually DESTROYS NPV (PV(low_price, low_days)
+< PV(high_price, high_days)). Prefer to:
+  1. Compress payment_days first while holding price near the buyer's offer.
+  2. Lower price only as a last concession - never below cost_threshold + 1.0.
+  3. Accept early once payment_days <= liquidity_threshold AND price >= cost_threshold + 5.
+  4. Use propose_late_payment_penalty_clause=true when payment_days > legal_max_payment_days.
+  5. Use propose_dynamic_discounting=true on hard tasks ONLY when annual_rate <= 0.03,
+     because higher discount rates erase NPV faster than days compression earns it back.
+
+PERIOD ADVANCEMENT (MANDATORY):
 - If open_deal_ids is empty, done=false, and current_period < total_periods, you MUST return
-  {"action_type":"advance_period","reason":"No open deals remain in this macro period."}
-- Do NOT propose, accept, reject, or call a deal-specific tool when there are no open deals.
+  {"action_type":"advance_period","reason":"All deals resolved in period N; advance to period N+1."}
+- NEVER propose / accept / reject / tool when there are no open deals.
+
+ANTI-LOOP:
+- Do NOT submit two consecutive proposals with identical (price, payment_days) - the env
+  penalises stalling. If your previous proposal was rejected, change at least ONE lever
+  by a meaningful step (>=2 days OR >=1 INR).
+- The 'reason' field is part of the reward signal (rubric grading). Boilerplate strings
+  like "Model-selected action" or "Escape hatch" lose points. Always cite numbers.
 """.strip()
 
 
@@ -424,6 +441,97 @@ def _format_period_summary_line(
         f"resolved_deal_count={resolved_deal_count} "
         f"defaulted_sme_count={defaulted_sme_count} "
         f"cumulative_reward={float(cumulative_reward):.4f}"
+    )
+
+
+def _format_theme_banner() -> str:
+    """One-shot judge-facing banner mapping the run to hackathon themes."""
+    return (
+        "+============================================================+\n"
+        "| OpenEnv SME Negotiator -- Razorpay Fix-My-Itch #82.8       |\n"
+        "+============================================================+\n"
+        "| [THEME #1]  Multi-Agent Interaction (SME * Buyer * Financier)\n"
+        "| [THEME #2]  Long-Horizon Planning (3 macro periods, 6 deals)\n"
+        "| [THEME #3.1] World Modeling -- Professional Tools (TReDS, NPV, Compliance)\n"
+        "| [THEME #4]  Self-Improvement -- GRPO + RLVR + multi-rubric rewards\n"
+        "+------------------------------------------------------------+"
+    )
+
+
+def _format_episode_banner(*, task_name: str, difficulty: str, seed: int, model_name: str, observation: Any) -> str:
+    """Per-episode prologue banner with the SME's opening treasury state."""
+    obs = _observation_to_dict(observation) if observation is not None else {}
+    cost = float(obs.get("cost_threshold", 0.0) or 0.0)
+    liq = int(obs.get("liquidity_threshold", 0) or 0)
+    bp = float(obs.get("buyer_price", 0.0) or 0.0)
+    bd = int(obs.get("buyer_days", 0) or 0)
+    rev = float(obs.get("sme_monthly_revenue", 0.0) or 0.0)
+    cur = int(obs.get("current_period", 0) or 0)
+    tot = int(obs.get("total_periods", 0) or 0)
+    open_deals = list(obs.get("open_deal_ids") or [])
+    return (
+        f"[EPISODE] task={task_name} difficulty={difficulty} seed={seed} model={model_name}\n"
+        f"  | Buyer opens at price={bp:.2f} INR / payment_days={bd}\n"
+        f"  | SME cost_threshold={cost:.2f} | liquidity_threshold={liq}d | monthly_revenue={rev:,.0f} INR\n"
+        f"  | Macro horizon: period {cur}/{tot} | Open deals: {len(open_deals)} ({', '.join(open_deals[:4])})"
+    )
+
+
+def _format_action_summary_line(*, step: int, action: Any, reward: float, observation: Any) -> str:
+    """Compact 'agent action -> env reaction' line shown after every [STEP] for judges."""
+    obs = _observation_to_dict(observation) if observation is not None else {}
+    metadata = obs.get("metadata") or {}
+    atype = str(getattr(action, "action_type", "") or "")
+    deal = str(getattr(action, "deal_id", "") or "-")
+    if atype in ("propose", "accept"):
+        price = float(getattr(action, "price", 0.0) or 0.0)
+        days = int(getattr(action, "payment_days", 0) or 0)
+        treds = "TReDS" if bool(getattr(action, "use_treds", False)) else "no-TReDS"
+        verb = "PROPOSE" if atype == "propose" else "ACCEPT"
+        head = f"  -> [{verb:7}] {deal} @ price={price:.2f} INR / {days}d ({treds})"
+    elif atype == "tool":
+        head = f"  -> [TOOL   ] {getattr(action, 'tool_name', '?')} on {deal}"
+    elif atype == "advance_period":
+        head = f"  -> [PERIOD ] advance to period {obs.get('current_period', '?')}/{obs.get('total_periods', '?')}"
+    elif atype == "simulate_plan":
+        head = f"  -> [SIM    ] simulate_plan deal={deal}"
+    else:
+        head = f"  -> [{atype.upper():7}] deal={deal}"
+    return (
+        f"{head}\n"
+        f"     reward={reward:+.4f}  "
+        f"period={metadata.get('current_period', '?')}/{obs.get('total_periods', '?')}  "
+        f"resolved={metadata.get('resolved_deal_count', 0)}  "
+        f"defaulted={metadata.get('defaulted_sme_count', 0)}  "
+        f"branch={str(metadata.get('legacy_reward_branch', '') or '')[:40]}"
+    )
+
+
+def _format_final_outcome_banner(*, summary: Mapping[str, Any], breakdown: Optional[Mapping[str, Any]], judge_score: Optional[float]) -> str:
+    """Trader-style final outcome banner with explicit reward decomposition."""
+    sol = float((breakdown or {}).get("solvency", 0.0) or 0.0)
+    liq = float((breakdown or {}).get("liquidity", 0.0) or 0.0)
+    npv = float((breakdown or {}).get("npv", 0.0) or 0.0)
+    com = float((breakdown or {}).get("compliance", 0.0) or 0.0)
+    total = float((breakdown or {}).get("total", summary.get("verifiable_reward", 0.0)) or 0.0)
+    success = bool(summary.get("success_no_default_positive_npv", False))
+    return (
+        "  +----------------------------------------------------------+\n"
+        "  | EPISODE OUTCOME -- VERIFIABLE REWARD DECOMPOSITION       |\n"
+        "  +----------------------------------------------------------+\n"
+        f"  | solvency   (w=0.35) : {sol:.4f}\n"
+        f"  | liquidity  (w=0.20) : {liq:.4f}\n"
+        f"  | npv        (w=0.35) : {npv:.4f}\n"
+        f"  | compliance (w=0.10) : {com:.4f}\n"
+        f"  | TOTAL              : {total:.4f}\n"
+        "  +----------------------------------------------------------+\n"
+        f"  | resolved_deals     : {summary.get('resolved_deal_count', 0)}\n"
+        f"  | defaulted_sme_count: {summary.get('defaulted_sme_count', 0)}\n"
+        f"  | avg_payment_days   : {float(summary.get('average_final_payment_days', 0.0) or 0.0):.2f}\n"
+        f"  | tools_used         : {summary.get('tool_call_count', 0)} (effective: {summary.get('tool_effective_count', 0)})\n"
+        f"  | judge_score        : {(judge_score or 0.0):.3f}\n"
+        f"  | SUCCESS (no-default & positive-NPV) : {'YES' if success else 'NO'}\n"
+        "  +----------------------------------------------------------+"
     )
 
 
@@ -871,6 +979,7 @@ def _build_liquidity_escape_action(
     liquidity = int(observation.get("liquidity_threshold", 0) or 0)
     buyer_price = float(observation.get("buyer_price", 0.0) or 0.0)
     metadata = observation.get("metadata") or {}
+    period_tools = set(observation.get("_period_tools_called") or [])
 
     if not open_deal_ids:
         return {
@@ -878,13 +987,17 @@ def _build_liquidity_escape_action(
             "reason": "No open deals remain in this macro period.",
         }
 
-    if observation.get("last_tool_name") != "QUERY_TREDS" and buyer_days > liquidity + 10:
+    # Per-period TReDS re-trigger: query at most once per macro period, not once per episode.
+    if "QUERY_TREDS" not in period_tools and buyer_days > liquidity + 10:
         return {
             "action_type": "tool",
             "deal_id": str(active_deal_id),
             "tool_name": "QUERY_TREDS",
             "tool_args": {"invoice_id": str(active_deal_id), "deal_id": str(active_deal_id)},
-            "reason": "Escape hatch: inspect TReDS terms before repeating the same negotiation move.",
+            "reason": (
+                f"Inspect TReDS for {active_deal_id}: tenor {buyer_days}d exceeds liquidity "
+                f"threshold {liquidity}d by {buyer_days - liquidity}d; need a financing quote."
+            ),
         }
 
     if "hard" in task_name.lower() and not bool(metadata.get("simulation_projection_present", False)):
@@ -1106,13 +1219,17 @@ def _build_liquidity_heuristic_action(
             "reason": "No deal: treasury policy avoids overtrading after financing capacity is mostly committed.",
         }
 
-    if observation.get("last_tool_name") != "QUERY_TREDS" and buyer_days > liquidity + 10 and round_number <= 1:
+    period_tools = set(observation.get("_period_tools_called") or [])
+    if "QUERY_TREDS" not in period_tools and buyer_days > liquidity + 10 and round_number <= 1:
         return {
             "action_type": "tool",
             "deal_id": str(active_deal_id),
             "tool_name": "QUERY_TREDS",
             "tool_args": {"invoice_id": str(active_deal_id), "deal_id": str(active_deal_id)},
-            "reason": "Deterministic heuristic: inspect TReDS before negotiating long tenor deals.",
+            "reason": (
+                f"TReDS quote for {active_deal_id}: buyer_days={buyer_days} > liquidity={liquidity}+10; "
+                f"financier rate informs whether to use_treds in the next propose."
+            ),
         }
 
     if "hard" in task_name.lower() and round_number <= 2 and not bool((observation.get("metadata") or {}).get("simulation_projection_present", False)):
@@ -2030,11 +2147,29 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         f"[START] task={task_name} env=sme-liquidity-inprocess model={MODEL_NAME}",
         flush=True,
     )
+    print(
+        _format_episode_banner(
+            task_name=task_name,
+            difficulty=difficulty,
+            seed=seed,
+            model_name=MODEL_NAME,
+            observation=observation,
+        ),
+        flush=True,
+    )
 
+    period_tools_called: set[str] = set()
+    last_observed_period = -1
     while not result.done:
         obs_dict = _observation_to_dict(observation)
         llm_error: Optional[str] = None
         previous_period = int(obs_dict.get("current_period", 0) or 0)
+        # Per-period tool re-trigger: clear the set whenever we enter a new macro period
+        # so the agent can query TReDS / compliance / cashflow once per period (not once per episode).
+        if previous_period != last_observed_period:
+            period_tools_called = set()
+            last_observed_period = previous_period
+        obs_dict["_period_tools_called"] = sorted(period_tools_called)
         active_deal_id = str(obs_dict.get("active_deal_id") or "") or None
         last_valid_proposal = last_valid_proposal_by_deal.get(active_deal_id) if active_deal_id else None
 
@@ -2094,6 +2229,8 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
             proposal_deal_id = str(action.deal_id or active_deal_id or "")
             if proposal_deal_id:
                 last_valid_proposal_by_deal[proposal_deal_id] = action.model_dump()
+        elif action.action_type == "tool" and action.tool_name:
+            period_tools_called.add(str(action.tool_name).upper())
         result = await env.step(action)
         observation = result.observation
         reward = float(result.reward or 0.0)
@@ -2103,6 +2240,15 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
             f'[STEP] step={round_number + 1} action={action_json} reward={_format_score_for_log(reward)} '
             f'step_reward_raw={reward:.4f} '
             f'done={"true" if bool(result.done) else "false"} error={_format_step_error(llm_error)}',
+            flush=True,
+        )
+        print(
+            _format_action_summary_line(
+                step=round_number + 1,
+                action=action,
+                reward=reward,
+                observation=observation,
+            ),
             flush=True,
         )
         _print_liquidity_step_debug(observation)
@@ -2195,6 +2341,14 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         flush=True,
     )
     print(
+        _format_final_outcome_banner(
+            summary=episode_summary,
+            breakdown=reward_breakdown,
+            judge_score=judge_score_liq,
+        ),
+        flush=True,
+    )
+    print(
         _format_end_line(
             success,
             round_number,
@@ -2233,6 +2387,7 @@ async def main() -> None:
     env_mode = _inference_env_mode()
     requested_in_process = _openenv_in_process_enabled()
     effective_in_process = requested_in_process or env_mode == "liquidity"
+    print(_format_theme_banner(), flush=True)
     print(f"[CONFIG] LLM API_BASE_URL={API_BASE_URL}", file=sys.stderr, flush=True)
     print(f"[CONFIG] MODEL_NAME={MODEL_NAME}", file=sys.stderr, flush=True)
     print(f"[MODE] {_runtime_banner(env_mode)}", file=sys.stderr, flush=True)
