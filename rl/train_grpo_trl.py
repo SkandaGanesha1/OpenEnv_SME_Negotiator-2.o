@@ -121,6 +121,25 @@ class EpisodeSummaryBuffer:
         return summaries, episode_logs, diagnostics
 
 
+@dataclass
+class PendingRolloutBuffer:
+    """FIFO buffer bridging rollout_func outputs into reward_func calls."""
+
+    items: list[dict[str, Any]] = field(default_factory=list)
+
+    def extend(self, records: list[dict[str, Any]]) -> None:
+        self.items.extend(dict(record) for record in records)
+
+    def take(self, count: int) -> Optional[list[dict[str, Any]]]:
+        if count <= 0:
+            return []
+        if len(self.items) < count:
+            return None
+        batch = self.items[:count]
+        del self.items[:count]
+        return batch
+
+
 def _build_training_prompt_content(
     *,
     prompt: str,
@@ -487,8 +506,72 @@ def make_reward_function(
     rubric_scorer=None,
     rubric_weight: float = 0.0,
     summary_buffer: Optional[EpisodeSummaryBuffer] = None,
+    pending_rollout_buffer: Optional[PendingRolloutBuffer] = None,
 ) -> Callable[[list[Any]], list[float]]:
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
+
+    def _reward_from_episode_payloads(
+        episode_summaries_value: list[EpisodeSummary],
+        *,
+        completions_value: Optional[list[Any]] = None,
+        episode_logs_value: Optional[list[str]] = None,
+        raw_completion_texts_value: Optional[list[str]] = None,
+        env_reward_std_value: Optional[list[float]] = None,
+        reward_mean_value: Optional[list[float]] = None,
+        unique_action_count_value: Optional[list[float]] = None,
+        unique_completion_count_value: Optional[list[float]] = None,
+        invalid_parse_fraction_value: Optional[list[float]] = None,
+        identical_terminal_fraction_value: Optional[list[float]] = None,
+        termination_reasons_value: Optional[list[str]] = None,
+    ) -> list[float]:
+        rewards: list[float] = []
+        texts = raw_completion_texts_value or [
+            _coerce_completion_text(completion) for completion in (completions_value or [None] * len(episode_summaries_value))
+        ]
+        logs = episode_logs_value or [""] * len(episode_summaries_value)
+        reward_std_values = env_reward_std_value or [0.0] * len(episode_summaries_value)
+        reward_mean_values = reward_mean_value or [0.0] * len(episode_summaries_value)
+        unique_action_values = unique_action_count_value or [0.0] * len(episode_summaries_value)
+        unique_completion_values = unique_completion_count_value or [0.0] * len(episode_summaries_value)
+        invalid_values = invalid_parse_fraction_value or [0.0] * len(episode_summaries_value)
+        identical_terminal_values = identical_terminal_fraction_value or [0.0] * len(episode_summaries_value)
+        termination_values = termination_reasons_value or [""] * len(episode_summaries_value)
+
+        for index, summary in enumerate(episode_summaries_value):
+            verifiable_reward = float(getattr(summary, "verifiable_reward", 0.0) or 0.0)
+            total_reward = float(getattr(summary, "total_reward", verifiable_reward) or verifiable_reward)
+            base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
+
+            if float(reward_std_values[index] or 0.0) <= 1e-8:
+                base_reward += 0.01 * _completion_format_score(texts[index])
+
+            final_reward = base_reward
+            if rubric_scorer is not None and float(rubric_weight) > 0.0:
+                rubric_scores = rubric_scorer(logs[index])
+                if getattr(summary, "persona_name", None):
+                    final_reward = base_reward + float(rubric_weight) * mean(
+                        float(value) for value in rubric_scores.values()
+                    )
+                else:
+                    final_reward = combine_rewards(base_reward, rubric_scores, rubric_weight)
+            rewards.append(round(final_reward, 6))
+
+            if summary_buffer is not None:
+                summary_buffer.append(
+                    summary,
+                    logs[index],
+                    diagnostics={
+                        "reward_mean": float(reward_mean_values[index] or 0.0),
+                        "reward_std": float(reward_std_values[index] or 0.0),
+                        "unique_action_count": float(unique_action_values[index] or 0.0),
+                        "unique_completion_count": float(unique_completion_values[index] or 0.0),
+                        "invalid_parse_fraction": float(invalid_values[index] or 0.0),
+                        "identical_terminal_fraction": float(identical_terminal_values[index] or 0.0),
+                        "termination_reason": termination_values[index],
+                        "sample_completion": texts[index],
+                    },
+                )
+        return rewards
 
     def reward_func(
         inputs: Optional[list[Any]] = None,
@@ -509,53 +592,43 @@ def make_reward_function(
         rewards: list[float] = []
 
         if episode_summaries is not None:
-            texts = raw_completion_texts or [
-                _coerce_completion_text(completion) for completion in (completions or [None] * len(episode_summaries))
-            ]
-            logs = episode_logs or [""] * len(episode_summaries)
-            reward_std_values = env_reward_std or [0.0] * len(episode_summaries)
-            reward_mean_values = reward_mean or [0.0] * len(episode_summaries)
-            unique_action_values = unique_action_count or [0.0] * len(episode_summaries)
-            unique_completion_values = unique_completion_count or [0.0] * len(episode_summaries)
-            invalid_values = invalid_parse_fraction or [0.0] * len(episode_summaries)
-            identical_terminal_values = identical_terminal_fraction or [0.0] * len(episode_summaries)
-            termination_values = termination_reasons or [""] * len(episode_summaries)
+            return _reward_from_episode_payloads(
+                episode_summaries,
+                completions_value=completions,
+                episode_logs_value=episode_logs,
+                raw_completion_texts_value=raw_completion_texts,
+                env_reward_std_value=env_reward_std,
+                reward_mean_value=reward_mean,
+                unique_action_count_value=unique_action_count,
+                unique_completion_count_value=unique_completion_count,
+                invalid_parse_fraction_value=invalid_parse_fraction,
+                identical_terminal_fraction_value=identical_terminal_fraction,
+                termination_reasons_value=termination_reasons,
+            )
 
-            for index, summary in enumerate(episode_summaries):
-                verifiable_reward = float(getattr(summary, "verifiable_reward", 0.0) or 0.0)
-                total_reward = float(getattr(summary, "total_reward", verifiable_reward) or verifiable_reward)
-                base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
-
-                if float(reward_std_values[index] or 0.0) <= 1e-8:
-                    base_reward += 0.01 * _completion_format_score(texts[index])
-
-                final_reward = base_reward
-                if rubric_scorer is not None and float(rubric_weight) > 0.0:
-                    rubric_scores = rubric_scorer(logs[index])
-                    if getattr(summary, "persona_name", None):
-                        final_reward = base_reward + float(rubric_weight) * mean(
-                            float(value) for value in rubric_scores.values()
-                        )
-                    else:
-                        final_reward = combine_rewards(base_reward, rubric_scores, rubric_weight)
-                rewards.append(round(final_reward, 6))
-
-                if summary_buffer is not None:
-                    summary_buffer.append(
-                        summary,
-                        logs[index],
-                        diagnostics={
-                            "reward_mean": float(reward_mean_values[index] or 0.0),
-                            "reward_std": float(reward_std_values[index] or 0.0),
-                            "unique_action_count": float(unique_action_values[index] or 0.0),
-                            "unique_completion_count": float(unique_completion_values[index] or 0.0),
-                            "invalid_parse_fraction": float(invalid_values[index] or 0.0),
-                            "identical_terminal_fraction": float(identical_terminal_values[index] or 0.0),
-                            "termination_reason": termination_values[index],
-                            "sample_completion": texts[index],
-                        },
-                    )
-            return rewards
+        batch_count = len(completions or prompts or inputs or kwargs.get("environments") or [])
+        if pending_rollout_buffer is not None and batch_count > 0:
+            pending_batch = pending_rollout_buffer.take(batch_count)
+            if pending_batch is not None:
+                return _reward_from_episode_payloads(
+                    [record["episode_summary"] for record in pending_batch],
+                    completions_value=completions,
+                    episode_logs_value=[str(record.get("episode_log", "")) for record in pending_batch],
+                    raw_completion_texts_value=[str(record.get("raw_completion_text", "")) for record in pending_batch],
+                    env_reward_std_value=[float(record.get("reward_std", 0.0) or 0.0) for record in pending_batch],
+                    reward_mean_value=[float(record.get("reward_mean", 0.0) or 0.0) for record in pending_batch],
+                    unique_action_count_value=[float(record.get("unique_action_count", 0.0) or 0.0) for record in pending_batch],
+                    unique_completion_count_value=[
+                        float(record.get("unique_completion_count", 0.0) or 0.0) for record in pending_batch
+                    ],
+                    invalid_parse_fraction_value=[
+                        float(record.get("invalid_parse_fraction", 0.0) or 0.0) for record in pending_batch
+                    ],
+                    identical_terminal_fraction_value=[
+                        float(record.get("identical_terminal_fraction", 0.0) or 0.0) for record in pending_batch
+                    ],
+                    termination_reasons_value=[str(record.get("termination_reason", "")) for record in pending_batch],
+                )
 
         resolved_inputs = inputs
         if resolved_inputs is None:
@@ -979,6 +1052,7 @@ def build_rollout_func(
     tokenizer: Any,
     curriculum: Optional[CurriculumManager],
     opponent_manager: Optional[OpponentPolicyManager],
+    pending_rollout_buffer: Optional[PendingRolloutBuffer] = None,
 ) -> Callable[..., dict[str, Any]]:
     """Build a TRL rollout_func for explicit environment stepping."""
     env_factory = build_environment_factory(args, curriculum=curriculum, opponent_manager=opponent_manager)
@@ -1023,6 +1097,9 @@ def build_rollout_func(
             for sample in group:
                 sample.update(group_metrics)
                 samples.append(sample)
+
+        if pending_rollout_buffer is not None and samples:
+            pending_rollout_buffer.extend(samples)
 
         return {
             "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
@@ -1451,16 +1528,19 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     dataset = build_dataset(components["rows"])
     model, tokenizer = load_training_model_and_tokenizer(args.model_name)
     summary_buffer = EpisodeSummaryBuffer()
+    pending_rollout_buffer = PendingRolloutBuffer()
     reward_func = make_reward_function(
         rubric_scorer=components["rubric_scorer"],
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
+        pending_rollout_buffer=pending_rollout_buffer,
     )
     rollout_func = build_rollout_func(
         args,
         tokenizer=tokenizer,
         curriculum=components["curriculum"],
         opponent_manager=components["opponent_manager"],
+        pending_rollout_buffer=pending_rollout_buffer,
     )
 
     grpo_kwargs = build_grpo_config_kwargs(args)
@@ -1533,6 +1613,7 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
         "rollout_func": rollout_func,
         "callbacks": callbacks,
         "summary_buffer": summary_buffer,
+        "pending_rollout_buffer": pending_rollout_buffer,
         "final_checkpoint_path": final_checkpoint_path,
         "grpo_config_kwargs": config_kwargs,
         "trainer_kwargs": filtered_trainer_kwargs,

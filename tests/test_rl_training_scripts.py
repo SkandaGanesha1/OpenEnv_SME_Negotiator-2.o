@@ -21,6 +21,7 @@ from rl.train_grpo_trl import (
     _ensure_grpo_response_schema,
     _run_single_rollout_sample,
     EpisodeSummaryBuffer,
+    PendingRolloutBuffer,
     build_arg_parser,
     build_environment_factory,
     build_grpo_config_kwargs,
@@ -186,6 +187,72 @@ def test_reward_function_accepts_keyword_only_trl_call_shape() -> None:
 
     assert len(rewards) == 2
     assert all(isinstance(value, float) for value in rewards)
+
+
+def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() -> None:
+    pending_buffer = PendingRolloutBuffer()
+    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+
+    pending_buffer.extend(
+        [
+            {
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.4,
+                    verifiable_reward=0.4,
+                    total_reward=0.4,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.4,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-a",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+                "reward_mean": 0.45,
+                "unique_action_count": 2.0,
+                "unique_completion_count": 2.0,
+                "invalid_parse_fraction": 0.0,
+                "identical_terminal_fraction": 0.0,
+                "termination_reason": "done",
+            },
+            {
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.6,
+                    verifiable_reward=0.6,
+                    total_reward=0.6,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.6,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=35.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-b",
+                "raw_completion_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "reward_std": 0.2,
+                "reward_mean": 0.45,
+                "unique_action_count": 2.0,
+                "unique_completion_count": 2.0,
+                "invalid_parse_fraction": 0.0,
+                "identical_terminal_fraction": 0.0,
+                "termination_reason": "done",
+            },
+        ]
+    )
+
+    rewards = reward_func(
+        prompts=["prompt-a", "prompt-b"],
+        completions=["{}", '{"action_type":"accept"}'],
+    )
+
+    assert rewards == [0.4, 0.6]
+    assert pending_buffer.items == []
 
 
 def test_reward_function_completion_text_provides_per_group_variance() -> None:
