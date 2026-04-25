@@ -13,6 +13,7 @@ import importlib
 import importlib.metadata
 import inspect
 import json
+import math
 import os
 import re
 import sys
@@ -24,6 +25,8 @@ from statistics import mean, pstdev
 from typing import Any, Callable, Optional
 
 from rl.bridge import (
+    SUPPORTED_ACTION_TYPES,
+    SUPPORTED_TOOL_NAMES,
     build_action_contract_text,
     execute_action,
     format_observation,
@@ -51,6 +54,52 @@ ROLL_OUT_USER_TURN = (
     "Current observation:\n{observation}\n\n"
     "Choose the single best next action for this exact state. "
     + build_action_contract_text()
+)
+TRAIN_GRPO_TRL_BRIDGE_REVISION = "2026-04-26c"
+_CANONICAL_ACTION_KEYS = frozenset(
+    {
+        "action_type",
+        "price",
+        "payment_days",
+        "use_treds",
+        "reason",
+        "deal_id",
+        "simulation_plan",
+        "simulation_horizon",
+        "tool_name",
+        "tool_args",
+        "propose_late_payment_penalty_clause",
+        "propose_dynamic_discounting",
+        "dynamic_discount_annual_rate",
+        "split_deal_buyer_a_days",
+        "split_deal_buyer_b_days",
+        "split_deal_buyer_a_price",
+        "split_deal_buyer_b_price",
+        "distress_disclosure_level",
+    }
+)
+_CANONICAL_BOOL_KEYS = frozenset(
+    {
+        "use_treds",
+        "propose_late_payment_penalty_clause",
+        "propose_dynamic_discounting",
+    }
+)
+_CANONICAL_NUMERIC_KEYS = frozenset(
+    {
+        "price",
+        "dynamic_discount_annual_rate",
+        "split_deal_buyer_a_price",
+        "split_deal_buyer_b_price",
+    }
+)
+_CANONICAL_INT_KEYS = frozenset(
+    {
+        "payment_days",
+        "simulation_horizon",
+        "split_deal_buyer_a_days",
+        "split_deal_buyer_b_days",
+    }
 )
 
 
@@ -495,6 +544,7 @@ def summarize_rollout_diagnostics(diagnostics: list[dict[str, Any]]) -> dict[str
         "unique_action_count",
         "invalid_parse_fraction",
         "identical_terminal_fraction",
+        "contract_score",
     )
     for key in numeric_keys:
         values = [float(item.get(key, 0.0) or 0.0) for item in diagnostics if key in item]
@@ -575,38 +625,185 @@ def _pending_rollout_record_signature(record: dict[str, Any]) -> Optional[str]:
     return _build_pending_rollout_signature(record.get("prompt"), completion)
 
 
-def _strict_invalid_reward(text: str) -> float:
-    if _strict_json_payload(text) is not None:
+def _is_json_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def _is_integer_like_json_number(value: Any) -> bool:
+    return _is_json_number(value) and float(value).is_integer()
+
+
+def _coerce_observation_dict(observation: Any) -> dict[str, Any]:
+    if observation is None:
+        return {}
+    if isinstance(observation, dict):
+        return dict(observation)
+    if hasattr(observation, "model_dump"):
+        dumped = observation.model_dump()
+        if isinstance(dumped, dict):
+            return dict(dumped)
+    result: dict[str, Any] = {}
+    for key in (
+        "buyer_price",
+        "buyer_days",
+        "cost_threshold",
+        "liquidity_threshold",
+        "current_period",
+        "total_periods",
+        "done",
+    ):
+        if hasattr(observation, key):
+            result[key] = getattr(observation, key)
+    return result
+
+
+def _has_only_canonical_action_keys(payload: dict[str, Any]) -> bool:
+    return all(str(key) in _CANONICAL_ACTION_KEYS for key in payload)
+
+
+def _validate_canonical_optional_fields(payload: dict[str, Any]) -> bool:
+    if not _has_only_canonical_action_keys(payload):
+        return False
+
+    for key in _CANONICAL_BOOL_KEYS:
+        if key in payload and not isinstance(payload.get(key), bool):
+            return False
+
+    for key in _CANONICAL_NUMERIC_KEYS:
+        if key in payload and payload.get(key) is not None and not _is_json_number(payload.get(key)):
+            return False
+
+    for key in _CANONICAL_INT_KEYS:
+        if key in payload and payload.get(key) is not None and not _is_integer_like_json_number(payload.get(key)):
+            return False
+
+    if "reason" in payload and payload.get("reason") is not None and not isinstance(payload.get("reason"), str):
+        return False
+    if "deal_id" in payload and payload.get("deal_id") is not None and not isinstance(payload.get("deal_id"), str):
+        return False
+    if "tool_args" in payload and payload.get("tool_args") is not None and not isinstance(payload.get("tool_args"), dict):
+        return False
+    if "simulation_plan" in payload and payload.get("simulation_plan") is not None and not isinstance(
+        payload.get("simulation_plan"), dict
+    ):
+        return False
+    if "tool_name" in payload and payload.get("tool_name") is not None and payload.get("tool_name") not in SUPPORTED_TOOL_NAMES:
+        return False
+    if "distress_disclosure_level" in payload and payload.get("distress_disclosure_level") not in {None, "low", "medium", "high"}:
+        return False
+    if "dynamic_discount_annual_rate" in payload and payload.get("dynamic_discount_annual_rate") is not None:
+        rate = float(payload["dynamic_discount_annual_rate"])
+        if rate < 0.0 or rate > 0.95:
+            return False
+    if "simulation_horizon" in payload and payload.get("simulation_horizon") is not None:
+        if int(float(payload["simulation_horizon"])) < 1:
+            return False
+    return True
+
+
+def _action_contract_score(payload: dict[str, Any], observation: Any = None) -> float:
+    action_type = str(payload.get("action_type", "") or "")
+    obs = _coerce_observation_dict(observation)
+
+    if action_type in {"reject", "advance_period"}:
+        return 0.7
+
+    if action_type == "tool":
+        score = 0.7
+        if payload.get("tool_args"):
+            score += 0.05
+        if bool(obs.get("done", False)):
+            score -= 0.15
+        return float(min(1.0, max(0.0, score)))
+
+    if action_type == "simulate_plan":
+        score = 0.68
+        if payload.get("simulation_plan"):
+            score += 0.08
+        if payload.get("simulation_horizon") is not None:
+            score += 0.04
+        return float(min(1.0, max(0.0, score)))
+
+    if action_type not in {"propose", "accept"}:
         return 0.0
-    return -0.01
+
+    price = float(payload.get("price", 0.0) or 0.0)
+    payment_days = int(float(payload.get("payment_days", 0) or 0))
+    score = 0.35
+
+    if 0.01 <= price <= 100000.0:
+        score += 0.08
+    if 0 <= payment_days <= 365:
+        score += 0.08
+
+    buyer_price = obs.get("buyer_price")
+    if _is_json_number(buyer_price):
+        gap_ratio = abs(price - float(buyer_price)) / max(abs(float(buyer_price)), 1.0)
+        score += max(0.0, 0.2 * (1.0 - min(gap_ratio, 1.5) / 1.5))
+
+    cost_threshold = obs.get("cost_threshold")
+    if _is_json_number(cost_threshold) and price < float(cost_threshold):
+        score -= min(0.25, (float(cost_threshold) - price) / max(abs(float(cost_threshold)), 1.0))
+
+    buyer_days = obs.get("buyer_days")
+    if _is_integer_like_json_number(buyer_days):
+        buyer_days_value = int(float(buyer_days))
+        day_gap = abs(payment_days - buyer_days_value)
+        score += max(0.0, 0.15 * (1.0 - min(day_gap, 120) / 120))
+
+    liquidity_threshold = obs.get("liquidity_threshold")
+    if _is_integer_like_json_number(liquidity_threshold):
+        liquidity_value = int(float(liquidity_threshold))
+        if payment_days <= max(liquidity_value, 0):
+            score += 0.05
+        if payment_days > max(liquidity_value + 120, 365):
+            score -= 0.18
+        if bool(payload.get("use_treds", False)) and _is_integer_like_json_number(buyer_days):
+            if int(float(buyer_days)) > liquidity_value + 15:
+                score += 0.05
+
+    return float(min(1.0, max(0.0, score)))
 
 
-def _completion_format_score(text: str) -> float:
+def _strict_invalid_reward(text: str) -> float:
+    return round(-0.08 + 0.08 * _completion_format_score(text), 6)
+
+
+def _completion_format_score(text: str, observation: Any = None) -> float:
     """Bounded format-quality score in [0, 1] that reads the model output text."""
     raw = (text or "").strip()
     if not raw:
         return 0.0
 
+    strict_payload = _strict_json_payload(raw)
+    if strict_payload is not None:
+        return float(min(1.0, 0.7 + 0.3 * _action_contract_score(strict_payload, observation)))
+
     score = 0.0
     lowered = raw.lower()
     if raw.startswith("{") and raw.rstrip().endswith("}"):
-        score += 0.30
+        score += 0.12
     if '"action_type"' in raw:
-        score += 0.15
-    for verb in ("propose", "accept", "reject", "advance_period", "tool", "simulate_plan"):
+        score += 0.08
+    for verb in SUPPORTED_ACTION_TYPES:
         if verb in lowered:
-            score += 0.05
+            score += 0.04
             break
-    for key in ("payment_days", "use_treds", "price", "tool_name"):
+    for key in ("price", "payment_days", "tool_name", "tool_args", "simulation_plan"):
         if key in lowered:
-            score += 0.07
-    if '"reason"' in raw or "reason=" in lowered:
-        score += 0.10
+            score += 0.04
+    if '"tool"' in raw and '"tool_name"' not in raw:
+        score -= 0.08
+    if "<think>" in lowered or "</think>" in lowered:
+        score -= 0.15
+    for invalid_variant in ("proposed", "proposal", "proposals", "proposer"):
+        if f'"action_type":"{invalid_variant}"' in lowered.replace(" ", ""):
+            score -= 0.08
     length = len(raw)
-    if 50 <= length <= 600:
-        score += 0.10
-    elif 10 <= length < 50:
+    if 20 <= length <= 600:
         score += 0.05
+    elif 1 <= length < 20:
+        score += 0.02
 
     return float(min(1.0, max(0.0, score)))
 
@@ -622,7 +819,12 @@ def make_reward_function(
     warned_non_environment_inputs = False
     warned_pending_bridge_miss = False
     warned_pending_fifo_fallback = False
-    bridge_diagnostics = {"bridge_miss_count": 0}
+    bridge_diagnostics = {
+        "bridge_miss_count": 0,
+        "fifo_fallback_count": 0,
+        "signature_match_count": 0,
+    }
+    bridge_debug_state = {"reward_calls": 0}
 
     def _reward_from_episode_payloads(
         episode_summaries_value: list[EpisodeSummary],
@@ -637,6 +839,7 @@ def make_reward_function(
         invalid_parse_fraction_value: Optional[list[float]] = None,
         identical_terminal_fraction_value: Optional[list[float]] = None,
         termination_reasons_value: Optional[list[str]] = None,
+        contract_score_value: Optional[list[float]] = None,
     ) -> list[float]:
         rewards: list[float] = []
         texts = raw_completion_texts_value or [
@@ -650,15 +853,21 @@ def make_reward_function(
         invalid_values = invalid_parse_fraction_value or [0.0] * len(episode_summaries_value)
         identical_terminal_values = identical_terminal_fraction_value or [0.0] * len(episode_summaries_value)
         termination_values = termination_reasons_value or [""] * len(episode_summaries_value)
+        contract_values = contract_score_value or [_completion_format_score(text) for text in texts]
 
         for index, summary in enumerate(episode_summaries_value):
             verifiable_reward = float(getattr(summary, "verifiable_reward", 0.0) or 0.0)
             total_reward = float(getattr(summary, "total_reward", verifiable_reward) or verifiable_reward)
             base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
-            base_reward -= 0.05 * float(invalid_values[index] or 0.0)
+            contract_score = float(contract_values[index] or 0.0)
+            invalid_fraction = float(invalid_values[index] or 0.0)
+            reward_std_scalar = float(reward_std_values[index] or 0.0)
+            if reward_std_scalar <= 1e-8 or invalid_fraction > 0.0:
+                base_reward += 0.12 * (contract_score - 0.5)
+            base_reward -= 0.04 * invalid_fraction
 
-            if float(reward_std_values[index] or 0.0) <= 1e-8:
-                base_reward += 0.01 * _completion_format_score(texts[index])
+            if reward_std_scalar <= 1e-8:
+                base_reward += 0.02 * (contract_score - 0.5)
 
             final_reward = base_reward
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
@@ -683,6 +892,7 @@ def make_reward_function(
                         "invalid_parse_fraction": float(invalid_values[index] or 0.0),
                         "identical_terminal_fraction": float(identical_terminal_values[index] or 0.0),
                         "termination_reason": termination_values[index],
+                        "contract_score": contract_score,
                         "sample_completion": texts[index],
                     },
                 )
@@ -702,6 +912,7 @@ def make_reward_function(
         invalid_parse_fraction: Optional[list[float]] = None,
         identical_terminal_fraction: Optional[list[float]] = None,
         termination_reasons: Optional[list[str]] = None,
+        contract_score: Optional[list[float]] = None,
         **kwargs: Any,
     ) -> list[float]:
         rewards: list[float] = []
@@ -719,40 +930,73 @@ def make_reward_function(
                 invalid_parse_fraction_value=invalid_parse_fraction,
                 identical_terminal_fraction_value=identical_terminal_fraction,
                 termination_reasons_value=termination_reasons,
+                contract_score_value=contract_score,
             )
 
         batch_count = len(completions or prompts or inputs or kwargs.get("environments") or [])
         if pending_rollout_buffer is not None and batch_count > 0:
+            bridge_debug_state["reward_calls"] = int(bridge_debug_state["reward_calls"]) + 1
             prompt_batch = prompts or kwargs.get("prompts") or kwargs.get("inputs")
             completion_batch = completions or kwargs.get("completions")
             pending_batch = None
+            pending_before = len(pending_rollout_buffer.items)
+            bridge_mode = "unavailable"
             signature_available = bool(prompt_batch) and bool(completion_batch) and len(prompt_batch) == len(completion_batch)
             if signature_available:
                 pending_batch = pending_rollout_buffer.take_by_signature(list(prompt_batch), list(completion_batch))
-                if pending_batch is None:
+                if pending_batch is not None:
+                    bridge_diagnostics["signature_match_count"] = int(bridge_diagnostics["signature_match_count"]) + batch_count
+                    bridge_mode = "signature"
+                else:
                     pending_batch = pending_rollout_buffer.take(batch_count)
                     if pending_batch is not None:
+                        bridge_diagnostics["fifo_fallback_count"] = int(bridge_diagnostics["fifo_fallback_count"]) + batch_count
+                        bridge_mode = "fifo"
                         nonlocal warned_pending_fifo_fallback
                         if not warned_pending_fifo_fallback:
                             print(
-                                "[train_grpo_trl][WARN] reward_func could not signature-match pending rollout rewards; "
+                                f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}][WARN] "
+                                "reward_func could not signature-match pending rollout rewards; "
                                 "using FIFO compatibility fallback for this TRL build.",
                                 flush=True,
                             )
                             warned_pending_fifo_fallback = True
                     else:
+                        bridge_mode = "miss"
                         nonlocal warned_pending_bridge_miss
                         bridge_diagnostics["bridge_miss_count"] = int(bridge_diagnostics["bridge_miss_count"]) + batch_count
                         if not warned_pending_bridge_miss:
                             print(
-                                "[train_grpo_trl][WARN] reward_func could not match pending rollout rewards "
+                                f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}][WARN] "
+                                "reward_func could not match pending rollout rewards "
                                 "for the current prompt/completion batch; using strict-invalid fallback reward.",
                                 flush=True,
                             )
                             warned_pending_bridge_miss = True
+                        if int(bridge_debug_state["reward_calls"]) <= 6:
+                            print(
+                                f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}] "
+                                f"reward_call={bridge_debug_state['reward_calls']} batch_count={batch_count} "
+                                f"pending_before={pending_before} pending_after={len(pending_rollout_buffer.items)} "
+                                f"signature_available={signature_available} bridge_mode={bridge_mode}",
+                                flush=True,
+                            )
                         return [round(_strict_invalid_reward(_coerce_completion_text(completion)), 6) for completion in completion_batch]
             else:
                 pending_batch = pending_rollout_buffer.take(batch_count)
+                if pending_batch is not None:
+                    bridge_diagnostics["fifo_fallback_count"] = int(bridge_diagnostics["fifo_fallback_count"]) + batch_count
+                    bridge_mode = "fifo_no_signature"
+                else:
+                    bridge_mode = "missing_no_signature"
+            if int(bridge_debug_state["reward_calls"]) <= 6:
+                print(
+                    f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}] "
+                    f"reward_call={bridge_debug_state['reward_calls']} batch_count={batch_count} "
+                    f"pending_before={pending_before} pending_after={len(pending_rollout_buffer.items)} "
+                    f"signature_available={signature_available} bridge_mode={bridge_mode}",
+                    flush=True,
+                )
             if pending_batch is not None:
                 return _reward_from_episode_payloads(
                     [record["episode_summary"] for record in pending_batch],
@@ -772,6 +1016,10 @@ def make_reward_function(
                         float(record.get("identical_terminal_fraction", 0.0) or 0.0) for record in pending_batch
                     ],
                     termination_reasons_value=[str(record.get("termination_reason", "")) for record in pending_batch],
+                    contract_score_value=[
+                        float(record.get("contract_score", _completion_format_score(str(record.get("raw_completion_text", "")))) or 0.0)
+                        for record in pending_batch
+                    ],
                 )
 
         resolved_inputs = inputs
@@ -1119,6 +1367,37 @@ def _strict_json_payload(raw_text: str) -> Optional[dict[str, Any]]:
         return None
     if not isinstance(parsed, dict) or "action_type" not in parsed:
         return None
+    if not _validate_canonical_optional_fields(parsed):
+        return None
+
+    action_type = parsed.get("action_type")
+    if not isinstance(action_type, str) or action_type not in SUPPORTED_ACTION_TYPES:
+        return None
+
+    if action_type in {"propose", "accept"}:
+        price = parsed.get("price")
+        payment_days = parsed.get("payment_days")
+        if not _is_json_number(price) or float(price) < 0.0:
+            return None
+        if not _is_integer_like_json_number(payment_days) or int(float(payment_days)) < 0:
+            return None
+        return parsed
+
+    if action_type == "tool":
+        if parsed.get("tool_name") not in SUPPORTED_TOOL_NAMES:
+            return None
+        if "tool_args" not in parsed or not isinstance(parsed.get("tool_args"), dict):
+            return None
+        return parsed
+
+    if action_type == "simulate_plan":
+        if not isinstance(parsed.get("simulation_plan"), dict):
+            return None
+        horizon = parsed.get("simulation_horizon")
+        if horizon is not None and (not _is_integer_like_json_number(horizon) or int(float(horizon)) < 1):
+            return None
+        return parsed
+
     return parsed
 
 
@@ -1151,6 +1430,7 @@ def _run_single_rollout_sample(
     raw_turn_texts: list[str] = []
     parsed_actions: list[dict[str, Any]] = []
     valid_json_steps = 0
+    contract_scores: list[float] = []
 
     max_episode_steps = int(getattr(rollout_args, "max_episode_steps", 24) or 24)
     max_new_tokens = int(getattr(rollout_args, "max_completion_length", 256) or 256)
@@ -1174,6 +1454,7 @@ def _run_single_rollout_sample(
         raw_turn_texts.append(raw_text)
 
         observation = getattr(wrapper, "last_observation", None)
+        contract_scores.append(_completion_format_score(raw_text, observation))
         action, was_valid_json = _parse_action_and_validity(raw_text, observation, strict_json=True)
         if was_valid_json:
             valid_json_steps += 1
@@ -1226,6 +1507,7 @@ def _run_single_rollout_sample(
         "raw_completion_text": "\n".join(raw_turn_texts),
         "completion_signature_text": completion_signature_text,
         "invalid_parse_fraction": round(1.0 - strict_json_fraction, 6),
+        "contract_score": round(mean(contract_scores), 6) if contract_scores else 0.0,
     }
 
 
@@ -1325,7 +1607,15 @@ def build_rollout_func(
                 samples.append(sample)
 
         if pending_rollout_buffer is not None and samples:
+            pending_before = len(pending_rollout_buffer.items)
             pending_rollout_buffer.extend(samples)
+            if len(samples) and len(prompts) and len(samples) <= 12:
+                print(
+                    f"[train_grpo_trl][bridge:{TRAIN_GRPO_TRL_BRIDGE_REVISION}] "
+                    f"rollout_prompts={len(prompts)} samples_added={len(samples)} "
+                    f"pending_before={pending_before} pending_after={len(pending_rollout_buffer.items)}",
+                    flush=True,
+                )
 
         return {
             "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
@@ -1343,6 +1633,10 @@ def build_rollout_func(
             "unique_completion_count": [float(sample["unique_completion_count"]) for sample in samples],
             "invalid_parse_fraction": [float(sample["invalid_parse_fraction"]) for sample in samples],
             "identical_terminal_fraction": [float(sample["identical_terminal_fraction"]) for sample in samples],
+            "contract_score": [
+                float(sample.get("contract_score", _completion_format_score(str(sample.get("raw_completion_text", "")))) or 0.0)
+                for sample in samples
+            ],
         }
 
     return rollout_func
@@ -1745,6 +2039,11 @@ def _require_rollout_func_support(grpo_trainer_cls: Any) -> None:
 
 def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     """Build the canonical explicit-rollout GRPO training bundle."""
+    print(
+        f"[train_grpo_trl] Bridge revision {TRAIN_GRPO_TRL_BRIDGE_REVISION} "
+        "(strict-contract-v2, reward-shaping-v2, bridge-debug-v1).",
+        flush=True,
+    )
     components = _resolve_training_components(args)
 
     from transformers import TrainerCallback

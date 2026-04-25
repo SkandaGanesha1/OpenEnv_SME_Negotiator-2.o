@@ -21,6 +21,7 @@ from rl.train_grpo_trl import (
     _ensure_grpo_response_schema,
     _render_chat_prompt,
     _run_single_rollout_sample,
+    _strict_json_payload,
     EpisodeSummaryBuffer,
     PendingRolloutBuffer,
     create_trainer,
@@ -439,10 +440,13 @@ def test_reward_function_reports_bridge_miss_and_returns_strict_invalid_reward()
 
     rewards = reward_func(
         prompts=["prompt-b", "prompt-c"],
-        completions=["<think>not json</think>", "<think>still not json</think>"],
+        completions=[
+            "<think>not json</think>",
+            '{"action_type":"proposal","price":95.0,"payment_days":40}',
+        ],
     )
 
-    assert rewards == [-0.01, -0.01]
+    assert rewards[0] < rewards[1] < 0.0
     assert reward_func.bridge_diagnostics["bridge_miss_count"] == 2
     assert len(pending_buffer.items) == 1
 
@@ -567,9 +571,33 @@ def test_reward_function_completion_text_provides_per_group_variance() -> None:
     assert len(rewards) == len(completions)
     # All rewards must differ by more than floating noise so GRPO advantage > 0.
     assert len(set(round(r, 4) for r in rewards)) >= 3
-    # Bounded: format contribution must not exceed 0.1 per the design.
+    # Bounded: contract shaping must stay small relative to the environment reward.
     base = max(rewards) - min(rewards)
-    assert 0.0 < base <= 0.11
+    assert 0.0 < base <= 0.18
+
+
+def test_strict_json_payload_rejects_near_schema_action_type_variants() -> None:
+    assert _strict_json_payload('{"action_type":"proposed","price":100.0,"payment_days":30}') is None
+    assert _strict_json_payload('{"action_type":"proposal","price":100.0,"payment_days":30}') is None
+    assert _strict_json_payload('{"action_type":"proposals","price":100.0,"payment_days":30}') is None
+    assert _strict_json_payload('{"action_type":"proposer","price":100.0,"payment_days":30}') is None
+
+
+def test_strict_json_payload_requires_exact_field_types_for_contract_actions() -> None:
+    assert _strict_json_payload('{"action_type":"propose","price":"0.01","payment_days":"15"}') is None
+    assert _strict_json_payload('{"action_type":"tool","tool":"QUERY_TREDS"}') is None
+    assert _strict_json_payload('{"action_type":"simulate_plan","simulation_plan":"simulate_two_periods"}') is None
+    assert (
+        _strict_json_payload(
+            '{"action_type":"propose","price":95.0,"payment_days":40,"reason":"close gap"}'
+        )
+        == {
+            "action_type": "propose",
+            "price": 95.0,
+            "payment_days": 40,
+            "reason": "close gap",
+        }
+    )
 
 
 def test_snapshot_callback_registers_and_prunes_opponent_zoo() -> None:
