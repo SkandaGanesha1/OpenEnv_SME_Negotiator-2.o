@@ -39,6 +39,7 @@ from sme_negotiator_env.prompting import conservative_default_action
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 DEFAULT_PROMPT = (
+    "/no_think\n"
     "You are an SME treasury agent operating a deterministic long-horizon liquidity workflow. "
     "Maximize the final verifiable reward, preserve positive NPV, use tools only when they improve the current state, "
     "and finish the episode without default. "
@@ -46,6 +47,7 @@ DEFAULT_PROMPT = (
 )
 TRAINING_ROW_PREFIX = "[TRAINING_ROW]"
 ROLL_OUT_USER_TURN = (
+    "/no_think\n"
     "Current observation:\n{observation}\n\n"
     "Choose the single best next action for this exact state. "
     + build_action_contract_text()
@@ -619,6 +621,7 @@ def make_reward_function(
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
     warned_non_environment_inputs = False
     warned_pending_bridge_miss = False
+    warned_pending_fifo_fallback = False
     bridge_diagnostics = {"bridge_miss_count": 0}
 
     def _reward_from_episode_payloads(
@@ -727,16 +730,27 @@ def make_reward_function(
             if signature_available:
                 pending_batch = pending_rollout_buffer.take_by_signature(list(prompt_batch), list(completion_batch))
                 if pending_batch is None:
-                    nonlocal warned_pending_bridge_miss
-                    bridge_diagnostics["bridge_miss_count"] = int(bridge_diagnostics["bridge_miss_count"]) + batch_count
-                    if not warned_pending_bridge_miss:
-                        print(
-                            "[train_grpo_trl][WARN] reward_func could not match pending rollout rewards "
-                            "for the current prompt/completion batch; using strict-invalid fallback reward.",
-                            flush=True,
-                        )
-                        warned_pending_bridge_miss = True
-                    return [round(_strict_invalid_reward(_coerce_completion_text(completion)), 6) for completion in completion_batch]
+                    pending_batch = pending_rollout_buffer.take(batch_count)
+                    if pending_batch is not None:
+                        nonlocal warned_pending_fifo_fallback
+                        if not warned_pending_fifo_fallback:
+                            print(
+                                "[train_grpo_trl][WARN] reward_func could not signature-match pending rollout rewards; "
+                                "using FIFO compatibility fallback for this TRL build.",
+                                flush=True,
+                            )
+                            warned_pending_fifo_fallback = True
+                    else:
+                        nonlocal warned_pending_bridge_miss
+                        bridge_diagnostics["bridge_miss_count"] = int(bridge_diagnostics["bridge_miss_count"]) + batch_count
+                        if not warned_pending_bridge_miss:
+                            print(
+                                "[train_grpo_trl][WARN] reward_func could not match pending rollout rewards "
+                                "for the current prompt/completion batch; using strict-invalid fallback reward.",
+                                flush=True,
+                            )
+                            warned_pending_bridge_miss = True
+                        return [round(_strict_invalid_reward(_coerce_completion_text(completion)), 6) for completion in completion_batch]
             else:
                 pending_batch = pending_rollout_buffer.take(batch_count)
             if pending_batch is not None:
@@ -963,8 +977,32 @@ def _render_chat_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
         training_chat_template = getattr(tokenizer, "training_chat_template", None)
+        try:
+            return str(tokenizer.apply_chat_template(messages, enable_thinking=False, **kwargs))
+        except TypeError:
+            pass
         if training_chat_template is not None:
-            kwargs["chat_template"] = training_chat_template
+            try:
+                return str(
+                    tokenizer.apply_chat_template(
+                        messages,
+                        chat_template=training_chat_template,
+                        enable_thinking=False,
+                        **kwargs,
+                    )
+                )
+            except TypeError:
+                try:
+                    return str(
+                        tokenizer.apply_chat_template(
+                            messages,
+                            chat_template=training_chat_template,
+                            chat_template_kwargs={"enable_thinking": False},
+                            **kwargs,
+                        )
+                    )
+                except TypeError:
+                    pass
         try:
             return str(tokenizer.apply_chat_template(messages, chat_template_kwargs={"enable_thinking": False}, **kwargs))
         except TypeError:
@@ -1170,6 +1208,11 @@ def _run_single_rollout_sample(
             termination_reason = metadata_reason
 
     strict_json_fraction = valid_json_steps / max(1, len(raw_turn_texts))
+    completion_signature_text = (
+        str(tokenizer.decode(completion_ids, skip_special_tokens=True))
+        if completion_ids and hasattr(tokenizer, "decode")
+        else "\n".join(raw_turn_texts)
+    )
     return {
         "prompt_ids": prompt_ids,
         "completion_ids": completion_ids,
@@ -1181,7 +1224,7 @@ def _run_single_rollout_sample(
         "parsed_actions": parsed_actions,
         "prompt": copy.deepcopy(prompt),
         "raw_completion_text": "\n".join(raw_turn_texts),
-        "completion_signature_text": "".join(raw_turn_texts),
+        "completion_signature_text": completion_signature_text,
         "invalid_parse_fraction": round(1.0 - strict_json_fraction, 6),
     }
 

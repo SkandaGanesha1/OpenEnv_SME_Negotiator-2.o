@@ -188,7 +188,7 @@ def test_render_chat_prompt_disables_thinking_when_chat_template_supports_it() -
     assert prompt == "rendered-prompt"
     assert captured["kwargs"]["tokenize"] is False
     assert captured["kwargs"]["add_generation_prompt"] is True
-    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert captured["kwargs"]["enable_thinking"] is False
 
 
 def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> None:
@@ -437,11 +437,75 @@ def test_reward_function_reports_bridge_miss_and_returns_strict_invalid_reward()
         ]
     )
 
-    rewards = reward_func(prompts=["prompt-b"], completions=["<think>not json</think>"])
+    rewards = reward_func(
+        prompts=["prompt-b", "prompt-c"],
+        completions=["<think>not json</think>", "<think>still not json</think>"],
+    )
 
-    assert rewards == [-0.01]
-    assert reward_func.bridge_diagnostics["bridge_miss_count"] == 1
+    assert rewards == [-0.01, -0.01]
+    assert reward_func.bridge_diagnostics["bridge_miss_count"] == 2
     assert len(pending_buffer.items) == 1
+
+
+def test_reward_function_uses_fifo_compatibility_fallback_after_signature_miss() -> None:
+    pending_buffer = PendingRolloutBuffer()
+    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    pending_buffer.extend(
+        [
+            {
+                "prompt": "prompt-a",
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.4,
+                    verifiable_reward=0.4,
+                    total_reward=0.4,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.4,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-a",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+            },
+            {
+                "prompt": "prompt-b",
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.6,
+                    verifiable_reward=0.6,
+                    total_reward=0.6,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.6,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=35.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-b",
+                "raw_completion_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "completion_signature_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "reward_std": 0.2,
+            },
+        ]
+    )
+
+    rewards = reward_func(
+        prompts=["different-a", "different-b"],
+        completions=[
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+            '{"action_type":"propose","price":97.0,"payment_days":35}',
+        ],
+    )
+
+    assert rewards == [0.4, 0.6]
+    assert reward_func.bridge_diagnostics["bridge_miss_count"] == 0
+    assert pending_buffer.items == []
 
 
 def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -> None:
