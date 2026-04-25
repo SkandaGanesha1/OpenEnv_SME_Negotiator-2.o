@@ -120,6 +120,16 @@ def build_episode_log(wrapper: object) -> str:
                 f"financier_policy_id={episode_summary.financier_policy_id}"
         )
 
+        # Include [STEP] and [END] markers so build_rule_based_rubric_scorer can parse them
+        env_reward = float(episode_summary.env_reward_total or 0.0)
+        score_val = float(episode_summary.total_reward or 0.0)
+        lines.append(f"[STEP] step=1 reward={score_val:.2f}")
+        use_treds_marker = "use_treds=true" if float(episode_summary.tool_usage_count or 0) > 0 else ""
+        if use_treds_marker:
+            lines.append(f"[STEP_DETAIL] {use_treds_marker}")
+        success_flag = "true" if episode_summary.success_no_default_positive_npv else "false"
+        lines.append(f"[END] success={success_flag} steps=1 score={score_val:.2f}")
+
     return "\n".join(lines)
 
 
