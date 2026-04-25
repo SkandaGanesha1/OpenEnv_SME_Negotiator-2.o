@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib
+import importlib.metadata
 import inspect
 import json
 import os
@@ -258,6 +259,50 @@ def _require_peft_components() -> tuple[Any, Any]:
     return LoraConfig, get_peft_model
 
 
+def _parse_version_components(raw: str) -> tuple[int, ...]:
+    """Return numeric version components for a best-effort comparison."""
+    parts = re.findall(r"\d+", str(raw))
+    return tuple(int(part) for part in parts[:4])
+
+
+def _torchao_version() -> Optional[str]:
+    """Return the installed torchao version when present."""
+    try:
+        return importlib.metadata.version("torchao")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def _disable_torchao_in_peft() -> None:
+    """Force PEFT to treat torchao as unavailable for LoRA injection."""
+    try:
+        import peft.import_utils as peft_import_utils
+
+        peft_import_utils.is_torchao_available = lambda: False
+    except ImportError:
+        pass
+
+    try:
+        import peft.tuners.lora.torchao as peft_lora_torchao
+
+        peft_lora_torchao.is_torchao_available = lambda: False
+    except ImportError:
+        pass
+
+
+def _maybe_disable_incompatible_torchao() -> None:
+    """Disable torchao integration when an unsupported version is installed."""
+    version = _torchao_version()
+    if version is None:
+        return
+    if _parse_version_components(version) < (0, 16, 0):
+        print(
+            f"[train_grpo_trl] Disabling incompatible torchao {version}; PEFT LoRA requires >= 0.16.0.",
+            flush=True,
+        )
+        _disable_torchao_in_peft()
+
+
 def prepare_model_for_grpo(model: Any) -> Any:
     """Apply canonical training settings and attach LoRA adapters."""
     if hasattr(model, "config"):
@@ -272,25 +317,30 @@ def prepare_model_for_grpo(model: Any) -> Any:
         model.enable_input_require_grads()
 
     LoraConfig, get_peft_model = _require_peft_components()
-    model = get_peft_model(
-        model,
-        LoraConfig(
-            r=16,
-            lora_alpha=32,
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
-        ),
+    _maybe_disable_incompatible_torchao()
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ],
     )
+    try:
+        model = get_peft_model(model, lora_config)
+    except ImportError as exc:
+        if "torchao" not in str(exc).lower():
+            raise
+        _disable_torchao_in_peft()
+        model = get_peft_model(model, lora_config)
     if hasattr(model, "print_trainable_parameters"):
         model.print_trainable_parameters()
     return model

@@ -543,6 +543,35 @@ def test_prepare_model_for_grpo_refuses_missing_peft(monkeypatch) -> None:
         raise AssertionError("prepare_model_for_grpo should require peft")
 
 
+def test_prepare_model_for_grpo_disables_incompatible_torchao_and_retries(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    calls = {"count": 0, "disabled": False}
+
+    class _FakeLoraConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    def _fake_disable_torchao() -> None:
+        calls["disabled"] = True
+
+    def _fake_get_peft_model(model, config):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise ImportError("Found an incompatible version of torchao")
+        return {"wrapped": model, "config": config}
+
+    monkeypatch.setattr(trl_script, "_torchao_version", lambda: "0.10.0")
+    monkeypatch.setattr(trl_script, "_disable_torchao_in_peft", _fake_disable_torchao)
+    monkeypatch.setattr(trl_script, "_require_peft_components", lambda: (_FakeLoraConfig, _fake_get_peft_model))
+
+    model = prepare_model_for_grpo(object())
+
+    assert calls["disabled"] is True
+    assert calls["count"] == 2
+    assert isinstance(model, dict)
+
+
 def test_trl_main_passes_rollout_func_and_not_environment_factory(monkeypatch) -> None:
     import rl.train_grpo_trl as trl_script
 
