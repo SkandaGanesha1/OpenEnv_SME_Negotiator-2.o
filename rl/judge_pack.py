@@ -7,7 +7,6 @@ import argparse
 import base64
 import json
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -154,13 +153,18 @@ def _build_trained_transcript(
             return fallback_log, dict(fallback.get("episode_summary") or {}), f"results_fallback:{type(exc).__name__}"
 
     fallback = _best_episode(results) or {}
-    fallback_log = str(fallback.get("episode_log", "") or "No trained transcript available.")
-    return fallback_log, dict(fallback.get("episode_summary") or {}), "results_best_episode"
+    fallback_log = str(fallback.get("episode_log", "") or "Baseline only: no trained transcript available.")
+    return fallback_log, dict(fallback.get("episode_summary") or {}), "baseline_only_results_best_episode"
 
 
 def _excerpt(text: str, *, max_lines: int = 12) -> str:
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return "\n".join(lines[:max_lines]) if lines else "(empty transcript)"
+
+
+def _stable_generated_at(results: dict[str, Any]) -> str:
+    metadata = dict(results.get("metadata") or {})
+    return str(metadata.get("timestamp") or "from_results_file")
 
 
 def build_judge_pack(
@@ -198,13 +202,29 @@ def build_judge_pack(
         Path(reward_curve_source) if reward_curve_source else None,
     )
 
+    comparison_heading = "Trained / evaluated excerpt" if checkpoint_path else "Baseline-only evaluated excerpt"
+    comparison = (
+        "## Before / After Snippet\n\n"
+        "### Baseline heuristic excerpt\n\n"
+        "```text\n"
+        f"{_excerpt(baseline_transcript)}\n"
+        "```\n\n"
+        f"### {comparison_heading}\n\n"
+        "```text\n"
+        f"{_excerpt(trained_transcript)}\n"
+        "```\n"
+    )
+    comparison_path = output_path / "before_after_excerpt.md"
+    comparison_path.write_text(comparison, encoding="utf-8")
+
     judge_summary = {
         "metadata": {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": _stable_generated_at(results),
             "results_file": str(results_path),
             "checkpoint_path": checkpoint_path,
             "reward_curve_status": curve_status,
             "trained_transcript_source": trained_source,
+            "comparison_mode": "trained_vs_baseline" if checkpoint_path else "baseline_only",
             "inference_metadata": dict(results.get("metadata") or {}),
         },
         "tasks": task_summaries,
@@ -214,18 +234,6 @@ def build_judge_pack(
     }
     judge_summary_path = output_path / "judge_summary.json"
     judge_summary_path.write_text(json.dumps(judge_summary, indent=2), encoding="utf-8")
-
-    comparison = (
-        "## Before / After Snippet\n\n"
-        "### Baseline heuristic excerpt\n\n"
-        "```text\n"
-        f"{_excerpt(baseline_transcript)}\n"
-        "```\n\n"
-        "### Trained / evaluated excerpt\n\n"
-        "```text\n"
-        f"{_excerpt(trained_transcript)}\n"
-        "```\n"
-    )
 
     task_rows = [
         f"| {name} | {summary['episode_count']} | {summary['mean_score']:.4f} | {summary['mean_reward']:.4f} | "
@@ -255,6 +263,7 @@ def build_judge_pack(
         "## Artifact Notes\n\n"
         f"- Reward curve status: `{curve_status}`\n"
         f"- Trained transcript source: `{trained_source}`\n"
+        f"- Comparison mode: `{'trained_vs_baseline' if checkpoint_path else 'baseline_only'}`\n"
         f"- Results file: `{results_path}`\n"
         f"- Checkpoint path: `{checkpoint_path or 'none'}`\n\n"
         f"{comparison}"
@@ -268,6 +277,7 @@ def build_judge_pack(
         "baseline_transcript_path": str(baseline_path),
         "trained_transcript_path": str(trained_path),
         "reward_curve_path": str(output_path / "reward_curve.png"),
+        "before_after_excerpt_path": str(comparison_path),
     }
 
 

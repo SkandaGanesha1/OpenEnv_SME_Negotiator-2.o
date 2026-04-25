@@ -139,6 +139,31 @@ def _inference_agent_mode() -> str:
     return _normalize_inference_agent_mode(os.getenv("INFERENCE_AGENT_MODE", DEFAULT_INFERENCE_AGENT_MODE))
 
 
+def _int_env(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = (os.getenv(name, str(default)) or str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def _inference_history_max_turns() -> int:
+    return _int_env("INFERENCE_HISTORY_MAX_TURNS", 6, minimum=1)
+
+
+def _inference_history_max_chars() -> int:
+    return _int_env("INFERENCE_HISTORY_MAX_CHARS", 6000, minimum=500)
+
+
+def _inference_history_summary_max_chars() -> int:
+    return _int_env("INFERENCE_HISTORY_SUMMARY_MAX_CHARS", 1200, minimum=50)
+
+
+def _inference_llm_max_tokens() -> int:
+    return _int_env("INFERENCE_LLM_MAX_TOKENS", 160, minimum=32)
+
+
 def _openenv_in_process_enabled() -> bool:
     return _env_truthy("OPENENV_IN_PROCESS", False)
 
@@ -253,9 +278,59 @@ def _clip_ascii_text(value: Any, max_len: int) -> str:
     return clip_ascii_text(value, max_len)
 
 
+def _strict_clip_text(value: Any, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
+    text = _clip_ascii_text(value, max_len)
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return text[:1]
+    return text[: max_len - 1] + "~"
+
+
+def _compact_action_payload_for_log(action_payload: Mapping[str, Any]) -> Dict[str, Any]:
+    action_type = str(action_payload.get("action_type", "propose") or "propose").lower()
+    compact: Dict[str, Any] = {"action_type": action_type}
+    deal_id = action_payload.get("deal_id")
+    reason = _strict_clip_text(action_payload.get("reason", ""), _MAX_REASON_CHARS)
+
+    if deal_id and action_type != "advance_period":
+        compact["deal_id"] = str(deal_id)
+
+    if action_type in {"propose", "accept"}:
+        compact["price"] = round(float(action_payload.get("price", 0.0) or 0.0), 2)
+        compact["payment_days"] = int(action_payload.get("payment_days", 0) or 0)
+        compact["use_treds"] = bool(action_payload.get("use_treds", False))
+        if bool(action_payload.get("propose_late_payment_penalty_clause", False)):
+            compact["propose_late_payment_penalty_clause"] = True
+        if bool(action_payload.get("propose_dynamic_discounting", False)):
+            compact["propose_dynamic_discounting"] = True
+            rate = float(action_payload.get("dynamic_discount_annual_rate", 0.0) or 0.0)
+            if rate > 0.0:
+                compact["dynamic_discount_annual_rate"] = round(rate, 4)
+    elif action_type == "tool":
+        tool_name = str(action_payload.get("tool_name", "") or "").upper()
+        if tool_name:
+            compact["tool_name"] = tool_name
+        tool_args = action_payload.get("tool_args")
+        if isinstance(tool_args, Mapping) and tool_args:
+            compact["tool_args"] = dict(tool_args)
+    elif action_type == "simulate_plan":
+        simulation_plan = action_payload.get("simulation_plan")
+        if isinstance(simulation_plan, Mapping) and simulation_plan:
+            compact["simulation_plan"] = dict(simulation_plan)
+        if action_payload.get("simulation_horizon") is not None:
+            compact["simulation_horizon"] = int(action_payload.get("simulation_horizon") or 0)
+
+    if reason:
+        compact["reason"] = reason
+    return compact
+
+
 def _serialize_step_action(action: NegotiationAction) -> str:
     """Serialize the action JSON on one line with compact separators for log safety."""
-    return json.dumps(action.model_dump(), ensure_ascii=True, separators=(",", ":"))
+    return json.dumps(_compact_action_payload_for_log(action.model_dump()), ensure_ascii=True, separators=(",", ":"))
 
 
 def _format_step_error(llm_error: str | None) -> str:
@@ -308,19 +383,28 @@ def _format_terminal_reward_line(
     )
 
 
-def _format_verifiable_reward_breakdown_line(reward_breakdown: Optional[Mapping[str, Any]]) -> Optional[str]:
+def _format_verifiable_reward_breakdown_line(
+    reward_breakdown: Optional[Mapping[str, Any]],
+    *,
+    canonical_total: Optional[float] = None,
+) -> str:
     if not reward_breakdown:
-        return None
+        if canonical_total is None:
+            return "[VERIFIABLE_REWARD] breakdown=unavailable"
+        return f"[VERIFIABLE_REWARD] total={float(canonical_total or 0.0):.4f} breakdown=unavailable"
     keys = ("solvency", "liquidity", "npv", "compliance", "total")
     if not all(key in reward_breakdown for key in keys):
-        return None
+        if canonical_total is None:
+            return "[VERIFIABLE_REWARD] breakdown=unavailable"
+        return f"[VERIFIABLE_REWARD] total={float(canonical_total or 0.0):.4f} breakdown=unavailable"
+    total_value = float(canonical_total if canonical_total is not None else reward_breakdown.get("total", 0.0) or 0.0)
     return (
         "[VERIFIABLE_REWARD] "
         f"solvency={float(reward_breakdown.get('solvency', 0.0) or 0.0):.4f} "
         f"liquidity={float(reward_breakdown.get('liquidity', 0.0) or 0.0):.4f} "
         f"npv={float(reward_breakdown.get('npv', 0.0) or 0.0):.4f} "
         f"compliance={float(reward_breakdown.get('compliance', 0.0) or 0.0):.4f} "
-        f"total={float(reward_breakdown.get('total', 0.0) or 0.0):.4f}"
+        f"total={total_value:.4f}"
     )
 
 
@@ -372,7 +456,7 @@ def _hard_fields_valid(action_payload: Dict[str, Any]) -> bool:
     if not bool(action_payload.get("propose_dynamic_discounting", False)):
         return False
     rate = float(action_payload.get("dynamic_discount_annual_rate", 0.0))
-    return 0.0 < rate <= 0.05
+    return abs(rate - 0.02) <= 1e-9
 
 
 def _proposal_viable_for_close(
@@ -400,18 +484,17 @@ def _enforce_task_contract_fields(
     buyer_days = int(observation.get("buyer_days", 0))
     liq = int(observation.get("liquidity_threshold", 0))
 
+    if "easy" in t or "medium" in t:
+        out["propose_dynamic_discounting"] = False
+        out["dynamic_discount_annual_rate"] = 0.0
+
     if "medium" in t:
         out["propose_late_payment_penalty_clause"] = True
 
     if "hard" in t:
         out["propose_dynamic_discounting"] = True
-        rate = float(out.get("dynamic_discount_annual_rate", 0.02))
-        if rate <= 0.0 or rate > 0.05:
-            out["dynamic_discount_annual_rate"] = 0.02
-        else:
-            out["dynamic_discount_annual_rate"] = round(rate, 4)
-        # Keep financing mechanic active when day-gap pressure is material.
-        if buyer_days > liq + 10:
+        out["dynamic_discount_annual_rate"] = 0.02
+        if buyer_days > liq + 10 or str(observation.get("last_tool_name", "")).upper() == "QUERY_TREDS":
             out["use_treds"] = True
     return out
 
@@ -546,6 +629,10 @@ class InProcessLiquidityBridge:
     @property
     def env(self) -> Any:
         return self._wrapper.env
+
+    @property
+    def reward_breakdown(self) -> Any:
+        return getattr(self._wrapper, "reward_breakdown", None)
 
     def summarize_episode(self) -> Any:
         return self._wrapper.summarize_episode()
@@ -755,6 +842,15 @@ def _same_action_shape(left: Optional[Dict[str, Any]], right: Optional[Dict[str,
     )
 
 
+def _remaining_rounds(observation: Dict[str, Any], round_number: int) -> int:
+    max_rounds = int(observation.get("max_rounds", 16) or 16)
+    return max(max_rounds - (round_number + 1), 0)
+
+
+def _late_close_window(task_name: str) -> int:
+    return 4 if "hard" in task_name.lower() else 3
+
+
 def _build_liquidity_escape_action(
     observation: Dict[str, Any],
     task_name: str,
@@ -816,6 +912,158 @@ def _build_liquidity_escape_action(
     )
     proposal["deal_id"] = str(active_deal_id)
     return proposal
+
+
+def _normalize_liquidity_raw_action_payload(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+    round_number: int,
+    last_valid_proposal: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    open_deal_ids = list(observation.get("open_deal_ids") or [])
+    active_deal_id = observation.get("active_deal_id") or (open_deal_ids[0] if open_deal_ids else None)
+    buyer_days = int(observation.get("buyer_days", 0) or 0)
+    liquidity = int(observation.get("liquidity_threshold", 0) or 0)
+    buyer_price = float(observation.get("buyer_price", 0.0) or 0.0)
+    cost = float(observation.get("cost_threshold", 0.0) or 0.0)
+
+    out = dict(action_payload)
+    out["action_type"] = str(out.get("action_type", "propose") or "propose").lower()
+    if active_deal_id and out["action_type"] != "advance_period":
+        out["deal_id"] = str(active_deal_id)
+
+    if out["action_type"] == "reject" and not _explicit_surrender_requested(out.get("reason")):
+        proposal = _normalize_stage1_proposal(
+            {
+                "action_type": "propose",
+                "deal_id": str(active_deal_id),
+                "price": float(out.get("price", buyer_price) or buyer_price),
+                "payment_days": int(out.get("payment_days", max(liquidity, buyer_days - 6)) or max(liquidity, buyer_days - 6)),
+                "use_treds": bool(out.get("use_treds", buyer_days > liquidity + 10)),
+                "reason": _annotate_reason(
+                    out.get("reason"),
+                    "Reject suppressed: convert to a counter-offer instead of ending the episode.",
+                ),
+            },
+            observation,
+            task_name,
+            round_number,
+            last_valid_proposal,
+        )
+        proposal["deal_id"] = str(active_deal_id)
+        return proposal
+
+    if out["action_type"] == "accept":
+        if last_valid_proposal is not None and _action_matches_last_proposal(out, last_valid_proposal):
+            accepted = _build_accept_from_last_proposal(last_valid_proposal, observation, task_name)
+            accepted["deal_id"] = str(active_deal_id)
+            return accepted
+
+        acceptable_buyer_terms = (
+            _action_matches_observation_terms(out, observation)
+            and buyer_days <= liquidity
+            and buyer_price >= (cost + _task_margin(task_name))
+        )
+        if acceptable_buyer_terms:
+            out["deal_id"] = str(active_deal_id)
+            return out
+
+        proposal = _normalize_stage1_proposal(
+            {
+                "action_type": "propose",
+                "deal_id": str(active_deal_id),
+                "price": float(out.get("price", buyer_price) or buyer_price),
+                "payment_days": int(last_valid_proposal.get("payment_days", buyer_days) if last_valid_proposal else buyer_days),
+                "use_treds": bool(out.get("use_treds", buyer_days > liquidity + 10)),
+                "reason": _annotate_reason(out.get("reason"), "Invalid accept downgraded to a counter-offer."),
+            },
+            observation,
+            task_name,
+            round_number,
+            last_valid_proposal,
+        )
+        proposal["deal_id"] = str(active_deal_id)
+        return proposal
+
+    if out["action_type"] == "tool":
+        tool_name = str(out.get("tool_name", "") or "").upper()
+        if tool_name not in {"QUERY_TREDS", "CHECK_COMPLIANCE", "RUN_CASHFLOW_SIM"}:
+            return _build_liquidity_escape_action(observation, task_name, round_number, last_valid_proposal)
+        out["tool_name"] = tool_name
+        if tool_name == "QUERY_TREDS":
+            out["tool_args"] = {"invoice_id": str(active_deal_id), "deal_id": str(active_deal_id)}
+        elif tool_name == "CHECK_COMPLIANCE":
+            out["tool_args"] = {"contract_id": str(active_deal_id), "deal_id": str(active_deal_id)}
+        else:
+            out["tool_args"] = {"plan": {"advance_periods": 1}, "horizon": 1, "deal_id": str(active_deal_id)}
+        out["deal_id"] = str(active_deal_id)
+        out["reason"] = _annotate_reason(out.get("reason"), "Tool call normalized for the liquidity workflow.")
+        return out
+
+    if out["action_type"] == "simulate_plan":
+        out["deal_id"] = str(active_deal_id)
+        if not isinstance(out.get("simulation_plan"), dict):
+            out["simulation_plan"] = {"advance_periods": 1}
+        if out.get("simulation_horizon") is None:
+            out["simulation_horizon"] = 1
+        out["reason"] = _annotate_reason(out.get("reason"), "Read-only plan simulation before further negotiation.")
+        return out
+
+    if out["action_type"] == "advance_period":
+        return {"action_type": "advance_period", "reason": "No open deals remain in this macro period."}
+
+    out = _normalize_stage1_proposal(out, observation, task_name, round_number, last_valid_proposal)
+    out["deal_id"] = str(active_deal_id)
+    return out
+
+
+def _apply_liquidity_task_contract_pass(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    task_name: str,
+) -> Dict[str, Any]:
+    out = dict(action_payload)
+    action_type = str(out.get("action_type", "propose") or "propose").lower()
+    if action_type in {"propose", "accept"}:
+        return _enforce_task_contract_fields(out, observation, task_name)
+    if action_type in {"tool", "simulate_plan", "advance_period"}:
+        out.pop("price", None)
+        out.pop("payment_days", None)
+        out.pop("use_treds", None)
+        out.pop("propose_late_payment_penalty_clause", None)
+        out.pop("propose_dynamic_discounting", None)
+        out.pop("dynamic_discount_annual_rate", None)
+    return out
+
+
+def _apply_liquidity_close_or_escape_rewrite(
+    action_payload: Dict[str, Any],
+    observation: Dict[str, Any],
+    history: List[dict],
+    task_name: str,
+    round_number: int,
+    last_valid_proposal: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    if str(action_payload.get("action_type", "")).lower() == "advance_period":
+        return {"action_type": "advance_period", "reason": "No open deals remain in this macro period."}
+
+    previous_action = _parse_last_assistant_action(history)
+    remaining = _remaining_rounds(observation, round_number)
+    closeable = last_valid_proposal is not None and _should_close_deal(observation, task_name, round_number, last_valid_proposal)
+
+    if closeable and remaining <= _late_close_window(task_name):
+        accepted = _build_accept_from_last_proposal(last_valid_proposal, observation, task_name)
+        accepted["deal_id"] = str(observation.get("active_deal_id") or accepted.get("deal_id") or "")
+        return accepted
+
+    if str(action_payload.get("action_type", "")).lower() == "propose":
+        if _detect_repetition(history, window=3) or _same_action_shape(action_payload, previous_action):
+            return _build_liquidity_escape_action(observation, task_name, round_number, last_valid_proposal)
+        if remaining <= _late_close_window(task_name) and not closeable:
+            return _build_liquidity_escape_action(observation, task_name, round_number, last_valid_proposal)
+
+    return action_payload
 
 
 def _build_liquidity_heuristic_action(
@@ -884,111 +1132,22 @@ def _normalize_liquidity_action_payload(
 ) -> Dict[str, Any]:
     if _should_auto_advance_liquidity_period(observation, done=bool(observation.get("done", False))):
         return {"action_type": "advance_period", "reason": "No open deals remain in this macro period."}
-
-    open_deal_ids = list(observation.get("open_deal_ids") or [])
-    active_deal_id = observation.get("active_deal_id") or (open_deal_ids[0] if open_deal_ids else None)
-    buyer_days = int(observation.get("buyer_days", 0) or 0)
-    liquidity = int(observation.get("liquidity_threshold", 0) or 0)
-    buyer_price = float(observation.get("buyer_price", 0.0) or 0.0)
-    cost = float(observation.get("cost_threshold", 0.0) or 0.0)
-    previous_action = _parse_last_assistant_action(history)
-
-    out = dict(action_payload)
-    out["action_type"] = str(out.get("action_type", "propose")).lower()
-    if active_deal_id and out["action_type"] not in {"advance_period"}:
-        out["deal_id"] = str(out.get("deal_id") or active_deal_id)
-
-    if out["action_type"] == "reject" and not _explicit_surrender_requested(out.get("reason")):
-        proposal = _normalize_stage1_proposal(
-            {
-                "action_type": "propose",
-                "deal_id": str(active_deal_id),
-                "price": float(out.get("price", buyer_price) or buyer_price),
-                "payment_days": int(out.get("payment_days", max(liquidity, buyer_days - 6)) or max(liquidity, buyer_days - 6)),
-                "use_treds": bool(out.get("use_treds", buyer_days > liquidity + 10)),
-                "reason": _annotate_reason(out.get("reason"), "Reject suppressed: convert to a counter-offer instead of ending the episode."),
-            },
-            observation,
-            task_name,
-            round_number,
-            last_valid_proposal,
-        )
-        proposal["deal_id"] = str(active_deal_id)
-        out = proposal
-
-    if out["action_type"] == "accept":
-        if last_valid_proposal is not None and (
-            _action_matches_last_proposal(out, last_valid_proposal)
-            or _should_close_deal(observation, task_name, round_number, last_valid_proposal)
-        ):
-            out = _build_accept_from_last_proposal(last_valid_proposal, observation, task_name)
-            out["deal_id"] = str(active_deal_id)
-            return out
-
-        acceptable_buyer_terms = (
-            _action_matches_observation_terms(out, observation)
-            and buyer_days <= liquidity
-            and buyer_price >= (cost + _task_margin(task_name))
-        )
-        if acceptable_buyer_terms:
-            out["deal_id"] = str(active_deal_id)
-            return _enforce_task_contract_fields(out, observation, task_name)
-
-        proposal = _normalize_stage1_proposal(
-            {
-                "action_type": "propose",
-                "deal_id": str(active_deal_id),
-                "price": float(out.get("price", buyer_price) or buyer_price),
-                "payment_days": int(last_valid_proposal.get("payment_days", buyer_days) if last_valid_proposal else buyer_days),
-                "use_treds": bool(out.get("use_treds", buyer_days > liquidity + 10)),
-                "reason": _annotate_reason(out.get("reason"), "Invalid accept downgraded to a counter-offer."),
-            },
-            observation,
-            task_name,
-            round_number,
-            last_valid_proposal,
-        )
-        proposal["deal_id"] = str(active_deal_id)
-        out = proposal
-
-    if out["action_type"] == "tool":
-        tool_name = str(out.get("tool_name", "") or "").upper()
-        if tool_name not in {"QUERY_TREDS", "CHECK_COMPLIANCE", "RUN_CASHFLOW_SIM"}:
-            return _build_liquidity_escape_action(observation, task_name, round_number, last_valid_proposal)
-        out["tool_name"] = tool_name
-        if tool_name == "QUERY_TREDS":
-            out["tool_args"] = {"invoice_id": str(active_deal_id), "deal_id": str(active_deal_id)}
-        elif tool_name == "CHECK_COMPLIANCE":
-            out["tool_args"] = {"contract_id": str(active_deal_id), "deal_id": str(active_deal_id)}
-        elif tool_name == "RUN_CASHFLOW_SIM":
-            out["tool_args"] = {
-                "plan": {"advance_periods": 1},
-                "horizon": 1,
-                "deal_id": str(active_deal_id),
-            }
-        out["deal_id"] = str(active_deal_id)
-        out["reason"] = _annotate_reason(out.get("reason"), "Tool call normalized for the liquidity workflow.")
-        return out
-
-    if out["action_type"] == "simulate_plan":
-        out["deal_id"] = str(active_deal_id)
-        if not isinstance(out.get("simulation_plan"), dict):
-            out["simulation_plan"] = {"advance_periods": 1}
-        if out.get("simulation_horizon") is None:
-            out["simulation_horizon"] = 1
-        out["reason"] = _annotate_reason(out.get("reason"), "Read-only plan simulation before further negotiation.")
-        return out
-
-    if out["action_type"] == "advance_period":
-        return {"action_type": "advance_period", "reason": "No open deals remain in this macro period."}
-
-    out = _normalize_stage1_proposal(out, observation, task_name, round_number, last_valid_proposal)
-    out["deal_id"] = str(active_deal_id)
-
-    if _detect_repetition(history, window=3) or _same_action_shape(out, previous_action):
-        return _build_liquidity_escape_action(observation, task_name, round_number, last_valid_proposal)
-
-    return out
+    raw_action = _normalize_liquidity_raw_action_payload(
+        action_payload,
+        observation,
+        task_name,
+        round_number,
+        last_valid_proposal,
+    )
+    task_contract_action = _apply_liquidity_task_contract_pass(raw_action, observation, task_name)
+    return _apply_liquidity_close_or_escape_rewrite(
+        task_contract_action,
+        observation,
+        history,
+        task_name,
+        round_number,
+        last_valid_proposal,
+    )
 
 
 def _should_auto_advance_liquidity_period(observation: Any, *, done: bool = False) -> bool:
@@ -1159,22 +1318,23 @@ def get_agent_action(observation: Dict[str, Any], history: List[dict], task_name
         return parsed.model_dump()
 
 
-def get_liquidity_agent_action(observation: Dict[str, Any], history: List[dict], task_name: str) -> NegotiationAction:
-    user_message = (
-        f"Task={task_name}\n"
-        f"Current liquidity observation:\n{format_liquidity_observation(observation)}\n"
-        "Return only JSON."
+def get_liquidity_agent_action(
+    observation: Dict[str, Any],
+    history: List[dict],
+    task_name: str,
+    history_summary: str = "",
+) -> NegotiationAction:
+    messages = _build_liquidity_router_messages(
+        history=history,
+        history_summary=history_summary,
+        task_name=task_name,
+        observation=observation,
     )
-
-    messages = [{"role": "system", "content": LIQUIDITY_SYSTEM_PROMPT}] + history + [
-        {"role": "user", "content": user_message}
-    ]
-
     completion = client.chat.completions.create(
         model=MODEL_NAME,
         messages=messages,
         temperature=0.2,
-        max_tokens=220,
+        max_tokens=_inference_llm_max_tokens(),
     )
     content = completion.choices[0].message.content
     return parse_liquidity_action(str(content or ""), observation)
@@ -1191,6 +1351,105 @@ def _parse_last_assistant_action(history: List[dict]) -> Dict[str, Any] | None:
         except json.JSONDecodeError:
             return None
     return None
+
+
+def _trim_history_tail(history: List[dict]) -> List[dict]:
+    max_turn_pairs = _inference_history_max_turns()
+    max_chars = _inference_history_max_chars()
+    candidate = list(history[-(max_turn_pairs * 2) :])
+    trimmed: List[dict] = []
+    remaining_chars = max_chars
+    for message in reversed(candidate):
+        role = str(message.get("role", "user") or "user")
+        content = _strict_clip_text(message.get("content", ""), min(max_chars, remaining_chars))
+        if not content:
+            continue
+        trimmed.append({"role": role, "content": content})
+        remaining_chars -= len(content)
+        if remaining_chars <= 0:
+            break
+    trimmed.reverse()
+    return trimmed
+
+
+def _roll_history_summary(existing_summary: str, line: str) -> str:
+    max_chars = _inference_history_summary_max_chars()
+    existing_lines = [item.strip() for item in existing_summary.splitlines() if item.strip()]
+    candidate_lines = existing_lines + [_strict_clip_text(line, 240)]
+    kept: List[str] = []
+    total_chars = 0
+    for item in reversed(candidate_lines):
+        item_len = len(item) + (1 if kept else 0)
+        if total_chars + item_len > max_chars:
+            continue
+        kept.append(item)
+        total_chars += item_len
+    kept.reverse()
+    return "\n".join(kept)
+
+
+def _update_liquidity_history_summary(
+    existing_summary: str,
+    *,
+    before_observation: Dict[str, Any],
+    after_observation: Dict[str, Any],
+    action_payload: Mapping[str, Any],
+) -> str:
+    before_active = before_observation.get("active_deal_id")
+    after_active = after_observation.get("active_deal_id")
+    before_period = int(before_observation.get("current_period", 0) or 0)
+    after_period = int(after_observation.get("current_period", before_period) or before_period)
+    before_resolved = set(str(item) for item in (before_observation.get("resolved_deal_ids") or []))
+    after_resolved = set(str(item) for item in (after_observation.get("resolved_deal_ids") or []))
+    resolved_now = sorted(after_resolved - before_resolved)
+    summary = existing_summary
+
+    for deal_id in resolved_now:
+        summary = _roll_history_summary(
+            summary,
+            (
+                f"Resolved {deal_id} via {str(action_payload.get('action_type', 'propose')).lower()} "
+                f"price={round(float(action_payload.get('price', 0.0) or 0.0), 2)} "
+                f"days={int(action_payload.get('payment_days', 0) or 0)}"
+            ),
+        )
+    if after_period > before_period:
+        summary = _roll_history_summary(
+            summary,
+            (
+                f"Advanced period {before_period}->{after_period}; resolved={len(after_resolved)} "
+                f"defaulted={int((after_observation.get('metadata') or {}).get('defaulted_sme_count', 0) or 0)}"
+            ),
+        )
+    elif before_active and after_active and before_active != after_active:
+        summary = _roll_history_summary(summary, f"Switched active deal {before_active}->{after_active}.")
+    return summary
+
+
+def _build_liquidity_router_messages(
+    *,
+    history: List[dict],
+    history_summary: str,
+    task_name: str,
+    observation: Dict[str, Any],
+) -> List[dict]:
+    user_message = (
+        f"Task={task_name}\n"
+        f"Current liquidity observation:\n{format_liquidity_observation(observation)}\n"
+        "Return only JSON."
+    )
+    messages: List[dict] = [{"role": "system", "content": LIQUIDITY_SYSTEM_PROMPT}]
+    if history_summary.strip():
+        messages.append(
+            {
+                "role": "system",
+                "content": "Rolling prior context summary:\n"
+                + _strict_clip_text(history_summary, _inference_history_summary_max_chars()),
+            }
+        )
+    messages.extend(_trim_history_tail(history))
+    messages.append({"role": "user", "content": user_message})
+    return messages
 
 
 def _hard_two_step_policy_enabled() -> bool:
@@ -1327,6 +1586,85 @@ def _print_liquidity_step_debug(observation: Any) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def _coerce_reward_breakdown_dict(value: Any) -> Optional[Dict[str, Any]]:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return dict(value)
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            coerced = to_dict()
+        except Exception:
+            return None
+        return dict(coerced) if isinstance(coerced, Mapping) else None
+    return None
+
+
+def _reward_breakdown_terminal_total(reward_breakdown: Mapping[str, Any]) -> Optional[float]:
+    keys = ("solvency", "liquidity", "npv", "compliance")
+    if all(key in reward_breakdown for key in keys):
+        return round(
+            0.35 * float(reward_breakdown.get("solvency", 0.0) or 0.0)
+            + 0.20 * float(reward_breakdown.get("liquidity", 0.0) or 0.0)
+            + 0.35 * float(reward_breakdown.get("npv", 0.0) or 0.0)
+            + 0.10 * float(reward_breakdown.get("compliance", 0.0) or 0.0),
+            6,
+        )
+    if "terminal_component" in reward_breakdown:
+        return float(reward_breakdown.get("terminal_component", 0.0) or 0.0)
+    return None
+
+
+def _extract_terminal_reward_breakdown(
+    env: Any,
+    final_metadata: Mapping[str, Any],
+    *,
+    canonical_total: float,
+) -> Optional[Dict[str, Any]]:
+    direct_value = _coerce_reward_breakdown_dict(getattr(env, "reward_breakdown", None))
+    fallback_value = _coerce_reward_breakdown_dict(final_metadata.get("reward_breakdown"))
+    for candidate in (direct_value, fallback_value):
+        if not candidate:
+            continue
+        terminal_total = _reward_breakdown_terminal_total(candidate)
+        if terminal_total is None:
+            continue
+        if abs(float(terminal_total) - float(canonical_total)) <= 1e-6:
+            candidate = dict(candidate)
+            candidate["total"] = float(canonical_total)
+            return candidate
+    return None
+
+
+def _build_canonical_reward_component_report(
+    episode_summary: Mapping[str, Any],
+    final_metadata: Mapping[str, Any],
+) -> Dict[str, Any]:
+    base_rl_reward = float(episode_summary.get("base_rl_reward", 0.0) or 0.0)
+    verifiable_reward = float(episode_summary.get("verifiable_reward", 0.0) or 0.0)
+    tool_bonus_total = float(episode_summary.get("tool_bonus_total", 0.0) or 0.0)
+    total_reward = float(episode_summary.get("total_reward", 0.0) or 0.0)
+    metadata_report = _coerce_reward_breakdown_dict(final_metadata.get("reward_component_report")) or {}
+    lambda_shaping = float(metadata_report.get("lambda_shaping", 0.1) or 0.1)
+    shaping_total = (
+        round((base_rl_reward - verifiable_reward) / lambda_shaping, 6)
+        if lambda_shaping > 0.0
+        else 0.0
+    )
+    report: Dict[str, Any] = {
+        "verifiable_reward": round(verifiable_reward, 6),
+        "shaping_total": shaping_total,
+        "tool_bonus": round(tool_bonus_total, 6),
+        "total_reward": round(total_reward, 6),
+        "success_no_default_positive_npv": bool(episode_summary.get("success_no_default_positive_npv", False)),
+        "lambda_shaping": lambda_shaping,
+    }
+    if "npv_delta_vs_baseline" in metadata_report:
+        report["npv_delta_vs_baseline"] = float(metadata_report.get("npv_delta_vs_baseline", 0.0) or 0.0)
+    return report
 
 
 def _print_liquidity_episode_summary(env: Any) -> dict[str, Any]:
@@ -1604,8 +1942,9 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
 
     task_name = _liquidity_task_for_difficulty(difficulty)
     history: List[dict] = []
+    history_summary = ""
     all_rewards: List[float] = []
-    last_valid_proposal: Dict[str, Any] | None = None
+    last_valid_proposal_by_deal: Dict[str, Dict[str, Any]] = {}
     result: Any = await env.reset(
         seed=seed,
         difficulty=difficulty.lower(),
@@ -1627,6 +1966,8 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         obs_dict = _observation_to_dict(observation)
         llm_error: Optional[str] = None
         previous_period = int(obs_dict.get("current_period", 0) or 0)
+        active_deal_id = str(obs_dict.get("active_deal_id") or "") or None
+        last_valid_proposal = last_valid_proposal_by_deal.get(active_deal_id) if active_deal_id else None
 
         if _should_auto_advance_liquidity_period(obs_dict, done=bool(result.done)):
             action_payload = _safe_liquidity_fallback_action(observation).model_dump()
@@ -1645,7 +1986,12 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
             )
         else:
             try:
-                action_payload = get_liquidity_agent_action(obs_dict, history, task_name).model_dump()
+                action_payload = get_liquidity_agent_action(
+                    obs_dict,
+                    history,
+                    task_name,
+                    history_summary,
+                ).model_dump()
             except Exception as e:
                 _maybe_print_hf_402_hint(e)
                 print(
@@ -1676,7 +2022,9 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         action = _to_model_action(action_payload, observation)
         action_json = _serialize_step_action(action)
         if action.action_type == "propose":
-            last_valid_proposal = action.model_dump()
+            proposal_deal_id = str(action.deal_id or active_deal_id or "")
+            if proposal_deal_id:
+                last_valid_proposal_by_deal[proposal_deal_id] = action.model_dump()
         result = await env.step(action)
         observation = result.observation
         reward = float(result.reward or 0.0)
@@ -1691,6 +2039,23 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         _print_liquidity_step_debug(observation)
         new_obs_dict = _observation_to_dict(observation)
         current_period = int(new_obs_dict.get("current_period", previous_period) or previous_period)
+        history_summary = _update_liquidity_history_summary(
+            history_summary,
+            before_observation=obs_dict,
+            after_observation=new_obs_dict,
+            action_payload=action.model_dump(),
+        )
+        resolved_after = set(str(item) for item in (new_obs_dict.get("resolved_deal_ids") or []))
+        for deal_id in list(last_valid_proposal_by_deal):
+            if deal_id in resolved_after:
+                last_valid_proposal_by_deal.pop(deal_id, None)
+        next_active_deal_id = str(new_obs_dict.get("active_deal_id") or "") or None
+        if current_period > previous_period:
+            last_valid_proposal_by_deal.clear()
+            history = []
+        elif active_deal_id and next_active_deal_id and next_active_deal_id != active_deal_id:
+            last_valid_proposal_by_deal.clear()
+            history = []
         if action.action_type == "advance_period" and current_period > previous_period:
             print(
                 _format_period_summary_line(
@@ -1710,7 +2075,13 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
             )
 
         history.append({"role": "user", "content": format_liquidity_observation(obs_dict)})
-        history.append({"role": "assistant", "content": action_json})
+        history.append(
+            {
+                "role": "assistant",
+                "content": json.dumps(action.model_dump(), ensure_ascii=True, separators=(",", ":")),
+            }
+        )
+        history = _trim_history_tail(history)
         round_number += 1
 
     final_score = _strict_unit_interval(float(result.reward or 0.0))
@@ -1720,9 +2091,20 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
     total_reward = sum(all_rewards)
     final_obs_dict = _observation_to_dict(observation) if observation is not None else {}
     final_metadata = final_obs_dict.get("metadata") or {}
-    reward_breakdown_line = _format_verifiable_reward_breakdown_line(
-        final_metadata.get("reward_breakdown")
+    canonical_verifiable_reward = float(episode_summary.get("verifiable_reward", 0.0) or 0.0)
+    reward_breakdown = _extract_terminal_reward_breakdown(
+        env,
+        final_metadata,
+        canonical_total=canonical_verifiable_reward,
     )
+    reward_breakdown_line = _format_verifiable_reward_breakdown_line(
+        reward_breakdown,
+        canonical_total=canonical_verifiable_reward,
+    )
+    reward_component_report = _build_canonical_reward_component_report(episode_summary, final_metadata)
+    episode_summary["reward_component_report"] = reward_component_report
+    episode_summary["shaping_total"] = float(reward_component_report.get("shaping_total", 0.0) or 0.0)
+    episode_summary["termination_reason"] = str(final_metadata.get("termination_reason", "") or "")
     # Compute rule-based persona judge score.
     judge_score_liq: Optional[float] = None
     try:
@@ -1733,11 +2115,10 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         judge_score_liq = max(persona_reward(p, _rubric_liq) for p in PERSONAS)
     except Exception:
         pass
-    if reward_breakdown_line:
-        print(reward_breakdown_line, flush=True)
+    print(reward_breakdown_line, flush=True)
     print(
         _format_terminal_reward_line(
-            verifiable_reward=float(episode_summary.get("verifiable_reward", 0.0) or 0.0),
+            verifiable_reward=canonical_verifiable_reward,
             final_score=final_score,
             success=success,
             source="liquidity_verifiable",
@@ -1772,6 +2153,8 @@ async def run_liquidity_episode(env: InProcessLiquidityBridge, difficulty: str, 
         "episode_log": episode_log,
         "final_observation": final_obs_dict,
         "termination_reason": str(final_metadata.get("termination_reason", "") or ""),
+        "defaulted_sme_count": int(final_metadata.get("defaulted_sme_count", 0) or 0),
+        "reward_component_report": reward_component_report,
     }
 
 
@@ -1787,6 +2170,14 @@ async def main() -> None:
     print(f"[CONFIG] INFERENCE_ENV_MODE={env_mode}", file=sys.stderr, flush=True)
     print(f"[CONFIG] INFERENCE_REWARD_MODE={_inference_reward_mode()}", file=sys.stderr, flush=True)
     print(f"[CONFIG] INFERENCE_AGENT_MODE={_inference_agent_mode()}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] INFERENCE_HISTORY_MAX_TURNS={_inference_history_max_turns()}", file=sys.stderr, flush=True)
+    print(f"[CONFIG] INFERENCE_HISTORY_MAX_CHARS={_inference_history_max_chars()}", file=sys.stderr, flush=True)
+    print(
+        f"[CONFIG] INFERENCE_HISTORY_SUMMARY_MAX_CHARS={_inference_history_summary_max_chars()}",
+        file=sys.stderr,
+        flush=True,
+    )
+    print(f"[CONFIG] INFERENCE_LLM_MAX_TOKENS={_inference_llm_max_tokens()}", file=sys.stderr, flush=True)
     print(f"[CONFIG] OPENENV_IN_PROCESS_REQUESTED={'1' if requested_in_process else '0'}", file=sys.stderr, flush=True)
     print(f"[CONFIG] OPENENV_IN_PROCESS_EFFECTIVE={'1' if effective_in_process else '0'}", file=sys.stderr, flush=True)
     if env_mode == "liquidity":
@@ -1836,6 +2227,10 @@ async def main() -> None:
             "inference_env_mode": env_mode,
             "inference_reward_mode": _inference_reward_mode(),
             "inference_agent_mode": _inference_agent_mode(),
+            "inference_history_max_turns": _inference_history_max_turns(),
+            "inference_history_max_chars": _inference_history_max_chars(),
+            "inference_history_summary_max_chars": _inference_history_summary_max_chars(),
+            "inference_llm_max_tokens": _inference_llm_max_tokens(),
         },
         "tasks": {},
     }

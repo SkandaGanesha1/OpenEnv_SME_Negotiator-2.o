@@ -143,6 +143,11 @@ def test_verifiable_reward_breakdown_line_formats_components() -> None:
     assert "total=0.6200" in line
 
 
+def test_verifiable_reward_breakdown_line_marks_unavailable_without_fake_zeroes() -> None:
+    line = inference._format_verifiable_reward_breakdown_line(None, canonical_total=0.7465)
+    assert line == "[VERIFIABLE_REWARD] total=0.7465 breakdown=unavailable"
+
+
 def test_ascii_sparkline_uses_ascii_only() -> None:
     sparkline = inference._ascii_sparkline([0.0, 0.5, 1.0])
     assert sparkline.isascii()
@@ -444,3 +449,30 @@ def test_run_liquidity_episode_logs_period_and_terminal_fields(monkeypatch, caps
     assert "step_reward_raw=0.4000" in captured
     assert "termination_reason=macro_horizon_end" in captured
     assert "defaulted_sme_count=1" in captured
+    assert "breakdown=unavailable" in captured
+
+
+def test_router_message_builder_bounds_history(monkeypatch) -> None:
+    monkeypatch.setenv("INFERENCE_HISTORY_MAX_TURNS", "2")
+    monkeypatch.setenv("INFERENCE_HISTORY_MAX_CHARS", "120")
+    monkeypatch.setenv("INFERENCE_HISTORY_SUMMARY_MAX_CHARS", "80")
+    history = [
+        {"role": "user", "content": "u1 " * 40},
+        {"role": "assistant", "content": '{"action_type":"propose","price":91.0,"payment_days":60}'},
+        {"role": "user", "content": "u2 " * 40},
+        {"role": "assistant", "content": '{"action_type":"propose","price":89.0,"payment_days":55}'},
+        {"role": "user", "content": "u3 " * 40},
+        {"role": "assistant", "content": '{"action_type":"tool","tool_name":"QUERY_TREDS"}'},
+    ]
+
+    messages = inference._build_liquidity_router_messages(
+        history=history,
+        history_summary="older summary " * 20,
+        task_name="liquidity-stress-medium",
+        observation={"buyer_price": 95.0, "buyer_days": 75, "liquidity_threshold": 45},
+    )
+
+    assert messages[0]["role"] == "system"
+    assert len(messages) <= 7
+    assert messages[1]["content"].startswith("Rolling prior context summary:\n")
+    assert len(messages[1]["content"].split("\n", 1)[1]) <= 80

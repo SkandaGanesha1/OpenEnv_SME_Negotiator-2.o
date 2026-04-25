@@ -141,6 +141,7 @@ def test_build_judge_pack_writes_required_artifacts(monkeypatch) -> None:
     assert Path(outputs["baseline_transcript_path"]).exists()
     assert Path(outputs["trained_transcript_path"]).exists()
     assert Path(outputs["reward_curve_path"]).exists()
+    assert Path(outputs["before_after_excerpt_path"]).exists()
 
     summary = json.loads(Path(outputs["judge_summary_path"]).read_text(encoding="utf-8"))
     assert summary["overall"]["default_rate"] == 0.5
@@ -150,3 +151,56 @@ def test_build_judge_pack_writes_required_artifacts(monkeypatch) -> None:
     judge_results = Path(outputs["judge_results_path"]).read_text(encoding="utf-8")
     assert "Before / After Snippet" in judge_results
     assert "Default rate: 0.5000" in judge_results
+
+
+def test_build_judge_pack_marks_baseline_only_when_no_checkpoint(monkeypatch) -> None:
+    tmp_path = _workspace_tmp_dir("judge_pack_baseline_only")
+    results = {
+        "metadata": {
+            "timestamp": "2026-04-25T00:00:00+00:00",
+            "inference_agent_mode": "router",
+        },
+        "tasks": {
+            "MEDIUM": {
+                "episodes": [
+                    {
+                        "final_score": 0.4,
+                        "total_reward": 0.45,
+                        "episode_log": "router-log",
+                        "episode_summary": {"verifiable_reward": 0.4},
+                    }
+                ],
+                "summary": {
+                    "mean_final_score": 0.4,
+                    "mean_total_reward": 0.45,
+                    "success_rate": 0.0,
+                    "avg_verifiable_reward": 0.4,
+                    "avg_final_payment_days": 55.0,
+                    "default_rate": 0.0,
+                    "timeout_or_stepcap_rate": 0.0,
+                    "avg_tool_call_count": 0.0,
+                    "avg_tool_effective_count": 0.0,
+                },
+            }
+        },
+        "summary": {
+            "overall_mean_score": 0.4,
+            "overall_mean_reward": 0.45,
+            "overall_success_rate": 0.0,
+        },
+    }
+    results_file = tmp_path / "inference_results.json"
+    results_file.write_text(json.dumps(results), encoding="utf-8")
+
+    monkeypatch.setattr(
+        "rl.judge_pack.run_heuristic_episode",
+        lambda **kwargs: {"transcript": "baseline transcript", "summary": {}},
+    )
+    monkeypatch.setattr("rl.judge_pack._write_reward_curve", lambda *args, **kwargs: "generated")
+
+    output_dir = tmp_path / "judge_pack"
+    outputs = build_judge_pack(results_file=str(results_file), output_dir=str(output_dir))
+
+    summary = json.loads(Path(outputs["judge_summary_path"]).read_text(encoding="utf-8"))
+    assert summary["metadata"]["comparison_mode"] == "baseline_only"
+    assert summary["metadata"]["generated_at"] == "2026-04-25T00:00:00+00:00"
