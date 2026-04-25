@@ -26,6 +26,7 @@ from rl.train_grpo_trl import (
     print_dry_run_summary,
 )
 from rl.reward_functions import make_all_reward_funcs
+from rl.train_grpo_trl import make_reward_function
 
 DEFAULT_UNSLOTH_MODEL = "unsloth/Qwen2.5-1.5B-Instruct-bnb-4bit"
 
@@ -144,11 +145,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     summary_buffer = EpisodeSummaryBuffer()
-    reward_funcs, reward_weights = make_all_reward_funcs(
+    # Use the hybrid reward function with completion-text variance to fix loss=0.
+    hybrid_reward_func = make_reward_function(
         rubric_scorer=rubric_scorer,
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
     )
+    reward_funcs = [hybrid_reward_func]
+    reward_weights = [1.0]
     callbacks = [
         build_metrics_callback(
             summary_buffer,

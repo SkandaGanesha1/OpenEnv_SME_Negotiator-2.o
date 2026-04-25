@@ -90,10 +90,10 @@ def make_outcome_reward(
                     episode_log = env.build_episode_log()
                     rubric_scores = rubric_scorer(episode_log)
                     persona = getattr(env, "current_persona", None)
-                    if persona is not None and hasattr(persona, "weights"):
+                    if persona is not None and hasattr(persona, "rubric_weights"):
                         overlay = sum(
                             float(rubric_scores.get(k, 0.0)) * float(v)
-                            for k, v in vars(persona.weights).items()
+                            for k, v in persona.rubric_weights.items()
                             if isinstance(v, (int, float))
                         )
                         final += rubric_weight * overlay
