@@ -154,6 +154,28 @@ def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> 
     assert rewards == [0.85, 0.85]
 
 
+def test_reward_function_completion_text_provides_per_group_variance() -> None:
+    """GRPO loss collapses to 0 when every completion in a group scores
+    identically. The reward function must therefore add a bounded text-derived
+    signal so distinct model outputs always produce distinct rewards even when
+    the deterministic env trajectory is constant across the group."""
+    reward_func = make_reward_function()
+    completions = [
+        "",
+        "I will think about it.",
+        '{"action_type":"propose","price":95.0,"payment_days":45,"reason":"close gap"}',
+        '{"action_type":"accept","deal_id":"d1","reason":"agreed"}',
+    ]
+    envs = [_DummyEnv() for _ in completions]
+    rewards = reward_func(envs, completions=completions)
+    assert len(rewards) == len(completions)
+    # All rewards must differ by more than floating noise so GRPO advantage > 0.
+    assert len(set(round(r, 4) for r in rewards)) >= 3
+    # Bounded: format contribution must not exceed 0.1 per the design.
+    base = max(rewards) - min(rewards)
+    assert 0.0 < base <= 0.11
+
+
 def test_snapshot_callback_registers_and_prunes_opponent_zoo() -> None:
     tmp_path = _workspace_tmp_dir("snapshot_callback")
     manager = OpponentPolicyManager(snapshots_dir=tmp_path / "snapshots", zoo_size=2)
