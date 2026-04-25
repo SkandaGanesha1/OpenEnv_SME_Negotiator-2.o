@@ -21,6 +21,7 @@ pinned: false
 |---|---|
 | HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator) |
 | GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb) |
+| Advanced GRPO notebook | [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb) |
 | Submission training dashboard | [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png) |
 | Submission policy comparison | [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png) |
 | Submission eval summary | [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json) |
@@ -650,6 +651,22 @@ Caption: Multi-panel training diagnostics from the real environment-connected GR
 
 Caption: Fixed-seed before/after comparison using the same task, horizon, and evaluation budget for the base model and the trained checkpoint.
 
+## Advanced Training Pipeline
+
+Advanced notebook: `notebooks/grpo_sme_liquidity.ipynb`
+
+Phases:
+- tiny TRL run
+- tiny Unsloth run
+- hacking inspection
+- curriculum-aware stabilization
+- larger TRL run
+- export + before/after demo
+
+Primary benchmark claim: the final reviewer-facing comparison is still `base pretrained model` vs `trained TRL checkpoint`, while the tiny Unsloth run acts as an early backend sanity check and hacking-inspection reference.
+
+Advanced artifacts are written under `outputs/grpo_sme_liquidity_advanced/`, including `run_manifest.json`, tiny-backend inspection JSON files, the main `training_dashboard.png`, and the final `policy_comparison.png`.
+
 Example before/after trajectory excerpt:
 
 ```text
@@ -976,5 +993,7 @@ MIT. See [LICENSE](LICENSE).
 - Submission policy comparison: [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png)
 - Submission eval summary: [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json)
 - Colab-style tiny demo: [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
+- Advanced phased notebook: [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb)
 - Notebook/demo helper layer: `rl/demo.py`
+- Advanced orchestrator: `rl/train_grpo_advanced.py`
 - Public manifest stays legacy-first and truthful: [openenv.yaml](openenv.yaml)

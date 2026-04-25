@@ -6,11 +6,19 @@ import base64
 import copy
 import inspect
 import json
+import re
+from collections import Counter
 from pathlib import Path
 from statistics import mean
 from typing import Any, Optional
 
-from rl.bridge import execute_action, format_observation, make_environment_factory
+from rl.bridge import (
+    SUPPORTED_ACTION_TYPES,
+    SUPPORTED_TOOL_NAMES,
+    execute_action,
+    format_observation,
+    make_environment_factory,
+)
 from rl.train_grpo_trl import (
     DEFAULT_MODEL_NAME,
     DEFAULT_PROMPT,
@@ -25,6 +33,7 @@ from rl.train_grpo_trl import (
     build_training_rows,
     configure_rollout_tokenizer,
     make_reward_function,
+    resolve_training_precision_kwargs,
 )
 from sme_negotiator_env.models import LiquidityObservation, NegotiationAction
 
@@ -66,6 +75,17 @@ _POLICY_COMPARISON_METRICS = (
 )
 _PLACEHOLDER_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4////fwAJ+wP9KobjigAAAABJRU5ErkJggg=="
+)
+_SUSPICIOUS_COMPLETION_PATTERNS = (
+    "globals(",
+    "__dict__",
+    "os.environ",
+    "sys.modules",
+    "subprocess",
+    "eval(",
+    "exec(",
+    "import os",
+    "import sys",
 )
 
 
@@ -239,6 +259,7 @@ def _policy_episode_result(
     summary: SummaryView,
     steps: int,
     policy: str,
+    completion_records: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     return {
         "seed": seed,
@@ -248,6 +269,7 @@ def _policy_episode_result(
         "done": bool(done),
         "transcript": "\n".join(transcript_lines),
         "summary": summary,
+        "completion_records": list(completion_records or []),
     }
 
 
@@ -334,6 +356,7 @@ def run_heuristic_episode(
         summary=summary,
         steps=max(0, len(transcript_lines) // 2),
         policy="heuristic",
+        completion_records=[],
     )
 
 
@@ -426,11 +449,7 @@ def demo_train_grpo(
         "gradient_checkpointing": True,
         "gradient_checkpointing_kwargs": {"use_reentrant": False},
     }
-    torch_dtype = _cuda_training_dtype()
-    if torch_dtype is not None:
-        dtype_name = str(torch_dtype)
-        grpo_kwargs["bf16"] = dtype_name == "torch.bfloat16"
-        grpo_kwargs["fp16"] = dtype_name == "torch.float16"
+    grpo_kwargs.update(resolve_training_precision_kwargs())
     valid_grpo_keys = set(inspect.signature(GRPOConfig.__init__).parameters) - {"self"}
     unsupported = sorted(key for key in grpo_kwargs if key not in valid_grpo_keys)
     if unsupported:
@@ -640,6 +659,7 @@ def run_policy_episode_report(
     messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
     messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
     transcript_lines = [f"RESET :: {format_observation(observation)}"]
+    completion_records: list[dict[str, Any]] = []
     executed_steps = 0
 
     for step_index in range(max_steps):
@@ -655,6 +675,15 @@ def run_policy_episode_report(
         )
         text = str(turn["text"])
         action, was_valid_json = _parse_action_and_validity(text, observation, strict_json=False)
+        completion_records.append(
+            {
+                "step": int(step_index + 1),
+                "valid_json": bool(was_valid_json),
+                "raw_text": text,
+                "action_type": str(getattr(action, "action_type", "") or ""),
+                "tool_name": str(getattr(action, "tool_name", "") or ""),
+            }
+        )
         transcript_lines.append(f"MODEL {step_index + 1} :: valid_json={str(was_valid_json).lower()} :: raw={text}")
         messages.append({"role": "assistant", "content": text})
         try:
@@ -682,6 +711,7 @@ def run_policy_episode_report(
         summary=summary,
         steps=executed_steps,
         policy=policy,
+        completion_records=completion_records,
     )
 
 
@@ -715,6 +745,253 @@ def _aggregate_policy_runs(runs: list[dict[str, Any]]) -> dict[str, float]:
             mean(1.0 if bool(summary["terminated_by_step_cap"]) else 0.0 for summary in summaries),
             6,
         ),
+    }
+
+
+def _slugify_artifact_label(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", str(label).strip().lower()).strip("_")
+    return slug or "artifact"
+
+
+def inspect_policy_reports(
+    reports: list[dict[str, Any]],
+    *,
+    policy_label: str,
+) -> dict[str, Any]:
+    """Inspect sampled policy generations for malformed or suspicious behavior."""
+    completion_records = [
+        dict(record)
+        for report in reports
+        for record in report.get("completion_records", [])
+        if isinstance(record, dict)
+    ]
+    completion_texts = [str(record.get("raw_text", "") or "").strip() for record in completion_records]
+    action_types = [str(record.get("action_type", "") or "").strip() for record in completion_records]
+    tool_names = [str(record.get("tool_name", "") or "").strip() for record in completion_records if record.get("tool_name")]
+    invalid_count = sum(1 for record in completion_records if not bool(record.get("valid_json", False)))
+    unsupported_action_count = sum(1 for action_type in action_types if action_type and action_type not in SUPPORTED_ACTION_TYPES)
+    unsupported_tool_count = sum(1 for tool_name in tool_names if tool_name not in SUPPORTED_TOOL_NAMES)
+    suspicious_hits = [
+        text
+        for text in completion_texts
+        if any(pattern in text.lower() for pattern in _SUSPICIOUS_COMPLETION_PATTERNS)
+    ]
+    duplicate_tool_abuse_count = sum(max(0, count - 1) for count in Counter(tool_names).values())
+    repeated_completion_fraction = 0.0
+    if completion_texts:
+        repeated_completion_fraction = round(
+            max(0.0, 1.0 - (len(set(completion_texts)) / float(len(completion_texts)))),
+            6,
+        )
+    warnings: list[str] = []
+    if invalid_count > 0:
+        warnings.append("Invalid JSON completions detected.")
+    if unsupported_action_count > 0:
+        warnings.append("Unsupported action schema drift detected.")
+    if unsupported_tool_count > 0:
+        warnings.append("Unsupported tool usage detected.")
+    if duplicate_tool_abuse_count > 0:
+        warnings.append("Repeated tool calls suggest possible tool abuse.")
+    if repeated_completion_fraction >= 0.5 and completion_texts:
+        warnings.append("Low completion diversity detected.")
+    if suspicious_hits:
+        warnings.append("Suspicious shortcut or environment-abuse patterns detected.")
+
+    return {
+        "policy_label": str(policy_label),
+        "episode_count": int(len(reports)),
+        "completion_count": int(len(completion_records)),
+        "invalid_parse_fraction": round(
+            float(invalid_count) / float(len(completion_records)) if completion_records else 0.0,
+            6,
+        ),
+        "repeated_completion_fraction": repeated_completion_fraction,
+        "unsupported_action_count": int(unsupported_action_count),
+        "unsupported_tool_count": int(unsupported_tool_count),
+        "duplicate_tool_abuse_count": int(duplicate_tool_abuse_count),
+        "suspicious_pattern_count": int(len(suspicious_hits)),
+        "suspicious_examples": suspicious_hits[:3],
+        "warnings": warnings,
+        "flagged": bool(warnings),
+    }
+
+
+def inspect_policy_checkpoint(
+    *,
+    output_dir: str,
+    policy_label: str,
+    seeds: list[int],
+    total_periods: int,
+    task_name: str,
+    difficulty: str,
+    policy: str = "trained",
+    checkpoint_path: Optional[str] = None,
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_steps: int = 20,
+) -> dict[str, Any]:
+    """Run fixed-seed inspection episodes and save a JSON inspection summary."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    reports = [
+        run_policy_episode_report(
+            policy=policy,
+            seed=seed,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            checkpoint_path=checkpoint_path,
+            model_name=model_name,
+            max_steps=max_steps,
+        )
+        for seed in seeds
+    ]
+    inspection = inspect_policy_reports(reports, policy_label=policy_label)
+    payload = {
+        "policy_label": str(policy_label),
+        "policy": str(policy),
+        "inspection": inspection,
+        "reports": reports,
+    }
+    inspection_path = output_path / f"{_slugify_artifact_label(policy_label)}_inspection.json"
+    inspection_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return {
+        "inspection": inspection,
+        "reports": reports,
+        "inspection_path": str(inspection_path.resolve()),
+    }
+
+
+def save_run_manifest(
+    manifest: dict[str, Any],
+    *,
+    output_dir: str,
+    filename: str = "run_manifest.json",
+) -> str:
+    """Persist a canonical manifest for notebook, README, or judge consumption."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_path / filename
+    manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    return str(manifest_path.resolve())
+
+
+def evaluate_policy_checkpoints(
+    *,
+    output_dir: str,
+    seeds: list[int],
+    total_periods: int,
+    task_name: str,
+    difficulty: str,
+    checkpoint_paths: dict[str, str],
+    model_name: str = DEFAULT_MODEL_NAME,
+    max_steps: int = 20,
+    include_base: bool = True,
+    include_heuristic: bool = False,
+    artifact_prefix: str = "checkpoint_policy",
+) -> dict[str, Any]:
+    """Evaluate multiple trained checkpoints on the same seed panel."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    runs_by_label: dict[str, list[dict[str, Any]]] = {}
+    transcript_paths: dict[str, str] = {}
+    if include_base:
+        runs_by_label["base"] = [
+            run_policy_episode_report(
+                policy="base",
+                seed=seed,
+                total_periods=total_periods,
+                task_name=task_name,
+                difficulty=difficulty,
+                model_name=model_name,
+                max_steps=max_steps,
+            )
+            for seed in seeds
+        ]
+    for label, checkpoint_path in checkpoint_paths.items():
+        runs_by_label[str(label)] = [
+            run_policy_episode_report(
+                policy="trained",
+                seed=seed,
+                total_periods=total_periods,
+                task_name=task_name,
+                difficulty=difficulty,
+                checkpoint_path=checkpoint_path,
+                model_name=model_name,
+                max_steps=max_steps,
+            )
+            for seed in seeds
+        ]
+    heuristic_reference = None
+    if include_heuristic:
+        heuristic_reference = run_policy_episode_report(
+            policy="heuristic",
+            seed=seeds[0] if seeds else 0,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            max_steps=max_steps,
+        )
+
+    comparison = {label: _aggregate_policy_runs(runs) for label, runs in runs_by_label.items()}
+
+    figure_path = output_path / f"{artifact_prefix}_comparison.png"
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_placeholder_png(figure_path)
+    else:
+        labels = list(comparison)
+        metric_names = [metric_name for metric_name, _, _ in _POLICY_COMPARISON_METRICS]
+        fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+        axes_flat = list(axes.flatten())
+        for axis, (metric_name, title, higher_is_better) in zip(axes_flat, _POLICY_COMPARISON_METRICS):
+            values = [comparison[label][metric_name] for label in labels]
+            axis.bar(labels, values, color=["#4C72B0", "#55A868", "#C44E52", "#8172B2"][: len(labels)])
+            axis.set_title(f"{title}{'' if higher_is_better else ' (lower is better)'}")
+            axis.set_ylabel(title)
+            axis.grid(True, axis="y", alpha=0.3)
+            axis.tick_params(axis="x", rotation=15)
+        fig.suptitle("Checkpoint Policy Comparison")
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+        fig.savefig(figure_path, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+
+    for label, runs in runs_by_label.items():
+        transcript_path = output_path / f"{_slugify_artifact_label(label)}_transcript.txt"
+        transcript_path.write_text(str(runs[0]["transcript"]) if runs else "", encoding="utf-8")
+        transcript_paths[label] = str(transcript_path.resolve())
+
+    heuristic_transcript_path = None
+    if heuristic_reference is not None:
+        heuristic_path = output_path / "heuristic_reference_transcript.txt"
+        heuristic_path.write_text(str(heuristic_reference["transcript"]), encoding="utf-8")
+        heuristic_transcript_path = str(heuristic_path.resolve())
+
+    summary = {
+        "metadata": {
+            "task_name": task_name,
+            "difficulty": difficulty,
+            "total_periods": int(total_periods),
+            "max_steps": int(max_steps),
+            "model_name": model_name,
+            "seeds": [int(seed) for seed in seeds],
+            "labels": list(comparison),
+        },
+        "policies": comparison,
+        "artifacts": {
+            "comparison_path": str(figure_path.resolve()),
+            "transcript_paths": transcript_paths,
+            "heuristic_transcript_path": heuristic_transcript_path,
+        },
+    }
+    summary_path = output_path / f"{artifact_prefix}_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {
+        "summary": summary,
+        "summary_path": str(summary_path.resolve()),
+        "comparison_path": str(figure_path.resolve()),
+        "heuristic_transcript": str(heuristic_reference["transcript"]) if heuristic_reference is not None else "",
     }
 
 

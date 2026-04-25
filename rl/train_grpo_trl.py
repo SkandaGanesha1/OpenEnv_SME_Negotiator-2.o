@@ -375,6 +375,28 @@ def _cuda_training_dtype() -> Any:
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
+def resolve_training_precision_kwargs() -> dict[str, bool]:
+    """Return explicit GRPO mixed-precision flags for the active hardware.
+
+    Some TRL / Transformers builds default to `bf16=True` on GPU-backed
+    TrainingArguments, which fails on Colab T4-class hardware. We set the
+    precision flags explicitly so notebook and CLI runs stay aligned.
+    """
+    try:
+        import torch
+    except ImportError:
+        return {}
+
+    if not torch.cuda.is_available():
+        return {}
+
+    use_bf16 = bool(torch.cuda.is_bf16_supported())
+    return {
+        "bf16": use_bf16,
+        "fp16": not use_bf16,
+    }
+
+
 def _require_peft_components() -> tuple[Any, Any]:
     try:
         from peft import LoraConfig, get_peft_model
@@ -1980,6 +2002,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
+    kwargs.update(resolve_training_precision_kwargs())
     if getattr(args, "max_steps", None) is not None:
         kwargs["max_steps"] = int(args.max_steps)
     if bool(args.use_vllm):
