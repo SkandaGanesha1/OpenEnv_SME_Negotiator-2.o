@@ -13,6 +13,7 @@ import importlib
 import inspect
 import json
 import os
+import re
 import sys
 import types
 from collections import Counter
@@ -1223,58 +1224,95 @@ def _resolve_training_components(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _install_mergekit_stub() -> None:
-    """Install a minimal mergekit shim for TRL builds that import it eagerly."""
-    if "mergekit" in sys.modules:
-        return
+def _install_optional_dependency_stub(module_name: str) -> bool:
+    """Install a minimal shim for optional TRL imports we do not use."""
+    if module_name == "mergekit":
+        if "mergekit" in sys.modules:
+            return True
 
-    mergekit_module = types.ModuleType("mergekit")
-    config_module = types.ModuleType("mergekit.config")
-    merge_module = types.ModuleType("mergekit.merge")
+        mergekit_module = types.ModuleType("mergekit")
+        config_module = types.ModuleType("mergekit.config")
+        merge_module = types.ModuleType("mergekit.merge")
 
-    class MergeConfiguration:  # pragma: no cover - compatibility shim only
-        pass
+        class MergeConfiguration:  # pragma: no cover - compatibility shim only
+            pass
 
-    class MergeOptions:  # pragma: no cover - compatibility shim only
-        pass
+        class MergeOptions:  # pragma: no cover - compatibility shim only
+            pass
 
-    def run_merge(*args: Any, **kwargs: Any) -> None:  # pragma: no cover - compatibility shim only
-        raise RuntimeError(
-            "mergekit compatibility stub was invoked. This training path does not support model merging."
-        )
+        def run_merge(*args: Any, **kwargs: Any) -> None:  # pragma: no cover - compatibility shim only
+            raise RuntimeError(
+                "mergekit compatibility stub was invoked. This training path does not support model merging."
+            )
 
-    config_module.MergeConfiguration = MergeConfiguration
-    merge_module.MergeOptions = MergeOptions
-    merge_module.run_merge = run_merge
-    mergekit_module.config = config_module
-    mergekit_module.merge = merge_module
+        config_module.MergeConfiguration = MergeConfiguration
+        merge_module.MergeOptions = MergeOptions
+        merge_module.run_merge = run_merge
+        mergekit_module.config = config_module
+        mergekit_module.merge = merge_module
 
-    sys.modules["mergekit"] = mergekit_module
-    sys.modules["mergekit.config"] = config_module
-    sys.modules["mergekit.merge"] = merge_module
+        sys.modules["mergekit"] = mergekit_module
+        sys.modules["mergekit.config"] = config_module
+        sys.modules["mergekit.merge"] = merge_module
+        return True
+
+    if module_name == "llm_blender":
+        if "llm_blender" not in sys.modules:
+            sys.modules["llm_blender"] = types.ModuleType("llm_blender")
+        return True
+
+    return False
+
+
+def _clear_trl_import_cache() -> None:
+    """Clear TRL submodules that may cache failed optional imports."""
+    for module_name in (
+        "trl.mergekit_utils",
+        "trl.trainer.callbacks",
+        "trl.trainer.judges",
+        "trl.trainer.grpo_trainer",
+    ):
+        sys.modules.pop(module_name, None)
+
+
+def _extract_missing_module_name(exc: Exception) -> Optional[str]:
+    """Extract the missing dependency name from an import exception."""
+    match = re.search(r"No module named '([^']+)'", str(exc))
+    if match is None:
+        return None
+    missing = str(match.group(1) or "").strip()
+    return missing.split(".", 1)[0] if missing else None
 
 
 def _import_trl_grpo_symbols() -> tuple[Any, Any]:
     """Import GRPOConfig and GRPOTrainer with a clearer dependency error."""
-    try:
-        from trl import GRPOConfig, GRPOTrainer
-    except Exception as exc:  # pragma: no cover - import path depends on installed TRL build
-        if "mergekit" in str(exc).lower():
-            _install_mergekit_stub()
-            sys.modules.pop("trl.mergekit_utils", None)
-            sys.modules.pop("trl.trainer.callbacks", None)
-            sys.modules.pop("trl.trainer.grpo_trainer", None)
-            try:
-                from trl import GRPOConfig, GRPOTrainer
-            except Exception as retry_exc:
-                raise ImportError(
-                    "TRL GRPO import failed because this TRL build eagerly imports mergekit. "
-                    "A compatibility stub was installed, but the import still failed. "
-                    "Restart the runtime and rerun the notebook install cell."
-                ) from retry_exc
+    last_exc: Optional[Exception] = None
+    for _ in range(4):
+        try:
+            from trl import GRPOConfig, GRPOTrainer
+        except Exception as exc:  # pragma: no cover - import path depends on installed TRL build
+            last_exc = exc
+            missing_module = _extract_missing_module_name(exc)
+            if missing_module and _install_optional_dependency_stub(missing_module):
+                _clear_trl_import_cache()
+                continue
+            raise
+        else:
             return GRPOConfig, GRPOTrainer
-        raise
-    return GRPOConfig, GRPOTrainer
+
+    if last_exc is not None:
+        missing_module = _extract_missing_module_name(last_exc)
+        if missing_module is not None:
+            raise ImportError(
+                "TRL GRPO import failed because this TRL build eagerly imports optional dependencies. "
+                f"A compatibility stub for '{missing_module}' was installed, but the import still failed. "
+                "Restart the runtime and rerun the notebook install cell."
+            ) from last_exc
+        raise ImportError(
+            "TRL GRPO import failed even after installing compatibility stubs for optional dependencies. "
+            "Restart the runtime and rerun the notebook install cell."
+        ) from last_exc
+    raise ImportError("TRL GRPO import failed for an unknown reason.")
 
 
 def build_training_session(args: argparse.Namespace) -> dict[str, Any]:

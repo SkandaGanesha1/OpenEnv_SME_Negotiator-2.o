@@ -730,17 +730,20 @@ def test_colab_notebook_baseline_handles_dict_or_attr_summary_shape() -> None:
     assert "run[\"summary\"].success_no_default_positive_npv" not in source
 
 
-def test_import_trl_grpo_symbols_installs_mergekit_stub_on_demand(monkeypatch) -> None:
+def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) -> None:
     import rl.train_grpo_trl as trl_script
     import builtins
 
     real_import = builtins.__import__
-    state = {"stub_visible": False}
+    state = {"stub_visible": False, "attempts": 0}
 
     def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name == "trl" and "GRPOConfig" in fromlist and "GRPOTrainer" in fromlist:
+            state["attempts"] += 1
             if "mergekit" not in sys.modules:
                 raise RuntimeError("No module named 'mergekit'")
+            if "llm_blender" not in sys.modules:
+                raise RuntimeError("No module named 'llm_blender'")
             state["stub_visible"] = True
             module = types.ModuleType("trl")
             module.GRPOConfig = type("GRPOConfig", (), {})
@@ -749,7 +752,7 @@ def test_import_trl_grpo_symbols_installs_mergekit_stub_on_demand(monkeypatch) -
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
-    for module_name in ("mergekit", "mergekit.config", "mergekit.merge"):
+    for module_name in ("mergekit", "mergekit.config", "mergekit.merge", "llm_blender"):
         sys.modules.pop(module_name, None)
 
     GRPOConfig, GRPOTrainer = trl_script._import_trl_grpo_symbols()
@@ -757,6 +760,7 @@ def test_import_trl_grpo_symbols_installs_mergekit_stub_on_demand(monkeypatch) -
     assert GRPOConfig.__name__ == "GRPOConfig"
     assert GRPOTrainer.__name__ == "GRPOTrainer"
     assert state["stub_visible"] is True
+    assert state["attempts"] >= 3
 
 
 def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
