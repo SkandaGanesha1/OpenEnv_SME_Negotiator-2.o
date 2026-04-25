@@ -8,27 +8,42 @@ Install with optional extras such as:
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
+import inspect
 import json
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from statistics import mean
+from statistics import mean, pstdev
 from typing import Any, Callable, Optional
 
-from rl.bridge import make_environment_factory
+from rl.bridge import (
+    build_action_contract_text,
+    execute_action,
+    format_observation,
+    make_environment_factory,
+    parse_action,
+)
 from rl.curriculum import CurriculumManager, DEFAULT_CURRICULUM_LEVELS
 from rl.episode_logging import EpisodeSummary, combine_rewards
 from rl.opponents import OpponentPolicyManager
-from rl.reward_functions import make_all_reward_funcs
 from rl.rubrics import persona_reward
 from rl.self_rewarding_dpo import build_preference_examples, write_preference_dataset
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-1.5B-Instruct"
+DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 DEFAULT_PROMPT = (
-    "You are an SME treasury agent operating a long-horizon liquidity workflow. "
-    "Use explicit tools when useful, negotiate responsibly across multiple deals, "
-    "advance macro periods when appropriate, and finish the episode without default."
+    "You are an SME treasury agent operating a deterministic long-horizon liquidity workflow. "
+    "Maximize the final verifiable reward, preserve positive NPV, use tools only when they improve the current state, "
+    "and finish the episode without default. "
+    + build_action_contract_text()
+)
+TRAINING_ROW_PREFIX = "[TRAINING_ROW]"
+ROLL_OUT_USER_TURN = (
+    "Current observation:\n{observation}\n\n"
+    "Choose the single best next action for this exact state. "
+    + build_action_contract_text()
 )
 
 
@@ -78,18 +93,50 @@ class EpisodeSummaryBuffer:
 
     items: list[EpisodeSummary] = field(default_factory=list)
     episode_logs: list[str] = field(default_factory=list)
+    diagnostics: list[dict[str, Any]] = field(default_factory=list)
 
-    def append(self, summary: EpisodeSummary, episode_log: Optional[str] = None) -> None:
+    def append(
+        self,
+        summary: EpisodeSummary,
+        episode_log: Optional[str] = None,
+        diagnostics: Optional[dict[str, Any]] = None,
+    ) -> None:
         self.items.append(summary)
         if episode_log is not None:
             self.episode_logs.append(episode_log)
+        if diagnostics is not None:
+            self.diagnostics.append(dict(diagnostics))
 
-    def drain(self) -> tuple[list[EpisodeSummary], list[str]]:
+    def drain(self) -> tuple[list[EpisodeSummary], list[str], list[dict[str, Any]]]:
         summaries = list(self.items)
         episode_logs = list(self.episode_logs)
+        diagnostics = list(self.diagnostics)
         self.items.clear()
         self.episode_logs.clear()
-        return summaries, episode_logs
+        self.diagnostics.clear()
+        return summaries, episode_logs, diagnostics
+
+
+def _build_training_prompt_content(
+    *,
+    prompt: str,
+    task_name: str,
+    difficulty: str,
+    seed: int,
+    total_periods: int,
+) -> str:
+    row_metadata = {
+        "task_name": str(task_name),
+        "difficulty": str(difficulty),
+        "seed": int(seed),
+        "total_periods": int(total_periods),
+    }
+    return "\n".join(
+        [
+            f"{TRAINING_ROW_PREFIX} {json.dumps(row_metadata, sort_keys=True, ensure_ascii=True)}",
+            str(prompt),
+        ]
+    )
 
 
 def build_training_rows(
@@ -102,16 +149,30 @@ def build_training_rows(
     seed_base: int = 1000,
 ) -> list[dict[str, Any]]:
     """Build deterministic conversational rows for GRPO/OpenEnv training."""
-    return [
-        {
-            "prompt": [{"role": "user", "content": prompt}],
-            "task_name": str(task_name),
-            "difficulty": str(difficulty),
-            "seed": int(seed_base) + index,
-            "total_periods": int(total_periods),
-        }
-        for index in range(int(num_samples))
-    ]
+    rows: list[dict[str, Any]] = []
+    for index in range(int(num_samples)):
+        seed = int(seed_base) + index
+        rows.append(
+            {
+                "prompt": [
+                    {
+                        "role": "user",
+                        "content": _build_training_prompt_content(
+                            prompt=prompt,
+                            task_name=task_name,
+                            difficulty=difficulty,
+                            seed=seed,
+                            total_periods=total_periods,
+                        ),
+                    }
+                ],
+                "task_name": str(task_name),
+                "difficulty": str(difficulty),
+                "seed": seed,
+                "total_periods": int(total_periods),
+            }
+        )
+    return rows
 
 
 def build_dataset(rows: list[dict[str, Any]]):
@@ -129,10 +190,131 @@ def configure_tokenizer(tokenizer: Any) -> Any:
     return tokenizer
 
 
+def _ensure_grpo_response_schema(tokenizer: Any) -> Any:
+    """Attach a response schema when TRL provides one."""
+    if getattr(tokenizer, "response_schema", None) is not None:
+        return tokenizer
+
+    try:
+        from trl.chat_template_utils import add_response_schema
+
+        return add_response_schema(tokenizer)
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from trl.chat_template_utils import qwen3_schema
+
+        tokenizer.response_schema = qwen3_schema
+    except (ImportError, AttributeError):
+        tokenizer.response_schema = {
+            "x-regex": r"^(?P<content>.*?)(?:<\|im_end\|>|$)",
+            "type": "object",
+            "properties": {
+                "role": {"const": "assistant"},
+                "content": {"type": "string"},
+            },
+        }
+    return tokenizer
+
+
+def configure_rollout_tokenizer(tokenizer: Any) -> Any:
+    """Apply tokenizer settings required for explicit multi-step rollouts."""
+    tokenizer = _ensure_grpo_response_schema(configure_tokenizer(tokenizer))
+    setattr(tokenizer, "training_chat_template", None)
+    try:
+        from trl.chat_template_utils import get_training_chat_template
+
+        chat_template = get_training_chat_template(tokenizer)
+        if chat_template is not None:
+            tokenizer.training_chat_template = chat_template
+    except (ImportError, AttributeError):
+        pass
+    return tokenizer
+
+
+def _cuda_training_dtype() -> Any:
+    """Return a safe dtype for CUDA training when torch is available."""
+    try:
+        import torch
+    except ImportError:
+        return None
+
+    if not torch.cuda.is_available():
+        return None
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _require_peft_components() -> tuple[Any, Any]:
+    try:
+        from peft import LoraConfig, get_peft_model
+    except ImportError as exc:
+        raise ImportError(
+            "peft is required for canonical GRPO training. Install optional RL extras with: pip install -e \".[rl]\""
+        ) from exc
+    return LoraConfig, get_peft_model
+
+
+def prepare_model_for_grpo(model: Any) -> Any:
+    """Apply canonical training settings and attach LoRA adapters."""
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+
+    if hasattr(model, "gradient_checkpointing_enable"):
+        try:
+            model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        except TypeError:
+            model.gradient_checkpointing_enable()
+    if hasattr(model, "enable_input_require_grads"):
+        model.enable_input_require_grads()
+
+    LoraConfig, get_peft_model = _require_peft_components()
+    model = get_peft_model(
+        model,
+        LoraConfig(
+            r=16,
+            lora_alpha=32,
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        ),
+    )
+    if hasattr(model, "print_trainable_parameters"):
+        model.print_trainable_parameters()
+    return model
+
+
+def load_training_model_and_tokenizer(model_name: str) -> tuple[Any, Any]:
+    """Load the canonical model/tokenizer pair for explicit rollout training."""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(model_name))
+    model_kwargs: dict[str, Any] = {"low_cpu_mem_usage": True}
+    torch_dtype = _cuda_training_dtype()
+    if torch_dtype is not None:
+        model_kwargs["dtype"] = torch_dtype
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    except TypeError:
+        model_kwargs.pop("low_cpu_mem_usage", None)
+        model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    return prepare_model_for_grpo(model), tokenizer
+
+
 def _default_fake_rubric_scorer(episode_log: str) -> dict[str, float]:
     # Replaced by rule-based scorer from self_rewarding_dpo; kept as thin wrapper
     # for backward compatibility with any callers that reference this symbol directly.
     from rl.self_rewarding_dpo import build_rule_based_rubric_scorer
+
     return build_rule_based_rubric_scorer()(episode_log)
 
 
@@ -172,6 +354,26 @@ def summarize_batch(summaries: list[EpisodeSummary]) -> dict[str, float]:
     }
 
 
+def summarize_rollout_diagnostics(diagnostics: list[dict[str, Any]]) -> dict[str, float]:
+    """Aggregate explicit rollout diagnostics for logging."""
+    if not diagnostics:
+        return {}
+    metrics: dict[str, float] = {}
+    numeric_keys = (
+        "reward_mean",
+        "reward_std",
+        "unique_completion_count",
+        "unique_action_count",
+        "invalid_parse_fraction",
+        "identical_terminal_fraction",
+    )
+    for key in numeric_keys:
+        values = [float(item.get(key, 0.0) or 0.0) for item in diagnostics if key in item]
+        if values:
+            metrics[f"rollout/{key}"] = mean(values)
+    return metrics
+
+
 def _coerce_completion_text(completion: Any) -> str:
     """Return a flat string for a TRL completion (chat list or raw string)."""
     if completion is None:
@@ -198,45 +400,26 @@ def _coerce_completion_text(completion: Any) -> str:
 
 
 def _completion_format_score(text: str) -> float:
-    """Bounded format-quality score in [0, 1] that reads the model output text.
-
-    This exists for one critical reason: GRPO normalizes rewards within each
-    generation group as ``(reward - mean) / std``. When every completion in a
-    group produces an identical environment trajectory (which happens before
-    the policy has learned to emit tool calls or structured actions), the
-    env-only verifiable reward is constant across the group, ``std == 0``,
-    advantage is clipped to 0, and TRL logs ``loss=0.000000`` for every step.
-
-    A small bounded score derived from the *completion text itself* gives
-    every group non-zero per-sample variance, so GRPO gradients are non-zero
-    even when the env trajectory hasn't responded yet. The contribution is
-    capped (max 0.1 of the total) so it cannot dominate or be hacked.
-    """
+    """Bounded format-quality score in [0, 1] that reads the model output text."""
     raw = (text or "").strip()
     if not raw:
         return 0.0
 
     score = 0.0
     lowered = raw.lower()
-
-    # Reward parseable JSON-shaped output (the action schema we want).
     if raw.startswith("{") and raw.rstrip().endswith("}"):
         score += 0.30
     if '"action_type"' in raw:
         score += 0.15
-    # Reward references to canonical action verbs.
-    for verb in ("propose", "accept", "reject", "advance_period", "tool"):
+    for verb in ("propose", "accept", "reject", "advance_period", "tool", "simulate_plan"):
         if verb in lowered:
             score += 0.05
             break
-    # Reward including the key negotiation levers.
-    for key in ("payment_days", "use_treds", "price"):
+    for key in ("payment_days", "use_treds", "price", "tool_name"):
         if key in lowered:
             score += 0.07
-    # Reward a non-trivial reasoning field.
     if '"reason"' in raw or "reason=" in lowered:
         score += 0.10
-    # Mild length shaping: prefer concise, non-empty outputs (50-600 chars).
     length = len(raw)
     if 50 <= length <= 600:
         score += 0.10
@@ -252,23 +435,75 @@ def make_reward_function(
     rubric_weight: float = 0.0,
     summary_buffer: Optional[EpisodeSummaryBuffer] = None,
 ) -> Callable[[list[Any]], list[float]]:
-    """Build the TRL reward function that reads deterministic env state.
-
-    The returned function is a hybrid of two signals:
-        verifiable (env-derived, deterministic) +
-        format_signal (text-derived, bounded, gives per-group variance).
-
-    The verifiable component dominates once the policy starts producing valid
-    tool calls; the format component guarantees a non-zero GRPO advantage
-    early in training so the policy gets gradient signal at all.
-    """
+    """Build the TRL reward function for both explicit rollouts and env wrappers."""
 
     def reward_func(
-        environments: list[Any],
+        inputs: list[Any],
         completions: Optional[list[Any]] = None,
+        episode_summaries: Optional[list[EpisodeSummary]] = None,
+        episode_logs: Optional[list[str]] = None,
+        raw_completion_texts: Optional[list[str]] = None,
+        env_reward_std: Optional[list[float]] = None,
+        reward_mean: Optional[list[float]] = None,
+        unique_action_count: Optional[list[float]] = None,
+        unique_completion_count: Optional[list[float]] = None,
+        invalid_parse_fraction: Optional[list[float]] = None,
+        identical_terminal_fraction: Optional[list[float]] = None,
+        termination_reasons: Optional[list[str]] = None,
         **kwargs: Any,
     ) -> list[float]:
         rewards: list[float] = []
+
+        if episode_summaries is not None:
+            texts = raw_completion_texts or [
+                _coerce_completion_text(completion) for completion in (completions or [None] * len(episode_summaries))
+            ]
+            logs = episode_logs or [""] * len(episode_summaries)
+            reward_std_values = env_reward_std or [0.0] * len(episode_summaries)
+            reward_mean_values = reward_mean or [0.0] * len(episode_summaries)
+            unique_action_values = unique_action_count or [0.0] * len(episode_summaries)
+            unique_completion_values = unique_completion_count or [0.0] * len(episode_summaries)
+            invalid_values = invalid_parse_fraction or [0.0] * len(episode_summaries)
+            identical_terminal_values = identical_terminal_fraction or [0.0] * len(episode_summaries)
+            termination_values = termination_reasons or [""] * len(episode_summaries)
+
+            for index, summary in enumerate(episode_summaries):
+                verifiable_reward = float(getattr(summary, "verifiable_reward", 0.0) or 0.0)
+                total_reward = float(getattr(summary, "total_reward", verifiable_reward) or verifiable_reward)
+                base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
+
+                if float(reward_std_values[index] or 0.0) <= 1e-8:
+                    base_reward += 0.01 * _completion_format_score(texts[index])
+
+                final_reward = base_reward
+                if rubric_scorer is not None and float(rubric_weight) > 0.0:
+                    rubric_scores = rubric_scorer(logs[index])
+                    if getattr(summary, "persona_name", None):
+                        final_reward = base_reward + float(rubric_weight) * mean(
+                            float(value) for value in rubric_scores.values()
+                        )
+                    else:
+                        final_reward = combine_rewards(base_reward, rubric_scores, rubric_weight)
+                rewards.append(round(final_reward, 6))
+
+                if summary_buffer is not None:
+                    summary_buffer.append(
+                        summary,
+                        logs[index],
+                        diagnostics={
+                            "reward_mean": float(reward_mean_values[index] or 0.0),
+                            "reward_std": float(reward_std_values[index] or 0.0),
+                            "unique_action_count": float(unique_action_values[index] or 0.0),
+                            "unique_completion_count": float(unique_completion_values[index] or 0.0),
+                            "invalid_parse_fraction": float(invalid_values[index] or 0.0),
+                            "identical_terminal_fraction": float(identical_terminal_values[index] or 0.0),
+                            "termination_reason": termination_values[index],
+                            "sample_completion": texts[index],
+                        },
+                    )
+            return rewards
+
+        environments = list(inputs)
         completions = completions or [None] * len(environments)
         for env, completion in zip(environments, completions):
             inner_env = getattr(env, "env", env)
@@ -278,6 +513,7 @@ def make_reward_function(
             if world_state is not None and trajectory:
                 try:
                     from sme_negotiator_env.graders import compute_verifiable_reward  # type: ignore[import]
+
                     verifiable = float(compute_verifiable_reward(world_state, trajectory))
                 except Exception:
                     verifiable = None
@@ -296,11 +532,8 @@ def make_reward_function(
                     pass
                 base_reward = verifiable + 0.1 * shaping_signal
 
-            # Completion-text variance signal — bounded so the verifiable
-            # reward is still the dominant policy signal once it lights up.
             completion_text = _coerce_completion_text(completion)
-            format_signal = _completion_format_score(completion_text)
-            base_reward = base_reward + 0.1 * format_signal
+            base_reward = base_reward + 0.1 * _completion_format_score(completion_text)
 
             final_reward = base_reward
             episode_log = env.build_episode_log()
@@ -348,7 +581,7 @@ def build_environment_factory(
     curriculum: Optional[CurriculumManager],
     opponent_manager: Optional[OpponentPolicyManager],
 ):
-    """Build a zero-arg TRL environment factory that reads live curriculum state."""
+    """Build a zero-arg in-process environment factory."""
 
     def environment_factory():
         if curriculum is not None:
@@ -381,6 +614,375 @@ def build_environment_factory(
     return environment_factory
 
 
+def _coerce_prompt_messages(prompt: Any) -> list[dict[str, str]]:
+    if isinstance(prompt, list):
+        messages: list[dict[str, str]] = []
+        for message in prompt:
+            if isinstance(message, dict):
+                messages.append(
+                    {
+                        "role": str(message.get("role", "user")),
+                        "content": str(message.get("content", "")),
+                    }
+                )
+            else:
+                messages.append({"role": "user", "content": str(message)})
+        return messages
+    return [{"role": "user", "content": str(prompt or "")}]
+
+
+def _extract_training_row_from_prompt(prompt: Any, fallback_args: Any) -> dict[str, Any]:
+    messages = _coerce_prompt_messages(prompt)
+    row = {
+        "prompt": messages,
+        "task_name": str(getattr(fallback_args, "task_name", "liquidity-correlation-hard")),
+        "difficulty": str(getattr(fallback_args, "difficulty", "hard")),
+        "seed": int(getattr(fallback_args, "seed_base", 1000)),
+        "total_periods": int(getattr(fallback_args, "total_periods", 3)),
+    }
+    for message in messages:
+        for line in str(message.get("content", "")).splitlines():
+            if not line.startswith(TRAINING_ROW_PREFIX):
+                continue
+            payload = json.loads(line[len(TRAINING_ROW_PREFIX) :].strip())
+            if isinstance(payload, dict):
+                row.update(payload)
+            return row
+    return row
+
+
+def _build_observation_message(observation_text: str) -> str:
+    return ROLL_OUT_USER_TURN.format(observation=observation_text)
+
+
+def _render_chat_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        training_chat_template = getattr(tokenizer, "training_chat_template", None)
+        if training_chat_template is not None:
+            kwargs["chat_template"] = training_chat_template
+        try:
+            return str(tokenizer.apply_chat_template(messages, chat_template_kwargs={"enable_thinking": False}, **kwargs))
+        except TypeError:
+            return str(tokenizer.apply_chat_template(messages, **kwargs))
+    return "\n".join(f"{message['role']}: {message['content']}" for message in messages)
+
+
+def _move_inputs_to_model_device(inputs: dict[str, Any], model: Any) -> dict[str, Any]:
+    device = getattr(model, "device", None)
+    if device is None:
+        return inputs
+    moved: dict[str, Any] = {}
+    for key, value in inputs.items():
+        if hasattr(value, "to"):
+            moved[key] = value.to(device)
+        else:
+            moved[key] = value
+    return moved
+
+
+def _filter_kwargs_for_callable(fn: Callable[..., Any], kwargs: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    params = inspect.signature(fn).parameters
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in params.values()):
+        return dict(kwargs), []
+    valid = set(params) - {"self"}
+    unsupported = sorted(key for key in kwargs if key not in valid)
+    return {key: value for key, value in kwargs.items() if key in valid}, unsupported
+
+
+def _token_ids_to_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if hasattr(value, "tolist"):
+        data = value.tolist()
+        if isinstance(data, list) and data and isinstance(data[0], list):
+            return [int(token) for token in data[0]]
+        if isinstance(data, list):
+            return [int(token) for token in data]
+    if isinstance(value, list):
+        if value and isinstance(value[0], list):
+            return [int(token) for token in value[0]]
+        return [int(token) for token in value]
+    return []
+
+
+def _compute_generated_logprobs(output_scores: Any, completion_ids: list[int]) -> list[float]:
+    if not output_scores or not completion_ids:
+        return []
+    try:
+        import torch
+    except ImportError:
+        return [0.0 for _ in completion_ids]
+
+    values: list[float] = []
+    for index, token_id in enumerate(completion_ids):
+        if index >= len(output_scores):
+            break
+        logits = output_scores[index]
+        if hasattr(logits, "dim") and int(logits.dim()) > 1:
+            logits = logits[0]
+        log_probs = torch.log_softmax(logits, dim=-1)
+        values.append(float(log_probs[int(token_id)].item()))
+    return values
+
+
+def _generate_completion_turn(
+    model: Any,
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> dict[str, Any]:
+    prompt_text = _render_chat_prompt(tokenizer, messages)
+    tokenized = tokenizer(prompt_text, return_tensors="pt")
+    tokenized = _move_inputs_to_model_device(tokenized, model)
+    prompt_ids = _token_ids_to_list(tokenized.get("input_ids"))
+    generate_kwargs = {
+        **tokenized,
+        "max_new_tokens": int(max_new_tokens),
+        "do_sample": True,
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "return_dict_in_generate": True,
+        "output_scores": True,
+    }
+    if getattr(tokenizer, "pad_token_id", None) is not None:
+        generate_kwargs["pad_token_id"] = int(tokenizer.pad_token_id)
+    if getattr(tokenizer, "eos_token_id", None) is not None:
+        generate_kwargs["eos_token_id"] = int(tokenizer.eos_token_id)
+
+    outputs = model.generate(**generate_kwargs)
+    sequence_ids = _token_ids_to_list(getattr(outputs, "sequences", None))
+    completion_ids = sequence_ids[len(prompt_ids) :] if len(sequence_ids) >= len(prompt_ids) else []
+    text = tokenizer.decode(completion_ids, skip_special_tokens=True) if completion_ids else ""
+    return {
+        "prompt_ids": prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs": _compute_generated_logprobs(getattr(outputs, "scores", None), completion_ids),
+        "text": str(text),
+    }
+
+
+def _parse_action_and_validity(raw_text: str, observation: Any) -> tuple[Any, bool]:
+    candidate = str(raw_text or "").strip()
+    is_json = False
+    if candidate.startswith("{") and candidate.rstrip().endswith("}"):
+        try:
+            parsed = json.loads(candidate)
+            is_json = isinstance(parsed, dict) and "action_type" in parsed
+        except json.JSONDecodeError:
+            is_json = False
+    return parse_action(candidate, observation), is_json
+
+
+def _run_single_rollout_sample(
+    prompt: Any,
+    *,
+    model: Any,
+    tokenizer: Any,
+    rollout_args: Any,
+    env_factory: Callable[[], Any],
+) -> dict[str, Any]:
+    row = _extract_training_row_from_prompt(prompt, rollout_args)
+    wrapper = env_factory()
+    reset_text = wrapper.reset(**row)
+    messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
+    messages.append({"role": "user", "content": _build_observation_message(reset_text)})
+
+    prompt_ids: list[int] = []
+    completion_ids: list[int] = []
+    logprobs: list[float] = []
+    raw_turn_texts: list[str] = []
+    parsed_actions: list[dict[str, Any]] = []
+    valid_json_steps = 0
+
+    max_episode_steps = int(getattr(rollout_args, "max_episode_steps", 24) or 24)
+    max_new_tokens = int(getattr(rollout_args, "max_completion_length", 256) or 256)
+    temperature = float(getattr(rollout_args, "temperature", 1.0) or 1.0)
+    top_p = float(getattr(rollout_args, "top_p", 1.0) or 1.0)
+
+    termination_reason = "rollout_step_cap"
+    for _ in range(max_episode_steps):
+        turn = _generate_completion_turn(
+            model,
+            tokenizer,
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+        prompt_ids.extend(list(turn["prompt_ids"]))
+        completion_ids.extend(list(turn["completion_ids"]))
+        logprobs.extend(list(turn["logprobs"]))
+        raw_text = str(turn["text"])
+        raw_turn_texts.append(raw_text)
+
+        observation = getattr(wrapper, "last_observation", None)
+        action, was_valid_json = _parse_action_and_validity(raw_text, observation)
+        if was_valid_json:
+            valid_json_steps += 1
+        parsed_actions.append(action.model_dump(exclude_none=True))
+
+        messages.append({"role": "assistant", "content": raw_text})
+        try:
+            execute_action(wrapper, action)
+        except Exception as exc:
+            termination_reason = f"action_error:{exc}"
+            break
+
+        latest_observation = getattr(wrapper, "last_observation", None)
+        if latest_observation is not None:
+            latest_metadata = latest_observation.metadata or {}
+            termination_reason = str(latest_metadata.get("termination_reason", termination_reason))
+        if bool(getattr(wrapper, "done", False)):
+            break
+        if latest_observation is None:
+            termination_reason = "missing_observation"
+            break
+        messages.append({"role": "user", "content": _build_observation_message(format_observation(latest_observation))})
+
+    summary = wrapper.summarize_episode()
+    episode_log = wrapper.build_episode_log()
+    last_observation = getattr(wrapper, "last_observation", None)
+    reward_breakdown = {}
+    if last_observation is not None:
+        reward_breakdown = dict((last_observation.metadata or {}).get("reward_breakdown", {}) or {})
+        metadata_reason = str((last_observation.metadata or {}).get("termination_reason", "") or "")
+        if metadata_reason:
+            termination_reason = metadata_reason
+
+    strict_json_fraction = valid_json_steps / max(1, len(raw_turn_texts))
+    return {
+        "prompt_ids": prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs": logprobs or [0.0 for _ in completion_ids],
+        "episode_summary": summary,
+        "episode_log": episode_log,
+        "reward_breakdown": reward_breakdown,
+        "termination_reason": termination_reason,
+        "parsed_actions": parsed_actions,
+        "raw_completion_text": "\n".join(raw_turn_texts),
+        "invalid_parse_fraction": round(1.0 - strict_json_fraction, 6),
+    }
+
+
+def _compute_group_rollout_diagnostics(samples: list[dict[str, Any]]) -> dict[str, float]:
+    if not samples:
+        return {
+            "reward_mean": 0.0,
+            "reward_std": 0.0,
+            "unique_completion_count": 0.0,
+            "unique_action_count": 0.0,
+            "invalid_parse_fraction": 0.0,
+            "identical_terminal_fraction": 0.0,
+        }
+    rewards = [float(sample["episode_summary"].verifiable_reward) for sample in samples]
+    completion_signatures = {str(sample["raw_completion_text"]) for sample in samples}
+    action_signatures = {
+        json.dumps(sample["parsed_actions"], sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+        for sample in samples
+    }
+    terminal_signatures = [
+        json.dumps(
+            {
+                "termination_reason": str(sample["termination_reason"]),
+                "verifiable_reward": round(float(sample["episode_summary"].verifiable_reward), 6),
+                "resolved_deal_count": int(sample["episode_summary"].resolved_deal_count),
+            },
+            sort_keys=True,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        for sample in samples
+    ]
+    modal_terminal_count = max(Counter(terminal_signatures).values()) if terminal_signatures else 0
+    return {
+        "reward_mean": round(mean(rewards), 6),
+        "reward_std": round(pstdev(rewards) if len(rewards) > 1 else 0.0, 6),
+        "unique_completion_count": float(len(completion_signatures)),
+        "unique_action_count": float(len(action_signatures)),
+        "invalid_parse_fraction": round(
+            mean(float(sample["invalid_parse_fraction"]) for sample in samples),
+            6,
+        ),
+        "identical_terminal_fraction": round(modal_terminal_count / max(1, len(samples)), 6),
+    }
+
+
+def build_rollout_func(
+    args: argparse.Namespace,
+    *,
+    tokenizer: Any,
+    curriculum: Optional[CurriculumManager],
+    opponent_manager: Optional[OpponentPolicyManager],
+) -> Callable[..., dict[str, Any]]:
+    """Build a TRL rollout_func for explicit environment stepping."""
+    env_factory = build_environment_factory(args, curriculum=curriculum, opponent_manager=opponent_manager)
+
+    def rollout_func(prompts: list[Any], *context: Any, **kwargs: Any) -> dict[str, Any]:
+        trainer = None
+        rollout_args: Any = args
+        processing_class = tokenizer
+        model = kwargs.get("model")
+
+        if context:
+            candidate = context[0]
+            if hasattr(candidate, "model") and hasattr(candidate, "args"):
+                trainer = candidate
+            else:
+                rollout_args = candidate
+                if len(context) > 1:
+                    processing_class = context[1]
+        if trainer is None:
+            trainer = kwargs.get("trainer")
+        if trainer is not None:
+            rollout_args = getattr(trainer, "args", rollout_args)
+            processing_class = getattr(trainer, "processing_class", processing_class)
+            model = getattr(trainer, "model", model)
+        if model is None:
+            raise ValueError("rollout_func could not resolve the active model.")
+
+        num_generations = int(getattr(rollout_args, "num_generations", 1) or 1)
+        samples: list[dict[str, Any]] = []
+        for prompt in prompts:
+            group = [
+                _run_single_rollout_sample(
+                    prompt,
+                    model=model,
+                    tokenizer=processing_class,
+                    rollout_args=rollout_args,
+                    env_factory=env_factory,
+                )
+                for _ in range(num_generations)
+            ]
+            group_metrics = _compute_group_rollout_diagnostics(group)
+            for sample in group:
+                sample.update(group_metrics)
+                samples.append(sample)
+
+        return {
+            "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
+            "completion_ids": [list(sample["completion_ids"]) for sample in samples],
+            "logprobs": [list(sample["logprobs"]) for sample in samples],
+            "episode_summaries": [sample["episode_summary"] for sample in samples],
+            "episode_logs": [sample["episode_log"] for sample in samples],
+            "reward_breakdowns": [sample["reward_breakdown"] for sample in samples],
+            "termination_reasons": [sample["termination_reason"] for sample in samples],
+            "parsed_actions": [sample["parsed_actions"] for sample in samples],
+            "raw_completion_texts": [sample["raw_completion_text"] for sample in samples],
+            "reward_mean": [float(sample["reward_mean"]) for sample in samples],
+            "env_reward_std": [float(sample["reward_std"]) for sample in samples],
+            "unique_action_count": [float(sample["unique_action_count"]) for sample in samples],
+            "unique_completion_count": [float(sample["unique_completion_count"]) for sample in samples],
+            "invalid_parse_fraction": [float(sample["invalid_parse_fraction"]) for sample in samples],
+            "identical_terminal_fraction": [float(sample["identical_terminal_fraction"]) for sample in samples],
+        }
+
+    return rollout_func
+
+
 def build_metrics_callback(
     summary_buffer: EpisodeSummaryBuffer,
     trainer_callback_base: type[Any],
@@ -390,19 +992,23 @@ def build_metrics_callback(
     scorer,
     output_dir: str,
 ):
-    """Create a TrainerCallback that logs rolling episode means and updates the curriculum."""
+    """Create a TrainerCallback that logs metrics and updates the curriculum."""
 
     class RollingEpisodeMetricsCallback(trainer_callback_base):
-        """Attach summarized episode metrics, curriculum promotion, and optional preference export."""
+        """Attach summarized episode metrics, diagnostics, and curriculum promotion."""
 
         def __init__(self) -> None:
             super().__init__()
             self.reward_curve: list[float] = []
             self.success_curve: list[float] = []
+            self.zero_variance_streak = 0
 
         def on_log(self, args, state, control, logs=None, **kwargs):  # type: ignore[override]
-            summaries, episode_logs = summary_buffer.drain()
-            if summaries and logs is not None:
+            summaries, episode_logs, diagnostics = summary_buffer.drain()
+            if logs is None:
+                return control
+
+            if summaries:
                 logs.update(summarize_batch(summaries))
                 if "episode/avg_total_reward" in logs:
                     self.reward_curve.append(float(logs["episode/avg_total_reward"]))
@@ -419,9 +1025,29 @@ def build_metrics_callback(
                         scorer,
                         seed=int(getattr(state, "global_step", 0) or 0) + 1000,
                     )
-                    output_path = Path(output_dir) / "preferences" / f"step_{int(getattr(state, 'global_step', 0)):06d}.jsonl"
+                    output_path = (
+                        Path(output_dir)
+                        / "preferences"
+                        / f"step_{int(getattr(state, 'global_step', 0)):06d}.jsonl"
+                    )
                     write_preference_dataset(output_path, examples)
                     logs["preferences/written"] = float(len(examples))
+
+            if diagnostics:
+                logs.update(summarize_rollout_diagnostics(diagnostics))
+                reward_std = float(logs.get("rollout/reward_std", 0.0) or 0.0)
+                if reward_std <= 1e-8:
+                    self.zero_variance_streak += 1
+                else:
+                    self.zero_variance_streak = 0
+                if self.zero_variance_streak >= 2:
+                    sample = diagnostics[0]
+                    print(
+                        "[TRAINING][WARN] rollout reward variance is zero for consecutive logs. "
+                        f"sample_completion={json.dumps(str(sample.get('sample_completion', '')))} "
+                        f"termination_reason={json.dumps(str(sample.get('termination_reason', '')))}",
+                        flush=True,
+                    )
             return control
 
         def on_train_end(self, args, state, control, **kwargs):  # type: ignore[override]
@@ -475,20 +1101,37 @@ def build_snapshot_callback(
 
 def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     """Translate CLI args into a GRPOConfig kwargs dictionary."""
+    per_device_train_batch_size = int(getattr(args, "per_device_train_batch_size", 1) or 1)
+    gradient_accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 4) or 4)
+    num_generations = int(getattr(args, "num_generations", 4) or 4)
+    generation_batch_size = int(getattr(args, "generation_batch_size", 0) or num_generations)
+    learning_rate = float(getattr(args, "learning_rate", 5e-6) or 5e-6)
+    temperature = float(getattr(args, "temperature", 1.0) or 1.0)
+    top_p = float(getattr(args, "top_p", 1.0) or 1.0)
+    max_prompt_length = int(getattr(args, "max_prompt_length", 1024) or 1024)
+    max_completion_length = int(getattr(args, "max_completion_length", 256) or 256)
+    logging_steps = int(getattr(args, "logging_steps", 1) or 1)
+    save_steps = int(getattr(args, "save_steps", 1000) or 1000)
     kwargs: dict[str, Any] = {
         "output_dir": args.output_dir,
         "remove_unused_columns": False,
-        "per_device_train_batch_size": 1,
-        "gradient_accumulation_steps": 4,
-        "num_generations": 4,
-        "learning_rate": 5e-6,
-        "max_prompt_length": 512,
-        "max_completion_length": 1536,
-        "logging_steps": 1,
-        "save_steps": 50,
+        "per_device_train_batch_size": per_device_train_batch_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "num_generations": num_generations,
+        "generation_batch_size": generation_batch_size,
+        "learning_rate": learning_rate,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_prompt_length": max_prompt_length,
+        "max_completion_length": max_completion_length,
+        "logging_steps": logging_steps,
+        "save_steps": save_steps,
+        "save_only_model": True,
         "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
+    if getattr(args, "max_steps", None) is not None:
+        kwargs["max_steps"] = int(args.max_steps)
     if bool(args.use_vllm):
         kwargs["vllm_mode"] = args.vllm_mode
     return kwargs
@@ -504,6 +1147,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-samples", type=int, default=64)
     parser.add_argument("--seed-base", type=int, default=1000)
     parser.add_argument("--output-dir", default="outputs/grpo_sme_liquidity_trl")
+    parser.add_argument("--per-device-train-batch-size", type=int, default=1)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
+    parser.add_argument("--num-generations", type=int, default=4)
+    parser.add_argument("--generation-batch-size", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=5e-6)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--max-prompt-length", type=int, default=1024)
+    parser.add_argument("--max-completion-length", type=int, default=256)
+    parser.add_argument("--logging-steps", type=int, default=1)
+    parser.add_argument("--save-steps", type=int, default=1000)
+    parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--use-vllm", action="store_true")
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
     parser.add_argument("--rubric-weight", type=float, default=0.0)
@@ -519,7 +1174,149 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persona-mode", choices=("off", "fixed", "per_episode"), default="off")
     parser.add_argument("--persona-name", default=None)
     parser.add_argument("--build-preference-dataset", action="store_true")
+    parser.add_argument("--max-episode-steps", type=int, default=24)
     return parser
+
+
+def make_training_args(**overrides: Any) -> argparse.Namespace:
+    """Return parser-backed training args with optional attribute overrides."""
+    parser = build_arg_parser()
+    args = parser.parse_args([])
+    valid_keys = {
+        action.dest
+        for action in parser._actions
+        if getattr(action, "dest", None) not in {None, "help"}
+    }
+    unknown = sorted(set(overrides) - valid_keys)
+    if unknown:
+        raise KeyError(f"Unknown training arg overrides: {unknown}")
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def _resolve_training_components(args: argparse.Namespace) -> dict[str, Any]:
+    """Resolve shared runtime components used by dry-runs and real training."""
+    curriculum = build_curriculum_manager_from_args(args)
+    opponent_manager = build_opponent_manager_from_args(args)
+    rubric_scorer = load_rubric_scorer(args.judge_scorer, enable_rubrics=args.enable_rubrics)
+    rows = build_training_rows(
+        task_name=args.task_name,
+        difficulty=args.difficulty,
+        total_periods=args.total_periods,
+        num_samples=args.num_samples,
+        seed_base=args.seed_base,
+    )
+    env_factory = build_environment_factory(
+        args,
+        curriculum=curriculum,
+        opponent_manager=opponent_manager,
+    )
+    return {
+        "curriculum": curriculum,
+        "opponent_manager": opponent_manager,
+        "rubric_scorer": rubric_scorer,
+        "rows": rows,
+        "env_factory": env_factory,
+    }
+
+
+def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the canonical explicit-rollout GRPO training bundle."""
+    components = _resolve_training_components(args)
+
+    from transformers import TrainerCallback
+    from trl import GRPOConfig, GRPOTrainer
+
+    dataset = build_dataset(components["rows"])
+    model, tokenizer = load_training_model_and_tokenizer(args.model_name)
+    summary_buffer = EpisodeSummaryBuffer()
+    reward_func = make_reward_function(
+        rubric_scorer=components["rubric_scorer"],
+        rubric_weight=args.rubric_weight,
+        summary_buffer=summary_buffer,
+    )
+    rollout_func = build_rollout_func(
+        args,
+        tokenizer=tokenizer,
+        curriculum=components["curriculum"],
+        opponent_manager=components["opponent_manager"],
+    )
+
+    grpo_kwargs = build_grpo_config_kwargs(args)
+    grpo_kwargs["reward_weights"] = [1.0]
+    grpo_kwargs["log_completions"] = True
+    config_kwargs, unsupported_config = _filter_kwargs_for_callable(GRPOConfig.__init__, grpo_kwargs)
+    if unsupported_config:
+        print(
+            f"[train_grpo_trl] Dropping unsupported GRPOConfig args for this TRL version: {unsupported_config}",
+            flush=True,
+        )
+    training_args = GRPOConfig(**config_kwargs)
+
+    try:
+        from rl.monitoring import RewardMonitorCallback
+
+        monitoring_cb = RewardMonitorCallback(
+            log_every_n_steps=10,
+            generation_sample_every_n_steps=50,
+        )
+    except ImportError:
+        monitoring_cb = None
+
+    callbacks = [
+        build_metrics_callback(
+            summary_buffer,
+            TrainerCallback,
+            curriculum=components["curriculum"],
+            build_preference_dataset=args.build_preference_dataset,
+            scorer=components["rubric_scorer"] or _default_fake_rubric_scorer,
+            output_dir=args.output_dir,
+        )
+    ]
+    if args.enable_self_play:
+        callbacks.append(
+            build_snapshot_callback(
+                TrainerCallback,
+                opponent_manager=components["opponent_manager"],
+                interval=args.snapshot_interval,
+                output_dir=args.output_dir,
+            )
+        )
+    if monitoring_cb is not None:
+        callbacks.append(monitoring_cb)
+
+    trainer_kwargs = {
+        "model": model,
+        "processing_class": tokenizer,
+        "reward_funcs": reward_func,
+        "train_dataset": dataset,
+        "args": training_args,
+        "rollout_func": rollout_func,
+        "callbacks": callbacks,
+    }
+    filtered_trainer_kwargs, unsupported_trainer = _filter_kwargs_for_callable(GRPOTrainer.__init__, trainer_kwargs)
+    if unsupported_trainer:
+        raise TypeError(
+            "Installed TRL version does not support the canonical explicit-rollout training path. "
+            f"Unsupported trainer args: {unsupported_trainer}"
+        )
+
+    final_checkpoint_path = Path(args.output_dir) / "final-grpo-model"
+    return {
+        **components,
+        "model": model,
+        "tokenizer": tokenizer,
+        "dataset": dataset,
+        "training_args": training_args,
+        "reward_funcs": reward_func,
+        "rollout_func": rollout_func,
+        "callbacks": callbacks,
+        "summary_buffer": summary_buffer,
+        "final_checkpoint_path": final_checkpoint_path,
+        "grpo_config_kwargs": config_kwargs,
+        "trainer_kwargs": filtered_trainer_kwargs,
+    }
 
 
 def print_dry_run_summary(
@@ -531,7 +1328,7 @@ def print_dry_run_summary(
     opponent_manager: Optional[OpponentPolicyManager],
     rubric_scorer,
 ) -> None:
-    """Print the resolved Stage 6 training configuration without loading a model."""
+    """Print the resolved training configuration without loading a model."""
     preview_wrapper = env_factory()
     preview_text = preview_wrapper.reset(**rows[0]) if rows else ""
     summary = {
@@ -546,6 +1343,10 @@ def print_dry_run_summary(
         "use_vllm": bool(args.use_vllm),
         "vllm_mode": args.vllm_mode,
         "grpo_config": build_grpo_config_kwargs(args),
+        "rollout": {
+            "max_episode_steps": int(getattr(args, "max_episode_steps", 24) or 24),
+            "strict_action_contract": build_action_contract_text(),
+        },
         "first_row": rows[0] if rows else None,
         "observation_preview": preview_text,
         "curriculum": {
@@ -574,103 +1375,32 @@ def main(argv: Optional[list[str]] = None) -> int:
     """Run GRPO training or print a dry-run summary."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-
-    curriculum = build_curriculum_manager_from_args(args)
-    opponent_manager = build_opponent_manager_from_args(args)
-    rubric_scorer = load_rubric_scorer(args.judge_scorer, enable_rubrics=args.enable_rubrics)
-    rows = build_training_rows(
-        task_name=args.task_name,
-        difficulty=args.difficulty,
-        total_periods=args.total_periods,
-        num_samples=args.num_samples,
-        seed_base=args.seed_base,
-    )
-    env_factory = build_environment_factory(
-        args,
-        curriculum=curriculum,
-        opponent_manager=opponent_manager,
-    )
+    components = _resolve_training_components(args)
 
     if args.dry_run:
         print_dry_run_summary(
             args,
-            rows,
-            env_factory,
-            curriculum=curriculum,
-            opponent_manager=opponent_manager,
-            rubric_scorer=rubric_scorer,
+            components["rows"],
+            components["env_factory"],
+            curriculum=components["curriculum"],
+            opponent_manager=components["opponent_manager"],
+            rubric_scorer=components["rubric_scorer"],
         )
         return 0
 
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
-    from trl import GRPOConfig, GRPOTrainer
+    from trl import GRPOTrainer
 
-    dataset = build_dataset(rows)
-    tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(args.model_name))
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
-    summary_buffer = EpisodeSummaryBuffer()
-
-    # Use the hybrid reward function that includes completion-text variance.
-    # This solves the loss=0.000 problem: when all completions in a GRPO group
-    # produce identical env trajectories, the text-derived format score gives
-    # non-zero per-sample variance so GRPO gradients are non-zero.
-    hybrid_reward_func = make_reward_function(
-        rubric_scorer=rubric_scorer,
-        rubric_weight=args.rubric_weight,
-        summary_buffer=summary_buffer,
-    )
-    reward_funcs = [hybrid_reward_func]
-    reward_weights = [1.0]
-
-    grpo_kwargs = build_grpo_config_kwargs(args)
-    grpo_kwargs["reward_weights"] = reward_weights
-    grpo_kwargs["log_completions"] = True   # enables generation inspection
-    training_args = GRPOConfig(**grpo_kwargs)
-
-    # Build monitoring callback (reward hacking detector + per-component logs)
-    try:
-        from rl.monitoring import RewardMonitorCallback
-        monitoring_cb = RewardMonitorCallback(
-            log_every_n_steps=10,
-            generation_sample_every_n_steps=50,
-        )
-    except ImportError:
-        monitoring_cb = None
-
-    callbacks = [
-        build_metrics_callback(
-            summary_buffer,
-            TrainerCallback,
-            curriculum=curriculum,
-            build_preference_dataset=args.build_preference_dataset,
-            scorer=rubric_scorer or _default_fake_rubric_scorer,
-            output_dir=args.output_dir,
-        )
-    ]
-    if args.enable_self_play:
-        callbacks.append(
-            build_snapshot_callback(
-                TrainerCallback,
-                opponent_manager=opponent_manager,
-                interval=args.snapshot_interval,
-                output_dir=args.output_dir,
-            )
-        )
-    if monitoring_cb is not None:
-        callbacks.append(monitoring_cb)
-
-    # Use the configured zero-arg environment factory so curriculum, persona,
-    # and self-play wiring from the CLI all reach the trainer.
-    trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=reward_funcs,
-        train_dataset=dataset,
-        args=training_args,
-        environment_factory=env_factory,
-        callbacks=callbacks,
-    )
+    session = build_training_session(args)
+    trainer = GRPOTrainer(**session["trainer_kwargs"])
     trainer.train()
+
+    checkpoint_path = Path(session["final_checkpoint_path"])
+    checkpoint_path.mkdir(parents=True, exist_ok=True)
+    if hasattr(trainer, "save_model"):
+        trainer.save_model(str(checkpoint_path))
+    tokenizer = session["tokenizer"]
+    if hasattr(tokenizer, "save_pretrained"):
+        tokenizer.save_pretrained(str(checkpoint_path))
     return 0
 
 

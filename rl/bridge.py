@@ -46,6 +46,34 @@ _DEFAULT_FACTORY_CONFIG: dict[str, Any] = {
     "lock_curriculum_config": False,
 }
 
+SUPPORTED_ACTION_TYPES: tuple[str, ...] = (
+    "propose",
+    "accept",
+    "reject",
+    "advance_period",
+    "tool",
+    "simulate_plan",
+)
+SUPPORTED_TOOL_NAMES: tuple[str, ...] = (
+    "QUERY_TREDS",
+    "CHECK_COMPLIANCE",
+    "RUN_CASHFLOW_SIM",
+)
+
+
+def build_action_contract_text() -> str:
+    """Return strict action-format instructions for training prompts."""
+    return (
+        "Output exactly one JSON object and nothing else. "
+        f"Valid action_type values: {', '.join(SUPPORTED_ACTION_TYPES)}. "
+        f"When action_type='tool', tool_name must be one of: {', '.join(SUPPORTED_TOOL_NAMES)}. "
+        "Always include action_type. "
+        "For propose/accept include price and payment_days. "
+        "For tool include tool_args. "
+        "For simulate_plan include simulation_plan and optional simulation_horizon. "
+        "Do not write markdown, prose, or multiple actions."
+    )
+
 
 def format_observation(observation: Any, *, role: str = "sme", persona: Optional[str] = None) -> str:
     """Return a prompt-friendly string for a liquidity observation."""
@@ -80,6 +108,74 @@ def parse_action(text: str, observation: Optional[Any] = None) -> NegotiationAct
         return action_payload_to_model_action(payload, observation)
 
     return conservative_default_action()
+
+
+def action_to_payload(action: NegotiationAction) -> dict[str, Any]:
+    """Return a JSON-serializable action payload."""
+    return action.model_dump(exclude_none=True)
+
+
+def execute_action(wrapper: Any, action: NegotiationAction) -> str:
+    """Dispatch a parsed action through the in-process wrapper."""
+    payload = action_to_payload(action)
+    action_type = str(payload.get("action_type", "propose")).lower()
+
+    if action_type == "propose":
+        return wrapper.propose(
+            price=float(payload.get("price", 0.0) or 0.0),
+            payment_days=int(payload.get("payment_days", 0) or 0),
+            use_treds=bool(payload.get("use_treds", False)),
+            deal_id=payload.get("deal_id"),
+            reason=payload.get("reason"),
+            propose_late_payment_penalty_clause=bool(payload.get("propose_late_payment_penalty_clause", False)),
+            propose_dynamic_discounting=bool(payload.get("propose_dynamic_discounting", False)),
+            dynamic_discount_annual_rate=float(payload.get("dynamic_discount_annual_rate", 0.0) or 0.0),
+        )
+
+    if action_type == "accept":
+        return wrapper.accept(
+            price=float(payload.get("price", 0.0) or 0.0),
+            payment_days=int(payload.get("payment_days", 0) or 0),
+            use_treds=bool(payload.get("use_treds", False)),
+            deal_id=payload.get("deal_id"),
+            reason=payload.get("reason"),
+            propose_late_payment_penalty_clause=bool(payload.get("propose_late_payment_penalty_clause", False)),
+            propose_dynamic_discounting=bool(payload.get("propose_dynamic_discounting", False)),
+            dynamic_discount_annual_rate=float(payload.get("dynamic_discount_annual_rate", 0.0) or 0.0),
+        )
+
+    if action_type == "reject":
+        return wrapper.reject(deal_id=payload.get("deal_id"), reason=payload.get("reason"))
+
+    if action_type == "advance_period":
+        return wrapper.advance_period()
+
+    if action_type == "simulate_plan":
+        return wrapper.simulate_plan(
+            plan=dict(payload.get("simulation_plan", {}) or {}),
+            horizon=payload.get("simulation_horizon"),
+            deal_id=payload.get("deal_id"),
+        )
+
+    if action_type != "tool":
+        raise ValueError(f"Unsupported action_type: {action_type!r}")
+
+    tool_name = str(payload.get("tool_name", "") or "")
+    tool_args = dict(payload.get("tool_args", {}) or {})
+    deal_id = payload.get("deal_id")
+    if tool_name == "QUERY_TREDS":
+        invoice_id = str(tool_args.get("invoice_id", deal_id or "default"))
+        return wrapper.query_treds(invoice_id=invoice_id, deal_id=deal_id)
+    if tool_name == "CHECK_COMPLIANCE":
+        contract_id = str(tool_args.get("contract_id", deal_id or "default"))
+        return wrapper.check_compliance(contract_id=contract_id, deal_id=deal_id)
+    if tool_name == "RUN_CASHFLOW_SIM":
+        return wrapper.run_cashflow_sim(
+            plan=dict(tool_args.get("plan", {}) or {}),
+            horizon=tool_args.get("horizon"),
+            deal_id=deal_id,
+        )
+    raise ValueError(f"Unsupported tool_name: {tool_name!r}")
 
 
 def _coerce_prompt_text(prompt: Any) -> str:
