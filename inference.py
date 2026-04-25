@@ -499,6 +499,14 @@ def _enforce_task_contract_fields(
     return out
 
 
+def _liquidity_terms_need_financing(action_payload: Dict[str, Any], observation: Dict[str, Any]) -> bool:
+    """Return True when accepted terms leave a receivable/payable timing gap."""
+
+    payment_days = int(action_payload.get("payment_days", observation.get("buyer_days", 0)) or 0)
+    supplier_days = int(observation.get("sme_supplier_payment_days", 0) or 0)
+    return supplier_days > 0 and payment_days > supplier_days
+
+
 def _normalize_stage1_proposal(
     action_payload: Dict[str, Any],
     observation: Dict[str, Any],
@@ -1026,7 +1034,10 @@ def _apply_liquidity_task_contract_pass(
     out = dict(action_payload)
     action_type = str(out.get("action_type", "propose") or "propose").lower()
     if action_type in {"propose", "accept"}:
-        return _enforce_task_contract_fields(out, observation, task_name)
+        out = _enforce_task_contract_fields(out, observation, task_name)
+        if _liquidity_terms_need_financing(out, observation):
+            out["use_treds"] = True
+        return out
     if action_type in {"tool", "simulate_plan", "advance_period"}:
         out.pop("price", None)
         out.pop("payment_days", None)

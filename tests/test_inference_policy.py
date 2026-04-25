@@ -206,6 +206,44 @@ def test_medium_contract_strips_dynamic_discount_fields() -> None:
     assert out["propose_late_payment_penalty_clause"] is True
 
 
+def test_liquidity_contract_keeps_treds_when_terms_exceed_supplier_pay_cycle() -> None:
+    observation = {
+        "active_deal_id": "deal-1",
+        "open_deal_ids": ["deal-1"],
+        "buyer_price": 84.0,
+        "buyer_days": 40,
+        "liquidity_threshold": 40,
+        "cost_threshold": 82.0,
+        "sme_supplier_payment_days": 25,
+        "metadata": {},
+    }
+
+    out = inference._normalize_liquidity_action_payload(
+        {
+            "action_type": "accept",
+            "deal_id": "deal-1",
+            "price": 84.0,
+            "payment_days": 40,
+            "use_treds": False,
+            "propose_late_payment_penalty_clause": True,
+        },
+        observation,
+        history=[],
+        task_name="liquidity-stress-medium",
+        round_number=8,
+        last_valid_proposal={
+            "action_type": "propose",
+            "price": 84.0,
+            "payment_days": 40,
+            "use_treds": False,
+            "propose_late_payment_penalty_clause": True,
+        },
+    )
+
+    assert out["action_type"] == "accept"
+    assert out["use_treds"] is True
+
+
 def test_compact_step_serialization_omits_irrelevant_tool_fields() -> None:
     action = inference.NegotiationAction(
         action_type="tool",
