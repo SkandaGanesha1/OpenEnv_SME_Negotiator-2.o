@@ -50,8 +50,14 @@ venv/
 ENV/
 env/
 .venv
+.venv*/
 env.bak/
 venv.bak/
+
+# Local binary artifacts (never commit)
+*.exe
+*.dll
+*.pyd
 
 # IDE
 .vscode/
