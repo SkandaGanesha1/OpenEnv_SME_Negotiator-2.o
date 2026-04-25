@@ -994,13 +994,8 @@ def _safe_liquidity_fallback_action(observation: Any) -> NegotiationAction:
     liquidity_threshold = int(obs_dict.get("liquidity_threshold", 0) or 0)
     buyer_price = float(obs_dict.get("buyer_price", 0.0) or 0.0)
 
-    metadata = obs_dict.get("metadata") or {}
-    last_tool_deal = str(metadata.get("last_tool_deal_id", "") or "")
-    tool_used_for_deal = (
-        obs_dict.get("last_tool_name") == "QUERY_TREDS"
-        and last_tool_deal == str(active_deal_id)
-    )
-    if not tool_used_for_deal and buyer_days > liquidity_threshold + 10:
+    last_tool_name = str(obs_dict.get("last_tool_name", "") or "")
+    if last_tool_name != "QUERY_TREDS" and buyer_days > liquidity_threshold + 10:
         return NegotiationAction(
             action_type="tool",
             deal_id=str(active_deal_id),
@@ -1099,14 +1094,10 @@ def _build_liquidity_escape_action(
             "reason": "No open deals remain in this macro period.",
         }
 
-    # Per-deal tool re-triggering: allow QUERY_TREDS once per active deal,
-    # not once globally. Check if the last tool was on a DIFFERENT deal.
-    last_tool_deal = str(metadata.get("last_tool_deal_id", "") or "")
-    tool_already_used_for_deal = (
-        observation.get("last_tool_name") == "QUERY_TREDS"
-        and last_tool_deal == str(active_deal_id)
-    )
-    if not tool_already_used_for_deal and buyer_days > liquidity + 10:
+    # Allow QUERY_TREDS once per escape cycle: the escape is triggered by
+    # repetition, so only re-trigger if we haven't JUST called QUERY_TREDS.
+    last_tool = str(observation.get("last_tool_name", "") or "")
+    if last_tool != "QUERY_TREDS" and buyer_days > liquidity + 10:
         return {
             "action_type": "tool",
             "deal_id": str(active_deal_id),
@@ -1115,10 +1106,8 @@ def _build_liquidity_escape_action(
             "reason": f"Inspect TReDS for deal {active_deal_id}: buyer_days={buyer_days} > threshold={liquidity}+10.",
         }
 
-    # CHECK_COMPLIANCE before accepting
-    last_compliance_deal = str(metadata.get("last_compliance_deal_id", "") or "")
-    compliance_checked = last_compliance_deal == str(active_deal_id)
-    if not compliance_checked and last_valid_proposal is not None and _should_close_deal(observation, task_name, round_number, last_valid_proposal):
+    # CHECK_COMPLIANCE before accepting (but not right after another tool)
+    if last_tool not in ("CHECK_COMPLIANCE", "QUERY_TREDS") and last_valid_proposal is not None and _should_close_deal(observation, task_name, round_number, last_valid_proposal):
         return {
             "action_type": "tool",
             "deal_id": str(active_deal_id),
@@ -1346,13 +1335,8 @@ def _build_liquidity_heuristic_action(
             "reason": "No deal: treasury policy avoids overtrading after financing capacity is mostly committed.",
         }
 
-    heuristic_metadata = observation.get("metadata") or {}
-    h_last_tool_deal = str(heuristic_metadata.get("last_tool_deal_id", "") or "")
-    h_tool_used = (
-        observation.get("last_tool_name") == "QUERY_TREDS"
-        and h_last_tool_deal == str(active_deal_id)
-    )
-    if not h_tool_used and buyer_days > liquidity + 10 and round_number <= 1:
+    h_last_tool = str(observation.get("last_tool_name", "") or "")
+    if h_last_tool != "QUERY_TREDS" and buyer_days > liquidity + 10 and round_number <= 1:
         return {
             "action_type": "tool",
             "deal_id": str(active_deal_id),
