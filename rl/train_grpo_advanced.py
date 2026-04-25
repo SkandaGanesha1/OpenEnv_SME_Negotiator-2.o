@@ -132,6 +132,7 @@ def build_advanced_run_plan(
             "root": str(root.resolve()),
             "tiny_trl": str((root / "tiny_trl").resolve()),
             "tiny_unsloth": str((root / "tiny_unsloth").resolve()),
+            "reward_log": str((root / "reward_log.json").resolve()),
             "reward_curve": str((root / "reward_curve.png").resolve()),
             "training_dashboard": str((root / "training_dashboard.png").resolve()),
             "policy_comparison": str((root / "policy_comparison.png").resolve()),
@@ -390,6 +391,7 @@ def run_advanced_pipeline(
         "tiny_comparison": tiny_comparison,
         "main_training": {
             "checkpoint_path": final_checkpoint_path,
+            "reward_log_path": main_dashboard["reward_log_path"],
             "training_dashboard_path": main_dashboard["training_dashboard_path"],
             "reward_curve_path": main_dashboard["reward_curve_path"],
             "inspection_path": final_inspection["inspection_path"],

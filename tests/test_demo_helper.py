@@ -13,7 +13,13 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import rl.demo as demo
-from rl.demo import evaluate_before_after_policies, run_heuristic_episode, run_policy_episode, save_training_dashboard
+from rl.demo import (
+    evaluate_before_after_policies,
+    plot_rewards,
+    run_heuristic_episode,
+    run_policy_episode,
+    save_training_dashboard,
+)
 
 
 def _normalize_transcript(text: str) -> str:
@@ -301,9 +307,29 @@ def test_save_training_dashboard_skips_empty_legends_and_saves_png() -> None:
     summary = save_training_dashboard(history, output_dir=str(tmp_path))
 
     assert Path(summary["training_dashboard_path"]).exists()
+    assert Path(summary["reward_curve_path"]).exists()
+    assert Path(summary["reward_log_path"]).exists()
     assert summary["metrics"]["episode/avg_total_reward"] == 0.4
     assert summary["metrics"]["rollout/reward_std"] is None
     assert summary["history_points"] == 2
+
+
+def test_plot_rewards_writes_png_from_saved_reward_log() -> None:
+    tmp_path = _workspace_tmp_dir("plot_rewards")
+    reward_log_path = tmp_path / "reward_log.json"
+    reward_log_path.write_text(
+        """
+[
+  {"step": 1, "episode/avg_total_reward": 0.1, "episode/success_rate": 0.0},
+  {"step": 2, "episode/avg_total_reward": 0.3, "episode/success_rate": 0.5}
+]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    figure_path = plot_rewards(reward_log_path, tmp_path / "reward_curve.png")
+
+    assert Path(figure_path).exists()
 
 
 def test_evaluate_before_after_policies_writes_summary_and_plot(monkeypatch) -> None:

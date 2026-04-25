@@ -202,6 +202,14 @@ def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> 
     assert rewards == [0.85, 0.85]
 
 
+def test_strict_json_payload_extracts_embedded_object_after_think_tags() -> None:
+    payload = _strict_json_payload(
+        '<think>Reason about the contract first</think> {"action_type":"propose","price":1000,"payment_days":30}'
+    )
+
+    assert payload == {"action_type": "propose", "price": 1000, "payment_days": 30}
+
+
 def test_reward_function_accepts_keyword_only_trl_call_shape() -> None:
     reward_func = make_reward_function()
 
@@ -632,6 +640,87 @@ def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -
 
     assert len(rewards) == 2
     assert all(isinstance(value, float) for value in rewards)
+
+
+def test_score_prompt_completion_via_environment_relaxes_non_json_but_executable_actions() -> None:
+    class _Obs:
+        def __init__(self, *, done: bool, reward: float, metadata: dict[str, object], buyer_days: int = 40) -> None:
+            self.done = done
+            self.reward = reward
+            self.metadata = metadata
+            self.active_deal_id = "deal-1"
+            self.open_deal_ids = ["deal-1"] if not done else []
+            self.buyer_price = 95.0
+            self.buyer_days = buyer_days
+            self.cost_threshold = 80.0
+            self.liquidity_threshold = 35
+            self.current_period = 0
+            self.total_periods = 1
+
+        def model_dump(self):
+            return {
+                "done": self.done,
+                "reward": self.reward,
+                "metadata": self.metadata,
+                "active_deal_id": self.active_deal_id,
+                "open_deal_ids": list(self.open_deal_ids),
+                "buyer_price": self.buyer_price,
+                "buyer_days": self.buyer_days,
+                "cost_threshold": self.cost_threshold,
+                "liquidity_threshold": self.liquidity_threshold,
+                "current_period": self.current_period,
+                "total_periods": self.total_periods,
+            }
+
+    class _Wrapper:
+        def __init__(self) -> None:
+            self.done = False
+            self.last_observation = _Obs(done=False, reward=0.0, metadata={})
+
+        def reset(self, **kwargs):
+            self.done = False
+            self.last_observation = _Obs(done=False, reward=0.0, metadata={})
+            return "obs-reset"
+
+        def propose(self, **kwargs):
+            self.done = True
+            self.last_observation = _Obs(
+                done=True,
+                reward=0.3,
+                metadata={"termination_reason": "episode_complete"},
+                buyer_days=int(kwargs.get("payment_days", 30)),
+            )
+            return "obs-propose"
+
+        def summarize_episode(self):
+            return EpisodeSummary(
+                episode_completed=True,
+                base_rl_reward=0.3,
+                verifiable_reward=0.3,
+                total_reward=0.3,
+                tool_bonus_total=0.0,
+                env_reward_total=0.3,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=30.0,
+                tool_usage_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+            )
+
+        def build_episode_log(self):
+            return "wrapper-log"
+
+    result = _score_prompt_completion_via_environment(
+        "prompt-a",
+        '{"action_type":"proposal","price":1000,"payment_days":30}',
+        fallback_args=make_training_args(),
+        env_factory=_Wrapper,
+    )
+
+    assert result["termination_reason"] == "prompt_env_relaxed_episode_complete"
+    assert result["invalid_parse_fraction"] == 1.0
+    assert result["episode_summary"].total_reward == 0.3
+    assert result["parsed_actions"][0]["action_type"] == "propose"
 
 
 def test_reward_function_penalizes_invalid_json_in_episode_payloads() -> None:

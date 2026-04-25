@@ -105,10 +105,12 @@ def test_advanced_notebook_contains_all_pipeline_phases_and_artifacts() -> None:
     assert 'RUN_PROFILE = "submission"' in source
     assert 'backend="trl"' in source
     assert 'backend="unsloth"' in source
+    assert "plot_rewards" in source
     assert "evaluate_policy_checkpoints" in source
     assert "decide_curriculum_adjustment" in source
     assert "evaluate_before_after_policies" in source
     assert "save_run_manifest" in source
     assert 'outputs/grpo_sme_liquidity_advanced' in source
     assert "Submission ready:" in source
+    assert "Unsloth tiny run is required" in source
 

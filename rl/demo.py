@@ -106,10 +106,16 @@ def _load_demo_model(model_cls: Any, model_name: str) -> Any:
     model_kwargs: dict[str, Any] = {"low_cpu_mem_usage": True}
     torch_dtype = _cuda_training_dtype()
     if torch_dtype is not None:
-        model_kwargs["torch_dtype"] = torch_dtype
+        model_kwargs["dtype"] = torch_dtype
     try:
         return model_cls.from_pretrained(model_name, **model_kwargs)
     except TypeError:
+        if "dtype" in model_kwargs:
+            model_kwargs["torch_dtype"] = model_kwargs.pop("dtype")
+            try:
+                return model_cls.from_pretrained(model_name, **model_kwargs)
+            except TypeError:
+                pass
         model_kwargs.pop("low_cpu_mem_usage", None)
         return model_cls.from_pretrained(model_name, **model_kwargs)
 
@@ -498,6 +504,69 @@ def _metric_series(history: list[dict[str, Any]], name: str) -> tuple[list[int],
     return steps, values
 
 
+def _write_reward_log(history: list[dict[str, Any]], *, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    return output_path
+
+
+def plot_rewards(reward_log_path: str | Path, output_path: str | Path) -> Path:
+    """Render reward and success curves from a saved trainer log history file."""
+    reward_log = Path(reward_log_path)
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        history = json.loads(reward_log.read_text(encoding="utf-8"))
+    except Exception:
+        _write_placeholder_png(destination)
+        return destination
+
+    if not isinstance(history, list):
+        _write_placeholder_png(destination)
+        return destination
+
+    reward_steps, reward_values = _metric_series(history, "episode/avg_total_reward")
+    if not reward_values:
+        reward_steps, reward_values = _metric_series(history, "episode/avg_base_rl_reward")
+    success_steps, success_values = _metric_series(history, "episode/success_rate")
+
+    if not reward_values and not success_values:
+        _write_placeholder_png(destination)
+        return destination
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_placeholder_png(destination)
+        return destination
+
+    fig, (ax_reward, ax_success) = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+
+    if reward_values:
+        ax_reward.plot(reward_steps, reward_values, label="avg_total_reward")
+        ax_reward.legend()
+    else:
+        ax_reward.text(0.5, 0.5, "No reward entries found.", ha="center", va="center", transform=ax_reward.transAxes)
+    ax_reward.set_ylabel("Reward")
+    ax_reward.grid(True, alpha=0.3)
+
+    if success_values:
+        ax_success.plot(success_steps, success_values, label="success_rate", color="green")
+        ax_success.legend()
+    else:
+        ax_success.text(0.5, 0.5, "No success-rate entries found.", ha="center", va="center", transform=ax_success.transAxes)
+    ax_success.set_ylabel("Success Rate")
+    ax_success.set_xlabel("Training step")
+    ax_success.grid(True, alpha=0.3)
+
+    fig.suptitle("SME Negotiator Reward Curve")
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.savefig(destination, dpi=140, bbox_inches="tight")
+    plt.close(fig)
+    return destination
+
+
 def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict[str, Any]:
     """Save a readable multi-metric dashboard for notebook and README use."""
     output_path = Path(output_dir)
@@ -541,6 +610,13 @@ def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict
         fig.savefig(figure_path, dpi=140, bbox_inches="tight")
         plt.close(fig)
 
+    reward_log_path = _write_reward_log(history, output_path=output_path / "reward_log.json")
+    reward_curve_path = output_path / "reward_curve.png"
+    try:
+        plot_rewards(reward_log_path, reward_curve_path)
+    except Exception:
+        _write_placeholder_png(reward_curve_path)
+
     zero_variance_streak = 0
     zero_variance_warning = False
     for entry in history:
@@ -555,7 +631,8 @@ def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict
 
     return {
         "training_dashboard_path": str(figure_path.resolve()),
-        "reward_curve_path": str((output_path / "reward_curve.png").resolve()),
+        "reward_curve_path": str(reward_curve_path.resolve()),
+        "reward_log_path": str(reward_log_path.resolve()),
         "metrics": metrics,
         "history_points": len(history),
         "zero_variance_warning": zero_variance_warning,

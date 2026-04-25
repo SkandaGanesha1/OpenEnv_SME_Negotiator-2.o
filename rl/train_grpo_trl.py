@@ -1436,10 +1436,44 @@ def _generate_completion_turn(
     }
 
 
+def _extract_embedded_json_object(raw_text: str) -> Optional[str]:
+    """Extract the first balanced JSON object from mixed model output."""
+    text = re.sub(r"<think>.*?</think>", " ", str(raw_text or ""), flags=re.DOTALL | re.IGNORECASE).strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return None
+
+
 def _strict_json_payload(raw_text: str) -> Optional[dict[str, Any]]:
     candidate = str(raw_text or "").strip()
     if not candidate.startswith("{") or not candidate.rstrip().endswith("}"):
-        return None
+        candidate = str(_extract_embedded_json_object(candidate) or "").strip()
+        if not candidate:
+            return None
     try:
         parsed = json.loads(candidate)
     except json.JSONDecodeError:
@@ -1562,14 +1596,33 @@ def _score_prompt_completion_via_environment(
     first_action, was_valid_json = _parse_action_and_validity(completion_text, first_observation, strict_json=True)
 
     if not was_valid_json:
+        relaxed_action, _ = _parse_action_and_validity(completion_text, first_observation, strict_json=False)
+        try:
+            execute_action(wrapper, relaxed_action)
+        except Exception:
+            return {
+                "episode_summary": _prompt_env_penalty_summary(reward=-0.4, invalid_action_count=1),
+                "episode_log": "Prompt-env fallback rejected an invalid first action before stepping the environment.",
+                "raw_completion_text": completion_text,
+                "termination_reason": "prompt_env_invalid_first_action",
+                "invalid_parse_fraction": 1.0,
+                "contract_score": round(first_contract_score, 6),
+                "parsed_actions": [],
+            }
+        final_reason = "prompt_env_relaxed_first_action"
+        final_observation = getattr(wrapper, "last_observation", None)
+        if final_observation is not None:
+            metadata_reason = str((final_observation.metadata or {}).get("termination_reason", "") or "")
+            if metadata_reason:
+                final_reason = f"prompt_env_relaxed_{metadata_reason}"
         return {
-            "episode_summary": _prompt_env_penalty_summary(reward=-0.4, invalid_action_count=1),
-            "episode_log": "Prompt-env fallback rejected an invalid first action before stepping the environment.",
+            "episode_summary": wrapper.summarize_episode(),
+            "episode_log": wrapper.build_episode_log(),
             "raw_completion_text": completion_text,
-            "termination_reason": "prompt_env_invalid_first_action",
+            "termination_reason": final_reason,
             "invalid_parse_fraction": 1.0,
             "contract_score": round(first_contract_score, 6),
-            "parsed_actions": [],
+            "parsed_actions": [relaxed_action.model_dump(exclude_none=True)],
         }
 
     termination_reason = "prompt_env_fallback"
@@ -2363,6 +2416,7 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
 
 def create_trainer(session: dict[str, Any]) -> Any:
     """Instantiate GRPOTrainer from a freshly built training session."""
+    os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
 
