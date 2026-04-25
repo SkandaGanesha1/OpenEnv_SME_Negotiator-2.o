@@ -1261,7 +1261,64 @@ def _install_optional_dependency_stub(module_name: str) -> bool:
             sys.modules["llm_blender"] = types.ModuleType("llm_blender")
         return True
 
-    return False
+    if module_name in {"weave", "comet_ml"}:
+        if module_name not in sys.modules:
+            stub_module = types.ModuleType(module_name)
+
+            class _OptionalDependencyProxy:  # pragma: no cover - compatibility shim only
+                def __init__(self, *args: Any, **kwargs: Any) -> None:
+                    self.args = args
+                    self.kwargs = kwargs
+
+                def __call__(self, *args: Any, **kwargs: Any):
+                    raise RuntimeError(
+                        f"Optional dependency stub '{module_name}' was invoked at runtime. "
+                        "This training path does not support that integration."
+                    )
+
+                def __getattr__(self, name: str):
+                    return _OptionalDependencyProxy()
+
+            def _module_getattr(name: str):
+                return _OptionalDependencyProxy
+
+            setattr(stub_module, "__getattr__", _module_getattr)
+            stub_module.__dict__.update(
+                {
+                    "EvaluationLogger": _OptionalDependencyProxy,
+                    "init": _OptionalDependencyProxy(),
+                    "log": _OptionalDependencyProxy(),
+                    "finish": _OptionalDependencyProxy(),
+                }
+            )
+            sys.modules[module_name] = stub_module
+        return True
+
+    if module_name and module_name not in sys.modules:
+        stub_module = types.ModuleType(module_name)
+
+        class _GenericOptionalProxy:  # pragma: no cover - compatibility shim only
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.args = args
+                self.kwargs = kwargs
+
+            def __call__(self, *args: Any, **kwargs: Any):
+                raise RuntimeError(
+                    f"Optional dependency stub '{module_name}' was invoked at runtime. "
+                    "This training path does not support that integration."
+                )
+
+            def __getattr__(self, name: str):
+                return _GenericOptionalProxy()
+
+        def _module_getattr(name: str):
+            return _GenericOptionalProxy
+
+        setattr(stub_module, "__getattr__", _module_getattr)
+        sys.modules[module_name] = stub_module
+        return True
+
+    return module_name in sys.modules
 
 
 def _clear_trl_import_cache() -> None:
@@ -1287,7 +1344,7 @@ def _extract_missing_module_name(exc: Exception) -> Optional[str]:
 def _import_trl_grpo_symbols() -> tuple[Any, Any]:
     """Import GRPOConfig and GRPOTrainer with a clearer dependency error."""
     last_exc: Optional[Exception] = None
-    for _ in range(4):
+    for _ in range(8):
         try:
             from trl import GRPOConfig, GRPOTrainer
         except Exception as exc:  # pragma: no cover - import path depends on installed TRL build

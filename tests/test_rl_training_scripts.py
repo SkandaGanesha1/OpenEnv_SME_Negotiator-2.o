@@ -744,6 +744,8 @@ def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) 
                 raise RuntimeError("No module named 'mergekit'")
             if "llm_blender" not in sys.modules:
                 raise RuntimeError("No module named 'llm_blender'")
+            if "weave" not in sys.modules:
+                raise RuntimeError("No module named 'weave'")
             state["stub_visible"] = True
             module = types.ModuleType("trl")
             module.GRPOConfig = type("GRPOConfig", (), {})
@@ -752,7 +754,7 @@ def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) 
         return real_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", _fake_import)
-    for module_name in ("mergekit", "mergekit.config", "mergekit.merge", "llm_blender"):
+    for module_name in ("mergekit", "mergekit.config", "mergekit.merge", "llm_blender", "weave"):
         sys.modules.pop(module_name, None)
 
     GRPOConfig, GRPOTrainer = trl_script._import_trl_grpo_symbols()
@@ -760,7 +762,7 @@ def test_import_trl_grpo_symbols_installs_optional_stubs_on_demand(monkeypatch) 
     assert GRPOConfig.__name__ == "GRPOConfig"
     assert GRPOTrainer.__name__ == "GRPOTrainer"
     assert state["stub_visible"] is True
-    assert state["attempts"] >= 3
+    assert state["attempts"] >= 4
 
 
 def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
