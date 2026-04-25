@@ -610,13 +610,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     model = AutoModelForCausalLM.from_pretrained(args.model_name)
     summary_buffer = EpisodeSummaryBuffer()
 
-    # Split reward functions: [outcome, format, process, anti_hack]
-    # Weights:               [1.0,     0.3,    0.2,     1.0]
-    reward_funcs, reward_weights = make_all_reward_funcs(
+    # Use the hybrid reward function that includes completion-text variance.
+    # This solves the loss=0.000 problem: when all completions in a GRPO group
+    # produce identical env trajectories, the text-derived format score gives
+    # non-zero per-sample variance so GRPO gradients are non-zero.
+    hybrid_reward_func = make_reward_function(
         rubric_scorer=rubric_scorer,
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
     )
+    reward_funcs = [hybrid_reward_func]
+    reward_weights = [1.0]
 
     grpo_kwargs = build_grpo_config_kwargs(args)
     grpo_kwargs["reward_weights"] = reward_weights
