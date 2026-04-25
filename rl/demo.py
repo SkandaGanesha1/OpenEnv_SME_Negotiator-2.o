@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 from pathlib import Path
 from typing import Any, Optional
 
-from rl.bridge import format_observation, make_environment_factory, parse_action
+from rl.bridge import execute_action, format_observation, make_environment_factory
 from rl.train_grpo_trl import (
     DEFAULT_MODEL_NAME,
     DEFAULT_PROMPT,
+    _build_observation_message,
+    _coerce_prompt_messages,
+    _generate_completion_turn,
+    _parse_action_and_validity,
     _training_log_backend,
     EpisodeSummaryBuffer,
     build_dataset,
     build_metrics_callback,
     build_training_rows,
-    configure_tokenizer,
+    configure_rollout_tokenizer,
     make_reward_function,
 )
 from sme_negotiator_env.models import LiquidityObservation, NegotiationAction
@@ -33,29 +38,6 @@ class SummaryView(dict[str, Any]):
             return self[name]
         except KeyError as exc:
             raise AttributeError(name) from exc
-
-
-def _ensure_grpo_response_schema(tokenizer: Any) -> Any:
-    """Set a tool-response schema for TRL versions that require one."""
-    if getattr(tokenizer, "response_schema", None) is not None:
-        return tokenizer
-
-    try:
-        from trl.chat_template_utils import qwen3_schema
-
-        tokenizer.response_schema = qwen3_schema
-    except (ImportError, AttributeError):
-        tokenizer.response_schema = {
-            "x-regex": r"^(?P<content>.*?)(?:<\|im_end\|>|$)",
-            "type": "object",
-            "properties": {
-                "role": {"const": "assistant"},
-                "content": {"type": "string"},
-            },
-        }
-    return tokenizer
-
-
 def _cuda_training_dtype() -> Any:
     """Return the lowest-risk CUDA dtype for Colab-class demo training."""
     try:
@@ -353,7 +335,7 @@ def demo_train_grpo(
     reward_func = make_reward_function(summary_buffer=summary_buffer)
     output_path = Path(output_dir)
 
-    tokenizer = _ensure_grpo_response_schema(configure_tokenizer(AutoTokenizer.from_pretrained(model_name)))
+    tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(model_name))
     model = _prepare_demo_model_for_training(
         _load_demo_model(AutoModelForCausalLM, model_name),
         use_lora=use_lora,
@@ -452,7 +434,7 @@ def run_policy_episode(
         raise ImportError("Running a trained policy requires transformers to be installed.") from exc
 
     checkpoint = Path(checkpoint_path)
-    tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(checkpoint_path))
+    tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(checkpoint_path))
     try:
         from peft import PeftConfig, PeftModel
     except ImportError:
@@ -470,26 +452,66 @@ def run_policy_episode(
             )
     if hasattr(model, "eval"):
         model.eval()
-    env = SMELiquidityEnvironment(total_periods=total_periods)
-    observation = env.reset(seed=seed, difficulty=difficulty, task_name=task_name)
+    rows = build_training_rows(
+        prompt=DEFAULT_PROMPT,
+        task_name=task_name,
+        difficulty=difficulty,
+        total_periods=total_periods,
+        num_samples=1,
+        seed_base=seed,
+    )
+    row = rows[0]
+    wrapper_cls = make_environment_factory(
+        task_name=task_name,
+        difficulty=difficulty,
+        total_periods=total_periods,
+        seed=seed,
+        prompt=row["prompt"],
+    )
+    wrapper = wrapper_cls()
+    wrapper.reset(
+        seed=seed,
+        difficulty=difficulty,
+        task_name=task_name,
+        total_periods=total_periods,
+        prompt=row["prompt"],
+    )
+    observation = wrapper.last_observation
+    assert observation is not None
+    messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
+    messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
     transcript_lines = [f"RESET :: {format_observation(observation)}"]
 
     for step_index in range(max_steps):
         if observation.done:
             break
-        prompt = format_observation(observation)
-        inputs = tokenizer(prompt, return_tensors="pt")
-        if hasattr(model, "device"):
-            inputs = {key: value.to(model.device) for key, value in inputs.items()}
-        outputs = model.generate(**inputs, max_new_tokens=160)
-        text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        action = parse_action(text, observation)
-        observation = env.step(action)
+        turn = _generate_completion_turn(
+            model,
+            tokenizer,
+            messages,
+            max_new_tokens=160,
+            temperature=0.0,
+            top_p=1.0,
+        )
+        text = str(turn["text"])
+        action, was_valid_json = _parse_action_and_validity(text, observation, strict_json=False)
+        transcript_lines.append(
+            f"MODEL {step_index + 1} :: valid_json={str(was_valid_json).lower()} :: raw={text}"
+        )
+        messages.append({"role": "assistant", "content": text})
+        try:
+            execute_action(wrapper, action)
+        except Exception as exc:
+            transcript_lines.append(f"ERROR {step_index + 1} :: action_error={exc}")
+            break
+        observation = wrapper.last_observation
+        assert observation is not None
         transcript_lines.append(
             f"STEP {step_index + 1} :: action[{_action_to_text(action)}] :: reward={float(observation.reward):.6f}"
         )
         transcript_lines.append(f"OBS {step_index + 1} :: {format_observation(observation)}")
         if observation.done:
             break
+        messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
 
     return "\n".join(transcript_lines)

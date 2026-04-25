@@ -35,6 +35,7 @@ from rl.episode_logging import EpisodeSummary, combine_rewards
 from rl.opponents import OpponentPolicyManager
 from rl.rubrics import persona_reward
 from rl.self_rewarding_dpo import build_preference_examples, write_preference_dataset
+from sme_negotiator_env.prompting import conservative_default_action
 
 DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
 DEFAULT_PROMPT = (
@@ -123,12 +124,18 @@ class EpisodeSummaryBuffer:
 
 @dataclass
 class PendingRolloutBuffer:
-    """FIFO buffer bridging rollout_func outputs into reward_func calls."""
+    """Bridge rollout_func outputs into reward_func calls using signatures first."""
 
     items: list[dict[str, Any]] = field(default_factory=list)
+    signature_queues: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     def extend(self, records: list[dict[str, Any]]) -> None:
-        self.items.extend(dict(record) for record in records)
+        for record in records:
+            stored = dict(record)
+            self.items.append(stored)
+            signature = _pending_rollout_record_signature(stored)
+            if signature is not None:
+                self.signature_queues.setdefault(signature, []).append(stored)
 
     def take(self, count: int) -> Optional[list[dict[str, Any]]]:
         if count <= 0:
@@ -137,7 +144,55 @@ class PendingRolloutBuffer:
             return None
         batch = self.items[:count]
         del self.items[:count]
+        for record in batch:
+            self._discard_signature_record(record)
         return batch
+
+    def take_by_signature(self, prompts: list[Any], completions: list[Any]) -> Optional[list[dict[str, Any]]]:
+        if not prompts or len(prompts) != len(completions):
+            return None
+
+        requested_signatures: list[str] = []
+        requested_counts: Counter[str] = Counter()
+        for prompt, completion in zip(prompts, completions):
+            signature = _build_pending_rollout_signature(prompt, completion)
+            if signature is None:
+                return None
+            requested_signatures.append(signature)
+            requested_counts[signature] += 1
+
+        for signature, count in requested_counts.items():
+            if len(self.signature_queues.get(signature, [])) < count:
+                return None
+
+        batch: list[dict[str, Any]] = []
+        for signature in requested_signatures:
+            record = self.signature_queues[signature].pop(0)
+            if not self.signature_queues[signature]:
+                del self.signature_queues[signature]
+            self._remove_from_items(record)
+            batch.append(record)
+        return batch
+
+    def _remove_from_items(self, record: dict[str, Any]) -> None:
+        for index, candidate in enumerate(self.items):
+            if candidate is record:
+                del self.items[index]
+                break
+
+    def _discard_signature_record(self, record: dict[str, Any]) -> None:
+        signature = _pending_rollout_record_signature(record)
+        if signature is None:
+            return
+        queue = self.signature_queues.get(signature)
+        if not queue:
+            return
+        for index, candidate in enumerate(queue):
+            if candidate is record:
+                del queue[index]
+                break
+        if not queue:
+            del self.signature_queues[signature]
 
 
 def _build_training_prompt_content(
@@ -471,6 +526,59 @@ def _coerce_completion_text(completion: Any) -> str:
     return str(completion)
 
 
+def _normalize_signature_text(text: Any) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _coerce_prompt_signature_text(prompt: Any) -> str:
+    if prompt is None:
+        return ""
+    if isinstance(prompt, str):
+        return _normalize_signature_text(prompt)
+    if isinstance(prompt, list):
+        parts: list[str] = []
+        for message in prompt:
+            if isinstance(message, dict):
+                role = str(message.get("role", "user"))
+                content = message.get("content", "")
+                parts.append(f"{role}: {_coerce_completion_text(content)}")
+            else:
+                parts.append(str(message))
+        return _normalize_signature_text("\n".join(parts))
+    if isinstance(prompt, dict):
+        if "prompt" in prompt:
+            return _coerce_prompt_signature_text(prompt.get("prompt"))
+        if "messages" in prompt:
+            return _coerce_prompt_signature_text(prompt.get("messages"))
+        role = str(prompt.get("role", "user"))
+        return _normalize_signature_text(f"{role}: {_coerce_completion_text(prompt.get('content', ''))}")
+    return _normalize_signature_text(prompt)
+
+
+def _build_pending_rollout_signature(prompt: Any, completion: Any) -> Optional[str]:
+    prompt_text = _coerce_prompt_signature_text(prompt)
+    completion_text = _normalize_signature_text(_coerce_completion_text(completion))
+    if not prompt_text or not completion_text:
+        return None
+    return json.dumps(
+        {"prompt": prompt_text, "completion": completion_text},
+        sort_keys=True,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
+def _pending_rollout_record_signature(record: dict[str, Any]) -> Optional[str]:
+    completion = record.get("completion_signature_text", record.get("raw_completion_text", ""))
+    return _build_pending_rollout_signature(record.get("prompt"), completion)
+
+
+def _strict_invalid_reward(text: str) -> float:
+    if _strict_json_payload(text) is not None:
+        return 0.0
+    return -0.01
+
+
 def _completion_format_score(text: str) -> float:
     """Bounded format-quality score in [0, 1] that reads the model output text."""
     raw = (text or "").strip()
@@ -510,6 +618,8 @@ def make_reward_function(
 ) -> Callable[[list[Any]], list[float]]:
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
     warned_non_environment_inputs = False
+    warned_pending_bridge_miss = False
+    bridge_diagnostics = {"bridge_miss_count": 0}
 
     def _reward_from_episode_payloads(
         episode_summaries_value: list[EpisodeSummary],
@@ -542,6 +652,7 @@ def make_reward_function(
             verifiable_reward = float(getattr(summary, "verifiable_reward", 0.0) or 0.0)
             total_reward = float(getattr(summary, "total_reward", verifiable_reward) or verifiable_reward)
             base_reward = verifiable_reward + 0.05 * max(0.0, total_reward - verifiable_reward)
+            base_reward -= 0.05 * float(invalid_values[index] or 0.0)
 
             if float(reward_std_values[index] or 0.0) <= 1e-8:
                 base_reward += 0.01 * _completion_format_score(texts[index])
@@ -609,7 +720,25 @@ def make_reward_function(
 
         batch_count = len(completions or prompts or inputs or kwargs.get("environments") or [])
         if pending_rollout_buffer is not None and batch_count > 0:
-            pending_batch = pending_rollout_buffer.take(batch_count)
+            prompt_batch = prompts or kwargs.get("prompts") or kwargs.get("inputs")
+            completion_batch = completions or kwargs.get("completions")
+            pending_batch = None
+            signature_available = bool(prompt_batch) and bool(completion_batch) and len(prompt_batch) == len(completion_batch)
+            if signature_available:
+                pending_batch = pending_rollout_buffer.take_by_signature(list(prompt_batch), list(completion_batch))
+                if pending_batch is None:
+                    nonlocal warned_pending_bridge_miss
+                    bridge_diagnostics["bridge_miss_count"] = int(bridge_diagnostics["bridge_miss_count"]) + batch_count
+                    if not warned_pending_bridge_miss:
+                        print(
+                            "[train_grpo_trl][WARN] reward_func could not match pending rollout rewards "
+                            "for the current prompt/completion batch; using strict-invalid fallback reward.",
+                            flush=True,
+                        )
+                        warned_pending_bridge_miss = True
+                    return [round(_strict_invalid_reward(_coerce_completion_text(completion)), 6) for completion in completion_batch]
+            else:
+                pending_batch = pending_rollout_buffer.take(batch_count)
             if pending_batch is not None:
                 return _reward_from_episode_payloads(
                     [record["episode_summary"] for record in pending_batch],
@@ -641,6 +770,8 @@ def make_reward_function(
 
         environments = list(resolved_inputs or [])
         completions = completions or [None] * len(environments)
+        env_records: list[dict[str, Any]] = []
+        env_base_rewards: list[float] = []
         for env, completion in zip(environments, completions):
             nonlocal warned_non_environment_inputs
             inner_env = getattr(env, "env", env)
@@ -665,7 +796,7 @@ def make_reward_function(
                         flush=True,
                     )
                     warned_non_environment_inputs = True
-                rewards.append(round(0.01 * _completion_format_score(completion_text), 6))
+                rewards.append(round(_strict_invalid_reward(completion_text), 6))
                 continue
 
             if world_state is not None and trajectory:
@@ -690,7 +821,22 @@ def make_reward_function(
                     pass
                 base_reward = verifiable + 0.1 * shaping_signal
 
-            base_reward = base_reward + 0.1 * _completion_format_score(completion_text)
+            env_records.append(
+                {
+                    "env": env,
+                    "completion_text": completion_text,
+                    "base_reward": float(base_reward),
+                }
+            )
+            env_base_rewards.append(float(base_reward))
+
+        env_reward_std_value = pstdev(env_base_rewards) if len(env_base_rewards) > 1 else 0.0
+        for record in env_records:
+            env = record["env"]
+            completion_text = str(record["completion_text"])
+            base_reward = float(record["base_reward"])
+            if env_reward_std_value <= 1e-8:
+                base_reward += 0.1 * _completion_format_score(completion_text)
 
             final_reward = base_reward
             episode_log = env.build_episode_log()
@@ -708,6 +854,7 @@ def make_reward_function(
                     pass
         return rewards
 
+    setattr(reward_func, "bridge_diagnostics", bridge_diagnostics)
     return reward_func
 
 
@@ -896,15 +1043,17 @@ def _generate_completion_turn(
     tokenized = tokenizer(prompt_text, return_tensors="pt")
     tokenized = _move_inputs_to_model_device(tokenized, model)
     prompt_ids = _token_ids_to_list(tokenized.get("input_ids"))
+    use_sampling = float(temperature) > 0.0
     generate_kwargs = {
         **tokenized,
         "max_new_tokens": int(max_new_tokens),
-        "do_sample": True,
-        "temperature": float(temperature),
-        "top_p": float(top_p),
+        "do_sample": use_sampling,
         "return_dict_in_generate": True,
         "output_scores": True,
     }
+    if use_sampling:
+        generate_kwargs["temperature"] = float(temperature)
+        generate_kwargs["top_p"] = float(top_p)
     if getattr(tokenizer, "pad_token_id", None) is not None:
         generate_kwargs["pad_token_id"] = int(tokenizer.pad_token_id)
     if getattr(tokenizer, "eos_token_id", None) is not None:
@@ -922,16 +1071,26 @@ def _generate_completion_turn(
     }
 
 
-def _parse_action_and_validity(raw_text: str, observation: Any) -> tuple[Any, bool]:
+def _strict_json_payload(raw_text: str) -> Optional[dict[str, Any]]:
     candidate = str(raw_text or "").strip()
-    is_json = False
-    if candidate.startswith("{") and candidate.rstrip().endswith("}"):
-        try:
-            parsed = json.loads(candidate)
-            is_json = isinstance(parsed, dict) and "action_type" in parsed
-        except json.JSONDecodeError:
-            is_json = False
-    return parse_action(candidate, observation), is_json
+    if not candidate.startswith("{") or not candidate.rstrip().endswith("}"):
+        return None
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict) or "action_type" not in parsed:
+        return None
+    return parsed
+
+
+def _parse_action_and_validity(raw_text: str, observation: Any, *, strict_json: bool = True) -> tuple[Any, bool]:
+    payload = _strict_json_payload(raw_text)
+    if payload is not None:
+        return parse_action(json.dumps(payload, sort_keys=True, ensure_ascii=True), observation), True
+    if strict_json:
+        return conservative_default_action(observation), False
+    return parse_action(str(raw_text or "").strip(), observation), False
 
 
 def _run_single_rollout_sample(
@@ -977,7 +1136,7 @@ def _run_single_rollout_sample(
         raw_turn_texts.append(raw_text)
 
         observation = getattr(wrapper, "last_observation", None)
-        action, was_valid_json = _parse_action_and_validity(raw_text, observation)
+        action, was_valid_json = _parse_action_and_validity(raw_text, observation, strict_json=True)
         if was_valid_json:
             valid_json_steps += 1
         parsed_actions.append(action.model_dump(exclude_none=True))
@@ -1020,7 +1179,9 @@ def _run_single_rollout_sample(
         "reward_breakdown": reward_breakdown,
         "termination_reason": termination_reason,
         "parsed_actions": parsed_actions,
+        "prompt": copy.deepcopy(prompt),
         "raw_completion_text": "\n".join(raw_turn_texts),
+        "completion_signature_text": "".join(raw_turn_texts),
         "invalid_parse_fraction": round(1.0 - strict_json_fraction, 6),
     }
 

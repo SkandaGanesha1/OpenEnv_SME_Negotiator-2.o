@@ -19,6 +19,7 @@ from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
 from rl.train_grpo_trl import (
     _ensure_grpo_response_schema,
+    _render_chat_prompt,
     _run_single_rollout_sample,
     EpisodeSummaryBuffer,
     PendingRolloutBuffer,
@@ -170,6 +171,26 @@ def test_ensure_grpo_response_schema_adds_fallback_schema_when_missing() -> None
     assert tokenizer.response_schema["properties"]["content"]["type"] == "string"
 
 
+def test_render_chat_prompt_disables_thinking_when_chat_template_supports_it() -> None:
+    captured: dict[str, object] = {}
+
+    class _TemplateTokenizer(_DummyTokenizer):
+        def apply_chat_template(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return "rendered-prompt"
+
+    prompt = _render_chat_prompt(
+        _TemplateTokenizer(),
+        [{"role": "user", "content": "Return JSON only."}],
+    )
+
+    assert prompt == "rendered-prompt"
+    assert captured["kwargs"]["tokenize"] is False
+    assert captured["kwargs"]["add_generation_prompt"] is True
+    assert captured["kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+
+
 def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> None:
     reward_func = make_reward_function(
         rubric_scorer=lambda episode_log: {"rubric": 0.5},
@@ -199,6 +220,7 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
     pending_buffer.extend(
         [
             {
+                "prompt": "prompt-a",
                 "episode_summary": EpisodeSummary(
                     episode_completed=True,
                     base_rl_reward=0.4,
@@ -214,6 +236,7 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
                 ),
                 "episode_log": "log-a",
                 "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
                 "reward_std": 0.2,
                 "reward_mean": 0.45,
                 "unique_action_count": 2.0,
@@ -223,6 +246,7 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
                 "termination_reason": "done",
             },
             {
+                "prompt": "prompt-b",
                 "episode_summary": EpisodeSummary(
                     episode_completed=True,
                     base_rl_reward=0.6,
@@ -238,6 +262,7 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
                 ),
                 "episode_log": "log-b",
                 "raw_completion_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "completion_signature_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
                 "reward_std": 0.2,
                 "reward_mean": 0.45,
                 "unique_action_count": 2.0,
@@ -251,11 +276,172 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
 
     rewards = reward_func(
         prompts=["prompt-a", "prompt-b"],
-        completions=["{}", '{"action_type":"accept"}'],
+        completions=[
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+            '{"action_type":"propose","price":97.0,"payment_days":35}',
+        ],
     )
 
     assert rewards == [0.4, 0.6]
     assert pending_buffer.items == []
+
+
+def test_reward_function_matches_pending_rollouts_by_prompt_completion_signature_when_reordered() -> None:
+    pending_buffer = PendingRolloutBuffer()
+    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    pending_buffer.extend(
+        [
+            {
+                "prompt": [{"role": "user", "content": "prompt-a"}],
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.4,
+                    verifiable_reward=0.4,
+                    total_reward=0.4,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.4,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-a",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+            },
+            {
+                "prompt": [{"role": "user", "content": "prompt-b"}],
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.6,
+                    verifiable_reward=0.6,
+                    total_reward=0.6,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.6,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=35.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-b",
+                "raw_completion_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "completion_signature_text": '{"action_type":"propose","price":97.0,"payment_days":35}',
+                "reward_std": 0.2,
+            },
+        ]
+    )
+
+    rewards = reward_func(
+        prompts=[
+            [{"role": "user", "content": "prompt-b"}],
+            [{"role": "user", "content": "prompt-a"}],
+        ],
+        completions=[
+            '{"action_type":"propose","price":97.0,"payment_days":35}',
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+        ],
+    )
+
+    assert rewards == [0.6, 0.4]
+    assert pending_buffer.items == []
+
+
+def test_reward_function_preserves_duplicate_signature_queue_order() -> None:
+    pending_buffer = PendingRolloutBuffer()
+    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    pending_buffer.extend(
+        [
+            {
+                "prompt": "prompt-a",
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.4,
+                    verifiable_reward=0.4,
+                    total_reward=0.4,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.4,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-a",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+            },
+            {
+                "prompt": "prompt-a",
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.6,
+                    verifiable_reward=0.6,
+                    total_reward=0.6,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.6,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-b",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+            },
+        ]
+    )
+
+    rewards = reward_func(
+        prompts=["prompt-a", "prompt-a"],
+        completions=[
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+        ],
+    )
+
+    assert rewards == [0.4, 0.6]
+    assert pending_buffer.items == []
+
+
+def test_reward_function_reports_bridge_miss_and_returns_strict_invalid_reward() -> None:
+    pending_buffer = PendingRolloutBuffer()
+    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    pending_buffer.extend(
+        [
+            {
+                "prompt": "prompt-a",
+                "episode_summary": EpisodeSummary(
+                    episode_completed=True,
+                    base_rl_reward=0.4,
+                    verifiable_reward=0.4,
+                    total_reward=0.4,
+                    tool_bonus_total=0.0,
+                    env_reward_total=0.4,
+                    success_no_default_positive_npv=True,
+                    average_final_payment_days=40.0,
+                    tool_usage_count=1,
+                    resolved_deal_count=1,
+                    defaulted_sme_count=0,
+                ),
+                "episode_log": "log-a",
+                "raw_completion_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "completion_signature_text": '{"action_type":"accept","price":95.0,"payment_days":40}',
+                "reward_std": 0.2,
+            }
+        ]
+    )
+
+    rewards = reward_func(prompts=["prompt-b"], completions=["<think>not json</think>"])
+
+    assert rewards == [-0.01]
+    assert reward_func.bridge_diagnostics["bridge_miss_count"] == 1
+    assert len(pending_buffer.items) == 1
 
 
 def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -> None:
@@ -268,6 +454,36 @@ def test_reward_function_falls_back_safely_for_non_environment_prompt_inputs() -
 
     assert len(rewards) == 2
     assert all(isinstance(value, float) for value in rewards)
+
+
+def test_reward_function_penalizes_invalid_json_in_episode_payloads() -> None:
+    reward_func = make_reward_function()
+    summary = EpisodeSummary(
+        episode_completed=True,
+        base_rl_reward=0.5,
+        verifiable_reward=0.5,
+        total_reward=0.5,
+        tool_bonus_total=0.0,
+        env_reward_total=0.5,
+        success_no_default_positive_npv=True,
+        average_final_payment_days=40.0,
+        tool_usage_count=1,
+        resolved_deal_count=1,
+        defaulted_sme_count=0,
+    )
+
+    rewards = reward_func(
+        [None, None],
+        episode_summaries=[summary, summary],
+        raw_completion_texts=[
+            '{"action_type":"accept","price":95.0,"payment_days":40}',
+            "<think>I'll think about it first</think>",
+        ],
+        env_reward_std=[0.0, 0.0],
+        invalid_parse_fraction=[0.0, 1.0],
+    )
+
+    assert rewards[0] > rewards[1]
 
 
 def test_reward_function_completion_text_provides_per_group_variance() -> None:
@@ -623,6 +839,104 @@ def test_run_single_rollout_sample_steps_environment_with_structured_actions(mon
     assert result["parsed_actions"]
     assert '"action_type"' in result["raw_completion_text"]
     assert result["termination_reason"]
+
+
+def test_run_single_rollout_sample_marks_non_json_invalid_and_uses_conservative_fallback(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    def _fake_generate_completion_turn(model, tokenizer, messages, *, max_new_tokens, temperature, top_p):
+        return {
+            "prompt_ids": [1, 2, 3],
+            "completion_ids": [4, 5],
+            "logprobs": [-0.1, -0.2],
+            "text": "<think>I should reason this out first</think>",
+        }
+
+    monkeypatch.setattr(trl_script, "_generate_completion_turn", _fake_generate_completion_turn)
+    args = build_arg_parser().parse_args(["--max-episode-steps", "1"])
+    prompt = build_training_rows(num_samples=1, total_periods=1)[0]["prompt"]
+
+    class _Obs:
+        def __init__(self, *, done: bool, reward: float, metadata: dict[str, object], buyer_days: int = 40) -> None:
+            self.done = done
+            self.reward = reward
+            self.metadata = metadata
+            self.active_deal_id = "deal-1"
+            self.open_deal_ids = ["deal-1"] if not done else []
+            self.buyer_price = 95.0
+            self.buyer_days = buyer_days
+            self.cost_threshold = 82.0
+            self.liquidity_threshold = 35
+            self.current_period = 0
+            self.total_periods = 1
+
+        def model_dump(self):
+            return {
+                "done": self.done,
+                "reward": self.reward,
+                "metadata": self.metadata,
+                "active_deal_id": self.active_deal_id,
+                "open_deal_ids": list(self.open_deal_ids),
+                "buyer_price": self.buyer_price,
+                "buyer_days": self.buyer_days,
+                "cost_threshold": self.cost_threshold,
+                "liquidity_threshold": self.liquidity_threshold,
+                "current_period": self.current_period,
+                "total_periods": self.total_periods,
+            }
+
+    class _FakeWrapper:
+        def __init__(self) -> None:
+            self.done = False
+            self.env_reward_total = 0.0
+            self.last_observation = _Obs(done=False, reward=0.0, metadata={})
+
+        def reset(self, **kwargs):
+            self.done = False
+            self.last_observation = _Obs(done=False, reward=0.0, metadata={})
+            return "obs-reset"
+
+        def propose(self, **kwargs):
+            self.done = True
+            self.last_observation = _Obs(
+                done=True,
+                reward=0.1,
+                metadata={"termination_reason": "fallback_propose", "reward_breakdown": {"total": 0.1}},
+                buyer_days=int(kwargs.get("payment_days", 35)),
+            )
+            self.env_reward_total += 0.1
+            return "obs-propose"
+
+        def summarize_episode(self):
+            return EpisodeSummary(
+                episode_completed=True,
+                base_rl_reward=0.1,
+                verifiable_reward=0.1,
+                total_reward=0.1,
+                tool_bonus_total=0.0,
+                env_reward_total=0.1,
+                success_no_default_positive_npv=True,
+                average_final_payment_days=35.0,
+                tool_usage_count=0,
+                resolved_deal_count=1,
+                defaulted_sme_count=0,
+            )
+
+        def build_episode_log(self):
+            return "fake-episode-log"
+
+    result = _run_single_rollout_sample(
+        prompt,
+        model=object(),
+        tokenizer=_DummyTokenizer(),
+        rollout_args=args,
+        env_factory=lambda: _FakeWrapper(),
+    )
+
+    assert result["invalid_parse_fraction"] == 1.0
+    assert result["parsed_actions"][0]["action_type"] == "propose"
+    assert result["parsed_actions"][0]["reason"] == "Default action after failed parse"
+    assert "think" in result["raw_completion_text"]
 
 
 def test_prepare_model_for_grpo_refuses_missing_peft(monkeypatch) -> None:
