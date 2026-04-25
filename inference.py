@@ -941,7 +941,13 @@ def _normalize_liquidity_raw_action_payload(
     if active_deal_id and out["action_type"] != "advance_period":
         out["deal_id"] = str(active_deal_id)
 
-    if out["action_type"] == "reject" and not _explicit_surrender_requested(out.get("reason")):
+    if out["action_type"] == "reject":
+        if _explicit_surrender_requested(out.get("reason")):
+            return {
+                "action_type": "reject",
+                "deal_id": str(active_deal_id),
+                "reason": _strict_clip_text(out.get("reason", "No deal."), _MAX_REASON_CHARS),
+            }
         proposal = _normalize_stage1_proposal(
             {
                 "action_type": "propose",
@@ -1090,6 +1096,15 @@ def _build_liquidity_heuristic_action(
     active_deal_id = observation.get("active_deal_id") or (open_deal_ids[0] if open_deal_ids else None)
     buyer_days = int(observation.get("buyer_days", 0) or 0)
     liquidity = int(observation.get("liquidity_threshold", 0) or 0)
+    current_period = int(observation.get("current_period", 0) or 0)
+    resolved_count = len(observation.get("resolved_deal_ids") or [])
+
+    if current_period > 0 and resolved_count >= 2:
+        return {
+            "action_type": "reject",
+            "deal_id": str(active_deal_id),
+            "reason": "No deal: treasury policy avoids overtrading after financing capacity is mostly committed.",
+        }
 
     if observation.get("last_tool_name") != "QUERY_TREDS" and buyer_days > liquidity + 10 and round_number <= 1:
         return {
@@ -1151,7 +1166,7 @@ def _normalize_liquidity_action_payload(
         last_valid_proposal,
     )
     task_contract_action = _apply_liquidity_task_contract_pass(raw_action, observation, task_name)
-    return _apply_liquidity_close_or_escape_rewrite(
+    rewritten_action = _apply_liquidity_close_or_escape_rewrite(
         task_contract_action,
         observation,
         history,
@@ -1159,6 +1174,7 @@ def _normalize_liquidity_action_payload(
         round_number,
         last_valid_proposal,
     )
+    return _apply_liquidity_task_contract_pass(rewritten_action, observation, task_name)
 
 
 def _should_auto_advance_liquidity_period(observation: Any, *, done: bool = False) -> bool:
