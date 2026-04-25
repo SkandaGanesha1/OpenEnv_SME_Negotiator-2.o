@@ -175,6 +175,19 @@ def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> 
     assert rewards == [0.85, 0.85]
 
 
+def test_reward_function_accepts_keyword_only_trl_call_shape() -> None:
+    reward_func = make_reward_function()
+
+    rewards = reward_func(
+        prompts=["prompt-a", "prompt-b"],
+        completions=["{}", '{"action_type":"accept"}'],
+        environments=[_DummyEnv(), _DummyEnv()],
+    )
+
+    assert len(rewards) == 2
+    assert all(isinstance(value, float) for value in rewards)
+
+
 def test_reward_function_completion_text_provides_per_group_variance() -> None:
     """GRPO loss collapses to 0 when every completion in a group scores
     identically. The reward function must therefore add a bounded text-derived

@@ -491,7 +491,8 @@ def make_reward_function(
     """Build the TRL reward function for both explicit rollouts and env wrappers."""
 
     def reward_func(
-        inputs: list[Any],
+        inputs: Optional[list[Any]] = None,
+        prompts: Optional[list[Any]] = None,
         completions: Optional[list[Any]] = None,
         episode_summaries: Optional[list[EpisodeSummary]] = None,
         episode_logs: Optional[list[str]] = None,
@@ -556,7 +557,15 @@ def make_reward_function(
                     )
             return rewards
 
-        environments = list(inputs)
+        resolved_inputs = inputs
+        if resolved_inputs is None:
+            resolved_inputs = kwargs.get("environments")
+        if resolved_inputs is None:
+            resolved_inputs = kwargs.get("inputs")
+        if resolved_inputs is None:
+            resolved_inputs = prompts
+
+        environments = list(resolved_inputs or [])
         completions = completions or [None] * len(environments)
         for env, completion in zip(environments, completions):
             inner_env = getattr(env, "env", env)
