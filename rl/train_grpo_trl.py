@@ -1469,37 +1469,65 @@ def build_environment_factory(
     curriculum: Optional[CurriculumManager],
     opponent_manager: Optional[OpponentPolicyManager],
 ):
-    """Build a zero-arg in-process environment factory."""
+    """Build a TRL-compatible no-arg environment class for canonical training."""
+    base_wrapper_cls = make_environment_factory(
+        task_name=args.task_name,
+        difficulty=args.difficulty,
+        total_periods=args.total_periods,
+        seed=args.seed_base,
+        prompt=DEFAULT_PROMPT,
+        buyer_variance=0.0,
+        financier_variance=0.0,
+        curriculum_level=0,
+        lock_curriculum_config=curriculum is not None,
+        persona_mode=args.persona_mode,
+        persona_name=args.persona_name,
+        opponent_manager=opponent_manager,
+    )
 
-    def environment_factory():
-        if curriculum is not None:
-            difficulty_config = curriculum.current_config()
-            total_periods = difficulty_config.total_periods
-            buyer_variance = difficulty_config.buyer_variance
-            financier_variance = difficulty_config.financier_variance
-            curriculum_level = curriculum.current_level()
-        else:
-            total_periods = args.total_periods
-            buyer_variance = 0.0
-            financier_variance = 0.0
-            curriculum_level = 0
-        wrapper_cls = make_environment_factory(
-            task_name=args.task_name,
-            difficulty=args.difficulty,
-            total_periods=total_periods,
-            seed=args.seed_base,
-            prompt=DEFAULT_PROMPT,
-            buyer_variance=buyer_variance,
-            financier_variance=financier_variance,
-            curriculum_level=curriculum_level,
-            lock_curriculum_config=curriculum is not None,
-            persona_mode=args.persona_mode,
-            persona_name=args.persona_name,
-            opponent_manager=opponent_manager,
-        )
-        return wrapper_cls()
+    class CanonicalTrainingEnvironment(base_wrapper_cls):
+        def reset(self, **kwargs: Any) -> str:
+            if curriculum is not None:
+                difficulty_config = curriculum.current_config()
+                total_periods = difficulty_config.total_periods
+                buyer_variance = difficulty_config.buyer_variance
+                financier_variance = difficulty_config.financier_variance
+                curriculum_level = curriculum.current_level()
+            else:
+                total_periods = args.total_periods
+                buyer_variance = 0.0
+                financier_variance = 0.0
+                curriculum_level = 0
 
-    return environment_factory
+            # InProcessEnvWrapper reads these values from _factory_defaults when
+            # lock_curriculum_config=True, so refresh them before every reset.
+            self._factory_defaults = dict(self._factory_defaults)
+            self._factory_defaults["total_periods"] = int(total_periods)
+            self._factory_defaults["buyer_variance"] = float(buyer_variance)
+            self._factory_defaults["financier_variance"] = float(financier_variance)
+            self._factory_defaults["curriculum_level"] = int(curriculum_level)
+            self._factory_defaults["lock_curriculum_config"] = curriculum is not None
+            self._factory_defaults["opponent_manager"] = opponent_manager
+            self._factory_defaults["persona_mode"] = args.persona_mode
+            self._factory_defaults["persona_name"] = args.persona_name
+
+            reset_kwargs = dict(kwargs)
+            reset_kwargs.setdefault("task_name", args.task_name)
+            reset_kwargs.setdefault("difficulty", args.difficulty)
+            reset_kwargs.setdefault("seed", args.seed_base)
+            reset_kwargs.setdefault("prompt", DEFAULT_PROMPT)
+            reset_kwargs["total_periods"] = int(total_periods)
+            reset_kwargs["buyer_variance"] = float(buyer_variance)
+            reset_kwargs["financier_variance"] = float(financier_variance)
+            reset_kwargs["curriculum_level"] = int(curriculum_level)
+            reset_kwargs["lock_curriculum_config"] = curriculum is not None
+            reset_kwargs["persona_mode"] = args.persona_mode
+            reset_kwargs["persona_name"] = args.persona_name
+            reset_kwargs["opponent_manager"] = opponent_manager
+            return super().reset(**reset_kwargs)
+
+    CanonicalTrainingEnvironment.__name__ = "CanonicalTrainingEnvironment"
+    return CanonicalTrainingEnvironment
 
 
 def _coerce_prompt_messages(prompt: Any) -> list[dict[str, str]]:

@@ -29,7 +29,7 @@ pinned: false
 | OpenEnv manifest | [openenv.yaml](openenv.yaml) |
 
 <p align="center">
-  <img src="logo.png" alt="OpenEnv SME Negotiator" width="340">
+  <img src="assets/logo.jpeg" alt="OpenEnv SME Negotiator" width="340">
 </p>
 
 <p align="center">
