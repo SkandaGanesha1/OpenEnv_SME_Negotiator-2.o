@@ -23,6 +23,8 @@ from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
 from rl.bridge import InProcessEnvWrapper
 from rl.train_grpo_trl import (
+    _align_trl_environment_batch,
+    _infer_expected_environment_batch_size,
     _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
     _generate_completion_turn,
@@ -282,6 +284,42 @@ def test_strip_training_row_metadata_removes_embedded_row_lines() -> None:
     cleaned = _strip_training_row_metadata(messages)
 
     assert cleaned == [{"role": "user", "content": "/no_think\nUse JSON only."}]
+
+
+def test_infer_expected_environment_batch_size_handles_dict_and_list_inputs() -> None:
+    assert _infer_expected_environment_batch_size({"prompt": ["a", "b", "c"]}) == 3
+    assert _infer_expected_environment_batch_size([{"prompt": "a"}, {"prompt": "b"}]) == 2
+    assert _infer_expected_environment_batch_size({"task_name": ["a", "b"]}) == 2
+
+
+def test_align_trl_environment_batch_resizes_environment_and_tool_lists() -> None:
+    class _Env:
+        def reset(self, **kwargs):
+            return "obs"
+
+        def propose(self, price: float, payment_days: int) -> str:
+            return "ok"
+
+    created = {"count": 0}
+
+    def _factory():
+        created["count"] += 1
+        return _Env()
+
+    trainer = SimpleNamespace(
+        environments=[_factory()],
+        _sync_tool_dicts=[{"propose": trainer} for trainer in []],
+        _async_tool_dicts=[{}],
+        _canonical_environment_factory=_factory,
+    )
+    trainer._sync_tool_dicts = [{"propose": trainer.environments[0].propose}]
+
+    _align_trl_environment_batch(trainer, 3)
+
+    assert len(trainer.environments) == 3
+    assert len(trainer._sync_tool_dicts) == 3
+    assert len(trainer._async_tool_dicts) == 3
+    assert created["count"] == 3
 
 
 def test_liquidity_runner_rejects_legacy_backend_for_notebook_training() -> None:

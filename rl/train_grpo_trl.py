@@ -263,6 +263,110 @@ def _patch_trl_shuffle_sequence_dict() -> None:
         pass
 
 
+def _infer_expected_environment_batch_size(inputs: Any) -> int:
+    """Infer the active environment batch size from TRL generation inputs."""
+    if inputs is None:
+        return 0
+    if isinstance(inputs, dict):
+        prompt_column = inputs.get("prompt")
+        if isinstance(prompt_column, list):
+            return len(prompt_column)
+        for value in inputs.values():
+            if isinstance(value, list):
+                return len(value)
+        return 0
+    if isinstance(inputs, list):
+        return len(inputs)
+    try:
+        return int(len(inputs))
+    except Exception:
+        return 0
+
+
+def _build_environment_tool_dicts(environment: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build sync/async tool dictionaries for a TRL environment instance."""
+    sync_tools: dict[str, Any] = {}
+    async_tools: dict[str, Any] = {}
+    for name in dir(environment):
+        if name.startswith("_") or name == "reset":
+            continue
+        try:
+            value = getattr(environment, name)
+        except Exception:
+            continue
+        if not callable(value):
+            continue
+        if inspect.iscoroutinefunction(value):
+            async_tools[name] = value
+        else:
+            sync_tools[name] = value
+    return sync_tools, async_tools
+
+
+def _align_trl_environment_batch(trainer: Any, expected_count: int) -> None:
+    """Resize TRL's cached environment/tool batches to the active prompt batch."""
+    if expected_count <= 0 or not hasattr(trainer, "environments"):
+        return
+
+    environments = getattr(trainer, "environments", None)
+    if not isinstance(environments, list):
+        return
+
+    current_count = len(environments)
+    if current_count == expected_count:
+        return
+
+    factory = getattr(trainer, "_canonical_environment_factory", None)
+    if factory is None:
+        return
+
+    if current_count < expected_count:
+        new_envs = [factory() for _ in range(expected_count - current_count)]
+        environments.extend(new_envs)
+        sync_tool_dicts = getattr(trainer, "_sync_tool_dicts", None)
+        async_tool_dicts = getattr(trainer, "_async_tool_dicts", None)
+        if isinstance(sync_tool_dicts, list) and isinstance(async_tool_dicts, list):
+            for environment in new_envs:
+                sync_tools, async_tools = _build_environment_tool_dicts(environment)
+                sync_tool_dicts.append(sync_tools)
+                async_tool_dicts.append(async_tools)
+    else:
+        del environments[expected_count:]
+        sync_tool_dicts = getattr(trainer, "_sync_tool_dicts", None)
+        async_tool_dicts = getattr(trainer, "_async_tool_dicts", None)
+        if isinstance(sync_tool_dicts, list):
+            del sync_tool_dicts[expected_count:]
+        if isinstance(async_tool_dicts, list):
+            del async_tool_dicts[expected_count:]
+
+    if not bool(getattr(trainer, "_canonical_env_batch_alignment_warned", False)):
+        print(
+            "[train_grpo_trl][WARN] Adjusted TRL environment batch alignment for this build: "
+            f"expected={expected_count}, previous={current_count}, current={len(environments)}.",
+            flush=True,
+        )
+        setattr(trainer, "_canonical_env_batch_alignment_warned", True)
+
+
+def _patch_trl_environment_batch_alignment() -> None:
+    """Patch TRL's environment path to keep cached env batches aligned to inputs."""
+    try:
+        import trl.trainer.grpo_trainer as _grpo_mod
+    except ImportError:
+        return
+
+    original = getattr(_grpo_mod.GRPOTrainer, "_generate_and_score_completions", None)
+    if original is None or getattr(original, "__wrapped_environment_alignment__", False):
+        return
+
+    def _wrapped_generate_and_score_completions(self, inputs, *args: Any, **kwargs: Any):
+        _align_trl_environment_batch(self, _infer_expected_environment_batch_size(inputs))
+        return original(self, inputs, *args, **kwargs)
+
+    setattr(_wrapped_generate_and_score_completions, "__wrapped_environment_alignment__", True)
+    _grpo_mod.GRPOTrainer._generate_and_score_completions = _wrapped_generate_and_score_completions
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -3034,10 +3138,16 @@ def create_trainer(session: dict[str, Any]) -> Any:
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
         _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
-    if str(session.get("runtime_backend", "environment")) == "legacy":
+    runtime_backend = str(session.get("runtime_backend", "environment"))
+    if runtime_backend == "legacy":
         _patch_trl_shuffle_sequence_dict()
+    elif runtime_backend == "environment":
+        _patch_trl_environment_batch_alignment()
     _, GRPOTrainer = _import_trl_grpo_symbols()
-    return GRPOTrainer(**dict(session["trainer_kwargs"]))
+    trainer = GRPOTrainer(**dict(session["trainer_kwargs"]))
+    if runtime_backend == "environment":
+        setattr(trainer, "_canonical_environment_factory", session["trainer_kwargs"].get("environment_factory"))
+    return trainer
 
 
 def save_training_session(session: dict[str, Any], trainer: Any) -> Path:
