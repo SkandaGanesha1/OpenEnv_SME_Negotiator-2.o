@@ -58,6 +58,37 @@ venv.bak/
 *.exe
 *.dll
 *.pyd
+*.bin
+*.ckpt
+*.h5
+*.joblib
+*.model
+*.onnx
+*.ot
+*.pb
+*.pickle
+*.pkl
+*.pt
+*.pth
+*.safetensors
+*.tflite
+*.wasm
+
+# Large generated archives and arrays
+*.7z
+*.arrow
+*.bz2
+*.gz
+*.npy
+*.npz
+*.parquet
+*.rar
+*.tar
+*.tar.*
+*.tgz
+*.xz
+*.zip
+*.zst
 
 # IDE
 .vscode/
@@ -79,6 +110,10 @@ docker-compose.override.yml
 # Project specific
 *.log
 inference_results.json
+logo.png
+saved_model/
+*.lfs.*
+*tfevents*
 .mypy_cache/
 .ruff_cache/
 
