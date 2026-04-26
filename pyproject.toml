@@ -12,7 +12,7 @@ dependencies = [
     "fastapi>=0.104.0",
     "uvicorn>=0.23.0",
     "pydantic>=2.0.0",
-    "numpy>=1.24.0",
+    "numpy>=1.24.0,<2.0.0",
     "httpx>=0.24.0",
     "websockets>=11.0",
     "python-multipart>=0.0.7",
@@ -28,7 +28,13 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest"]
-rl = ["transformers>=5.2.0", "trl>=0.25.1", "datasets", "accelerate", "peft>=0.19.1"]
+rl = [
+    "transformers>=4.56.0,<4.57.0",
+    "trl>=0.29.0,<0.30.0",
+    "datasets",
+    "accelerate>=1.0.0",
+    "peft>=0.17.0,<0.20.0",
+]
 rl-unsloth = [
     "unsloth; platform_system != 'Windows'",
     "vllm; platform_system != 'Windows'",

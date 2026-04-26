@@ -6,15 +6,6 @@ colorTo: green
 sdk: docker
 pinned: false
 ---
-## Judge Quick Links
-
-| Resource | Link |
-|---|---|
-| HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o) |
-| GRPO Training Colab | [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb) |
-| Current inference summary artifact | [inference_results.json](inference_results.json) |
-| Full evaluation notes | [EVALUATION.md](EVALUATION.md) |
-| OpenEnv manifest | [openenv.yaml](openenv.yaml) |
 
 <p align="center">
   <img src="assets/logo.jpeg" alt="OpenEnv SME Negotiator" width="340">
@@ -32,7 +23,7 @@ pinned: false
     <img src="https://img.shields.io/badge/Open%20in-Colab-F9AB00?style=for-the-badge&logo=googlecolab&logoColor=white" alt="Open GRPO Training Colab">
   </a>
   <a href="https://www.python.org/downloads/">
-    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
+    <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+">
   </a>
   <a href="https://fastapi.tiangolo.com/">
     <img src="https://img.shields.io/badge/FastAPI-API-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI">
@@ -95,39 +86,13 @@ If you want an environment where an agent must balance price, payment days, work
 
 | Criterion | What We Built | Where to Verify |
 |---|---|---|
-| **Environment Innovation (40%)** | A novel SME treasury negotiation environment: multi-buyer payment-term pressure, financier/TReDS decisions, compliance checks, cashflow simulation, and delayed solvency consequences. This is harder than a game clone because the agent must balance NPV, liquidity, legal terms, and buyer leverage across a partially observable business workflow. | [`server/environment.py`](server/environment.py) · [`sme_negotiator_env/models.py`](sme_negotiator_env/models.py) · [`sme_negotiator_env/tool_backends.py`](sme_negotiator_env/tool_backends.py) · crisis stats above |
-| **Storytelling & Presentation (30%)** | The README leads with the real Razorpay “Fix My Itch” problem, the 82.8 itch score, MSME delayed-payment context, a live Hugging Face Space, a judge one-pager, and draft HF blog/model-card assets so non-technical reviewers can follow the problem → environment → agent behavior → results flow. | [HF Space](https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o) · [`docs/JUDGE_ONE_PAGER.md`](docs/JUDGE_ONE_PAGER.md) · [`huggingface/blog_post.md`](huggingface/blog_post.md) · [`huggingface/model_card.md`](huggingface/model_card.md) |
-| **Showing Improvement in Rewards (20%)** | Current router-backed liquidity inference is non-zero and judge-readable: `inference_results.json` reports `overall_mean_score=0.8283`, `overall_success_rate=1.0`, and `avg_verifiable_reward=0.8283`. Checked-in judge reports also summarize legacy and liquidity task scores. Final Colab plots should be regenerated before submission if used as training evidence. | [`inference_results.json`](inference_results.json) · [`outputs/judge_report.md`](outputs/judge_report.md) · [`outputs/judge_report.json`](outputs/judge_report.json) · [`docs/img/tiny_grpo_reward_curve.svg`](docs/img/tiny_grpo_reward_curve.svg) |
-| **Reward & Training Pipeline (10%)** | Deterministic RLVR reward combines solvency, liquidity buffer, NPV uplift, and compliance; shaping rewards provide step-level signal; bounded tool bonuses/penalties discourage tool spam. TRL GRPO and optional Unsloth entrypoints use the in-process liquidity environment through `rl/bridge.py`. | [`sme_negotiator_env/graders.py`](sme_negotiator_env/graders.py) · [`rl/bridge.py`](rl/bridge.py) · [`rl/train_grpo_trl.py`](rl/train_grpo_trl.py) · [`rl/train_grpo_unsloth.py`](rl/train_grpo_unsloth.py) · [Colab notebook](notebooks/grpo_sme_liquidity.ipynb) |
+| **Real-world utility (30%)** | Models a live multi‑lakh‑crore economic crisis in B2B payment-term negotiations. Designed to be immediately useful to fintech RL labs, MSME policy researchers, and agent benchmark suites. | Crisis stats above; Economic Survey 2025–26; MSME Samadhaan and RBI TReDS links; Razorpay “Fix My Itch”.[cite:16][cite:10][cite:14][cite:19][cite:23] |
+| **Task & grader quality (25%)** | 3 tasks (easy/medium/hard) with deterministic graders in `graders.py`. All terminal scores are normalized to `[0.0, 1.0]`. Hard task couples multi‑buyer dynamics, dynamic discounting, and financing tradeoffs to resist trivial strategies. | [`sme_negotiator_env/graders.py`](sme_negotiator_env/graders.py) · [`sme_negotiator_env/task_config.py`](sme_negotiator_env/task_config.py) |
+| **Environment design (20%)** | Clean `reset()` → `step()` loop with rich structured observations (liquidity threshold, working-capital gap, buyer power, TReDS availability). Shaped partial rewards plus deterministic terminal rewards and clear episode boundaries. | [`server/sme_environment.py`](server/sme_environment.py) · [`sme_negotiator_env/models.py`](sme_negotiator_env/models.py) |
+| **Code quality & spec compliance (15%)** | `openenv.yaml` present; OpenEnv HTTP + WebSocket API on port `7860`; Dockerfile builds and runs; Hugging Face Space live. Typed Pydantic models throughout and a `pytest` suite for environment and baseline behavior. | [`openenv.yaml`](openenv.yaml) · [`docker/Dockerfile`](docker/Dockerfile) · [`tests/`](tests/) · HF Space link above |
+| **Creativity & novelty (10%)** | First OpenEnv environment focused on B2B payment-term negotiation. Reward combines price × time × financing × legal clauses. Anchored in Indian MSME policy while remaining generalizable as a negotiation benchmark. | Task ladder below · `graders.py` reward logic · policy and TReDS links |
 
 </div>
-
-### Theme Fit
-
-| Priority | Hackathon Theme | Why it fits |
-|---|---|---|
-| **Primary** | **Theme #3.1 - World Modeling / Professional Tasks** | The agent operates a persistent SME treasury world with real workflow tools: `QUERY_TREDS`, `CHECK_COMPLIANCE`, `RUN_CASHFLOW_SIM`, and `simulate_plan`. |
-| **Secondary** | **Theme #2 - Long-Horizon Planning & Instruction Following** | Macro periods, settlement timing, defaults, `advance_period`, and sparse terminal solvency rewards require planning beyond one negotiation turn. |
-| **Supporting** | **Theme #1 - Multi-Agent Interactions** | The world models SME, buyer, financier, and regulator/compliance incentives, but this is supporting evidence rather than the main submission theme. |
-
-### Known Evidence Status
-
-| Evidence | Status | Notes |
-|---|---|---|
-| OpenEnv validation | **PASS** | `uv run --extra dev openenv validate` returned `[OK] OpenEnv_SME_Negotiator: Ready for multi-mode deployment`. |
-| Targeted environment/reward/training tests | **PASS** | `105 passed` for the targeted judge-readiness subset. |
-| Current router inference artifact | **PASS** | `inference_results.json` is non-zero: mean score `0.8283`, success rate `1.0`, verifiable reward `0.8283`. |
-| Final Colab training plots | **PENDING** | Regenerate before final submission if claiming full before/after training plots; missing local artifacts are not linked as final evidence here. |
-
-### 3-5 Minute Judge Flow
-
-| Step | What to show | Why it matters |
-|---|---|---|
-| **1. Problem** | Razorpay “Fix My Itch” score `82.8`, 60-90+ day buyer terms, and faster supplier-payment obligations. | Establishes the real SME working-capital gap. |
-| **2. Environment** | `reset()` / `step()` OpenEnv contract, typed observations, active deal state, macro periods, and tool evidence. | Shows this is a trainable environment, not a static demo. |
-| **3. Agent actions** | `propose`, `accept`, `reject`, `advance_period`, `simulate_plan`, and tool calls. | Makes the agent behavior inspectable and testable. |
-| **4. Reward** | Deterministic RLVR reward plus shaping and bounded tool bonuses/penalties. | Shows meaningful learning signal over the full trajectory. |
-| **5. Evidence** | `inference_results.json`, `outputs/judge_report.md`, Colab notebook, and regenerated plots when available. | Gives judges a quick audit path for runtime correctness and improvement claims. |
 
 ---
 
@@ -280,41 +245,41 @@ Jan 2026    ₹ 8.1  lakh crore            ▲ Eco Survey estimate remains massi
 <div align="center">
 
 ```text
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                    LIQUIDITY ENVIRONMENT TASK LADDER                         │
-├───────────────────────┬────────────────────────┬─────────────────────────────┤
-│  🟢 EASY              │  🟡 MEDIUM             │  🔴 HARD                    │
-│  liquidity-stress-    │  liquidity-stress-     │  liquidity-correlation-     │
-│  medium               │  medium                │  hard                       │
-├───────────────────────┼────────────────────────┼─────────────────────────────┤
-│ Thin-cash SME         │ Same stress world,     │ Correlated buyer risk,      │
-│ primary slow payer +  │ stricter judge view:   │ tighter liquidity threshold,│
-│ secondary risky buyer │ preserve NPV and tools │ limited financier capacity  │
-├───────────────────────┼────────────────────────┼─────────────────────────────┤
-│ Goal: resolve deals   │ Goal: finish macro     │ Goal: survive all periods   │
-│ with no default and   │ horizon with positive  │ while maximizing solvency,  │
-│ payment days near 40  │ verifiable reward      │ liquidity, NPV, compliance  │
-├───────────────────────┼────────────────────────┼─────────────────────────────┤
-│ Levers: propose/      │ Levers: all easy       │ Levers: all medium levers   │
-│ accept, TReDS, clause │ levers + period timing │ + dynamic discounting,      │
-│ and advance_period    │ and cashflow planning  │ selective finance, tool use │
-├───────────────────────┼────────────────────────┼─────────────────────────────┤
-│ Reward: dense shaping │ Reward: same RLVR      │ Reward: terminal RLVR from  │
-│ + terminal RLVR       │ formula, judge bucket  │ solvency + liquidity + NPV  │
-│                       │ uses medium difficulty │ + legal compliance          │
-└───────────────────────┴────────────────────────┴─────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        TASK DIFFICULTY LADDER                          │
+├──────────────────┬──────────────────────┬───────────────────────────────┤
+│  🟢 EASY         │  🟡 MEDIUM           │  🔴 HARD                      │
+│  payment-terms-  │  payment-terms-      │  payment-terms-hard          │
+│  easy            │  medium              │                               │
+├──────────────────┼──────────────────────┼───────────────────────────────┤
+│ Opens: 100 INR   │ Opens: 100 INR       │ Opens: 96 INR / 100 days      │
+│        / 90 days │        / 60 days     │ Setting: hostile two-buyer    │
+├──────────────────┼──────────────────────┼───────────────────────────────┤
+│ Goal: compress   │ Goal: tighten terms  │ Goal: maximize NPV via        │
+│ days ≤ 60        │ + add late-payment   │ dynamic discounting           │
+│                  │ penalty clause       │ (propose_dynamic_discounting) │
+├──────────────────┼──────────────────────┼───────────────────────────────┤
+│ Levers: 1        │ Levers: 2            │ Levers: 4                     │
+│ (payment days)   │ (days + clause)      │ (price × days × TReDS ×      │
+│                  │                      │  discount rate)               │
+├──────────────────┼──────────────────────┼───────────────────────────────┤
+│ Terminal: 1.0 if │ Terminal: 1.0 if     │ Terminal: NPV-delta score     │
+│ days ≤ 60        │ days ≤ 45 + clause   │ vs status quo                 │
+│ Partial: yes     │ Partial: yes         │ TReDS changes floor, not      │
+│                  │                      │ the terminal score alone      │
+└──────────────────┴──────────────────────┴───────────────────────────────┘
 ```
 
 </div>
 
-| Inference bucket | Liquidity task | Opening state | What the agent must do | Current checked-in signal |
-|---|---|---|---|---|
-| `EASY` | `liquidity-stress-medium` | `99 INR / 75 days`, liquidity threshold `40`, supplier pay cycle `25`, two buyers, modest financing capacity | Use TReDS/tool evidence where useful, negotiate short-tenor deals, advance macro periods, and avoid SME default | `mean_final_score=0.8280`, `success_rate=1.0`, `avg_final_payment_days=40.0` in `inference_results.json` |
-| `MEDIUM` | `liquidity-stress-medium` | Same stress task, evaluated as the medium judge bucket | Preserve positive NPV while resolving all deals, keeping legal/payment terms tight, and using tools without spam | `mean_final_score=0.8280`, `success_rate=1.0`, `avg_verifiable_reward=0.8280` in `inference_results.json` |
-| `HARD` | `liquidity-correlation-hard` | `96 INR / 95 days`, liquidity threshold `35`, supplier pay cycle `20`, correlated risky buyers, limited financier capacity | Combine negotiation, TReDS, late-payment protection, dynamic discounting, cashflow planning, and `advance_period` over the macro horizon | `mean_final_score=0.8288`, `success_rate=1.0`, `avg_final_payment_days=30.0` in `inference_results.json` |
+| Task | Opening state | What the agent must do | Full-credit signal |
+|------|---------------|------------------------|--------------------|
+| `payment-terms-easy` | Buyer opens at `100 INR / 90 days` | Compress terms toward the SME liquidity threshold | Reach a deal with agreed days `<= 60` |
+| `payment-terms-medium` | Buyer opens at `100 INR / 60 days` | Tighten terms and use a late-payment penalty clause | Reach a deal with agreed days `<= 45`, with stronger partial credit if the clause is included |
+| `payment-terms-hard` | Buyer opens at `96 INR / 100 days` in a hostile two-buyer setting | Negotiate dynamic discounting and manage financing tradeoffs | Improve NPV versus the status quo with `propose_dynamic_discounting=true` |
 
 > [!WARNING]
-> **Liquidity-mode trap for naive agents:** A single good deal is not enough. The agent must resolve the open deals, advance macro periods, avoid default, preserve NPV, and use tools only when they improve the economic trajectory. Tool calls alone do not earn terminal reward; the canonical hard signal is the deterministic RLVR score from solvency, liquidity buffer, NPV uplift, and legal compliance.
+> **Hard-mode trap for naive agents:** Setting `use_treds=true` modifies the simulation by lowering the buyer day floor, but the terminal score is **not** earned by TReDS alone. To earn hard-task credit, the agent must negotiate **dynamic discounting** with a coherent `dynamic_discount_annual_rate`. Agents that simply “accept + use_treds” will score close to 0 on the hard task.
 
 ---
 
@@ -405,7 +370,7 @@ The environment exposes:
 
 ## 🚀 Quick Start
 
-Runtime: **Python 3.10+**. `uv` is the fastest path.
+Runtime: **Python 3.11+**. `uv` is the fastest path.
 
 ### Install
 
@@ -462,20 +427,6 @@ export HF_TOKEN="hf_xxx"
 export MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
 uv run python inference.py
 ```
-
-Judge-mode router run for the advanced liquidity workflow:
-
-```bash
-export API_BASE_URL="https://router.huggingface.co/v1"
-export HF_TOKEN="hf_xxx"
-export MODEL_NAME="Qwen/Qwen2.5-7B-Instruct"
-export INFERENCE_AGENT_MODE="router"
-export INFERENCE_ENV_MODE="liquidity"
-export OPENENV_IN_PROCESS=1
-uv run python inference.py
-```
-
-Credential precedence is: `HF_TOKEN`, then `API_KEY`, then `OPENAI_API_KEY`.
 
 Compatibility fallback for generic OpenAI-style examples:
 
@@ -658,25 +609,28 @@ Checked-in judge-facing artifacts today:
 | Artifact | Overall value | Notes |
 |---|---|---|
 | Legacy single-deal reference benchmark | `0.52` overall score | Public server-compatible `payment-terms-*` baseline from `EVALUATION.md` |
-| Current router liquidity inference artifact | `0.8283` mean score / `1.0000` success rate | `inference_results.json` confirms the in-process liquidity path, explicit terminal reward logs, non-zero verifiable rewards, and additive summary metrics |
-| Judge readiness report | Legacy: `0.99 / 0.99 / 0.7138`; liquidity: `0.8085 / 0.9354` | Checked-in deterministic report at `outputs/judge_report.md` and `outputs/judge_report.json` |
+| Checked-in liquidity smoke artifact | `0.00` overall score / `0.0000` mean reward | Current `inference_results.json` confirms the in-process liquidity path, explicit terminal reward logs, and additive summary metrics |
 
 ## Real Training Evidence
 
-Run profile: `submission`  
-Task: `liquidity-correlation-hard`  
-Status: final Colab plot artifacts are **not currently checked in**. Regenerate them with `notebooks/colab_grpo_sme_liquidity.ipynb` before making a final training-curve claim.
+Run profile: `submission`
+Task: `liquidity-correlation-hard`
+Artifacts: `outputs/grpo_sme_liquidity_colab/training_dashboard.png`, `outputs/grpo_sme_liquidity_colab/policy_comparison.png`, `outputs/grpo_sme_liquidity_colab/eval_summary.json`
 
-| Evidence | Current status | Where to verify |
+| Metric | Base model | Trained checkpoint |
 |---|---|---|
-| Current router liquidity inference | Available | [`inference_results.json`](inference_results.json) |
-| Deterministic judge report | Available | [`outputs/judge_report.md`](outputs/judge_report.md) |
-| Tiny illustrative reward curve | Available, illustrative only | [`docs/img/tiny_grpo_reward_curve.svg`](docs/img/tiny_grpo_reward_curve.svg) |
-| Full Colab training dashboard | Pending regeneration | Expected at `outputs/grpo_sme_liquidity_colab/training_dashboard.png` |
-| Full Colab policy comparison | Pending regeneration | Expected at `outputs/grpo_sme_liquidity_colab/policy_comparison.png` |
-| Full Colab eval summary | Pending regeneration | Expected at `outputs/grpo_sme_liquidity_colab/eval_summary.json` |
+| Mean total reward | `policies.base.mean_total_reward` | `policies.trained.mean_total_reward` |
+| Mean verifiable reward | `policies.base.mean_verifiable_reward` | `policies.trained.mean_verifiable_reward` |
+| Success rate | `policies.base.success_rate` | `policies.trained.success_rate` |
+| Mean final payment days | `policies.base.mean_final_payment_days` | `policies.trained.mean_final_payment_days` |
 
-When the Colab artifacts are regenerated, the final before/after table should report `policies.base.*` vs `policies.trained.*` from `eval_summary.json` rather than placeholder field names.
+![Submission training dashboard](outputs/grpo_sme_liquidity_colab/training_dashboard.png)
+
+Caption: Multi-panel training diagnostics from the real environment-connected GRPO run, with reward, rollout diversity, and format-quality metrics on labeled axes.
+
+![Base model vs trained checkpoint comparison](outputs/grpo_sme_liquidity_colab/policy_comparison.png)
+
+Caption: Fixed-seed before/after comparison using the same task, horizon, and evaluation budget for the base model and the trained checkpoint.
 
 ## Advanced Training Pipeline
 
@@ -820,7 +774,6 @@ Core environment variables:
 | `OPENENV_BASE_URL` | Negotiation server URL, default `http://127.0.0.1:7860` |
 | `OPENENV_IN_PROCESS` | Set to `1` to skip the server and run in-process |
 | `INFERENCE_ENV_MODE` | `liquidity` (default) or `legacy` |
-| `INFERENCE_AGENT_MODE` | `router` (default) or `heuristic` |
 | `INFERENCE_LIQUIDITY_TASK` | Optional explicit liquidity task id override |
 | `INFERENCE_TOTAL_PERIODS` | Macro periods for liquidity mode (default `3`) |
 | `TASK_FILTER` | Optional comma-separated subset such as `EASY,MEDIUM` |
@@ -848,7 +801,7 @@ docker run -p 7860:7860 openenv-sme-negotiator:latest
 
 The repository is configured with Space frontmatter and Docker runtime metadata. The public Space for this environment is:
 
-- https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator
+- https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o
 
 ### Hugging Face Model Card & Blog Draft
 
@@ -1017,13 +970,9 @@ MIT. See [LICENSE](LICENSE).
 
 ### Evidence
 
-- Current router liquidity inference: [inference_results.json](inference_results.json)
-- Deterministic judge report: [outputs/judge_report.md](outputs/judge_report.md)
-- Judge report JSON: [outputs/judge_report.json](outputs/judge_report.json)
-- Tiny illustrative reward curve: [docs/img/tiny_grpo_reward_curve.svg](docs/img/tiny_grpo_reward_curve.svg)
-- Final Colab training dashboard: pending regeneration at `outputs/grpo_sme_liquidity_colab/training_dashboard.png`
-- Final Colab policy comparison: pending regeneration at `outputs/grpo_sme_liquidity_colab/policy_comparison.png`
-- Final Colab eval summary: pending regeneration at `outputs/grpo_sme_liquidity_colab/eval_summary.json`
+- Submission training dashboard: [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png)
+- Submission policy comparison: [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png)
+- Submission eval summary: [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json)
 - Colab-style tiny demo: [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb)
 - Advanced phased notebook: [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb)
 - Notebook/demo helper layer: `rl/demo.py`
