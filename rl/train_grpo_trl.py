@@ -1588,6 +1588,25 @@ def _token_ids_to_list(value: Any) -> list[int]:
     return []
 
 
+def _tokenize_text_without_special_tokens(tokenizer: Any, text: str) -> list[int]:
+    if not text:
+        return []
+    try:
+        tokenized = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    except TypeError:
+        tokenized = tokenizer(text, return_tensors="pt")
+    return _token_ids_to_list(tokenized.get("input_ids"))
+
+
+def _serialize_rollout_actions(parsed_actions: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for action in parsed_actions:
+        if not isinstance(action, dict):
+            continue
+        lines.append(json.dumps(action, sort_keys=True, ensure_ascii=True, separators=(",", ":")))
+    return "\n".join(lines)
+
+
 def _compute_generated_logprobs(output_scores: Any, completion_ids: list[int]) -> list[float]:
     if not output_scores or not completion_ids:
         return []
@@ -2004,10 +2023,13 @@ def _run_single_rollout_sample(
     wrapper = env_factory()
     reset_text = wrapper.reset(**row)
     current_observation_text = str(reset_text)
+    training_prompt_messages = _build_rollout_turn_messages(observation_text=current_observation_text)
+    training_prompt_ids = _tokenize_text_without_special_tokens(
+        tokenizer,
+        _render_chat_prompt(tokenizer, training_prompt_messages),
+    )
 
-    prompt_ids: list[int] = []
     completion_ids: list[int] = []
-    logprobs: list[float] = []
     raw_turn_texts: list[str] = []
     parsed_actions: list[dict[str, Any]] = []
     valid_json_steps = 0
@@ -2033,9 +2055,6 @@ def _run_single_rollout_sample(
             _build_rollout_turn_messages(observation_text=current_observation_text),
             **turn_kwargs,
         )
-        prompt_ids.extend(list(turn["prompt_ids"]))
-        completion_ids.extend(list(turn["completion_ids"]))
-        logprobs.extend(list(turn["logprobs"]))
         raw_text = str(turn["text"])
         raw_turn_texts.append(raw_text)
 
@@ -2073,15 +2092,14 @@ def _run_single_rollout_sample(
             termination_reason = metadata_reason
 
     strict_json_fraction = valid_json_steps / max(1, len(raw_turn_texts))
-    completion_signature_text = (
-        str(tokenizer.decode(completion_ids, skip_special_tokens=True))
-        if completion_ids and hasattr(tokenizer, "decode")
-        else "\n".join(raw_turn_texts)
-    )
+    completion_signature_text = _serialize_rollout_actions(parsed_actions)
+    if not completion_signature_text:
+        completion_signature_text = "\n".join(raw_turn_texts)
+    completion_ids = _tokenize_text_without_special_tokens(tokenizer, completion_signature_text)
     return {
-        "prompt_ids": prompt_ids,
+        "prompt_ids": training_prompt_ids,
         "completion_ids": completion_ids,
-        "logprobs": logprobs or [0.0 for _ in completion_ids],
+        "logprobs": [0.0 for _ in completion_ids],
         "episode_summary": summary,
         "episode_log": episode_log,
         "reward_breakdown": reward_breakdown,

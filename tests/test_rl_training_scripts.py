@@ -1417,7 +1417,10 @@ def test_run_single_rollout_sample_steps_environment_with_structured_actions(mon
 
     assert result["episode_summary"].episode_completed is True
     assert result["parsed_actions"]
-    assert '"action_type"' in result["raw_completion_text"]
+    assert result["prompt_ids"] == [10, 11, 12]
+    assert result["completion_ids"] == [10, 11, 12]
+    assert '"action_type":"accept"' in result["completion_signature_text"]
+    assert '"action_type":"advance_period"' in result["completion_signature_text"]
     assert result["termination_reason"]
 
 
