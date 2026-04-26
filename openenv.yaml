@@ -1,0 +1,61 @@
+spec_version: 1
+version: 0.2.0
+name: openenv-sme-negotiator
+description: >
+  OpenEnv environment for B2B payment-term negotiation. The public FastAPI
+  server exposes only the live single-deal baseline tasks used for
+  compatibility and evaluation. The stronger multi-deal liquidity and
+  tool-using workflow environment is available separately as an in-process
+  training/demo path via SMELiquidityEnvironment and rl/bridge.py.
+type: text
+runtime: fastapi
+app: server.app:app
+port: 7860
+
+action:
+  type: object
+  description: >
+    Negotiation action with price, payment days, and optional financing clauses
+    such as TReDS, late-payment penalties, and dynamic discounting. The live
+    HTTP server uses the legacy single-deal negotiation surface.
+  schema_ref: NegotiationAction
+
+observation:
+  type: object
+  description: >
+    Round observation containing the buyer counter-offer and SME financial
+    context for the live single-deal negotiation path. The in-process
+    liquidity path extends this contract internally with macro state and tool
+    evidence.
+  schema_ref: NegotiationObservation
+
+tasks:
+  - id: payment-terms-easy
+    name: payment-terms-easy
+    description: >
+      Single SME versus a cooperative buyer. Reduce settlement terms from
+      90 days toward 60 days or better. Graded by liquidity-threshold
+      compliance.
+    difficulty: easy
+    mode: http
+    env_class: server.environment.SMENegotiatorEnvironment
+
+  - id: payment-terms-medium
+    name: payment-terms-medium
+    description: >
+      Working-capital stress scenario. Tighten terms toward 45 days and
+      negotiate a late-payment penalty clause. Multi-dimensional grading
+      rewards both days improvement and clause inclusion.
+    difficulty: medium
+    mode: http
+    env_class: server.environment.SMENegotiatorEnvironment
+
+  - id: payment-terms-hard
+    name: payment-terms-hard
+    description: >
+      Hard single-deal setting with dynamic discounting and NPV-vs-status-quo
+      scoring. The agent must negotiate dynamic-discounting terms and
+      outperform the baseline NPV to earn a non-trivial reward.
+    difficulty: hard
+    mode: http
+    env_class: server.environment.SMENegotiatorEnvironment

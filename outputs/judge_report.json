@@ -1,0 +1,70 @@
+{
+  "compliance": {
+    "openenv_manifest": true,
+    "fastapi_app": true,
+    "typed_models": true,
+    "client_package": true,
+    "dockerfile": true,
+    "trl_training_script": true,
+    "unsloth_training_script": true,
+    "colab_notebook": true,
+    "hf_space_documented": true,
+    "hf_blog_draft": true,
+    "hf_model_card": true,
+    "hf_router_inference": true
+  },
+  "task_scores": [
+    {
+      "task_id": "payment-terms-easy",
+      "surface": "OpenEnv HTTP-compatible legacy task",
+      "mean_reward": 0.99,
+      "success_rate": 1.0,
+      "episodes": 3,
+      "notes": "Runs through SMENegotiatorEnvironment with reset/step and typed actions."
+    },
+    {
+      "task_id": "payment-terms-medium",
+      "surface": "OpenEnv HTTP-compatible legacy task",
+      "mean_reward": 0.99,
+      "success_rate": 1.0,
+      "episodes": 3,
+      "notes": "Runs through SMENegotiatorEnvironment with reset/step and typed actions."
+    },
+    {
+      "task_id": "payment-terms-hard",
+      "surface": "OpenEnv HTTP-compatible legacy task",
+      "mean_reward": 0.713773,
+      "success_rate": 1.0,
+      "episodes": 3,
+      "notes": "Runs through SMENegotiatorEnvironment with reset/step and typed actions."
+    },
+    {
+      "task_id": "liquidity-stress-medium",
+      "surface": "Advanced in-process liquidity task used by GRPO training",
+      "mean_reward": 0.808521,
+      "success_rate": 1.0,
+      "episodes": 3,
+      "notes": "resolved=2, defaulted=0, avg_days=44.0, tools=1/1; resolved=2, defaulted=0, avg_days=46.0, tools=1/1; resolved=2, defaulted=0, avg_days=49.0, tools=1/1"
+    },
+    {
+      "task_id": "liquidity-correlation-hard",
+      "surface": "Advanced in-process liquidity task used by GRPO training",
+      "mean_reward": 0.935427,
+      "success_rate": 1.0,
+      "episodes": 3,
+      "notes": "resolved=4, defaulted=0, avg_days=71.5, tools=1/1; resolved=4, defaulted=0, avg_days=70.5, tools=1/1; resolved=4, defaulted=0, avg_days=67.5, tools=1/1"
+    }
+  ],
+  "judge_mapping": {
+    "environment_innovation_40": "SME payment-term negotiation with multi-agent buyer/financier/regulator state, cashflow simulation, and TReDS-style tools.",
+    "storytelling_30": "README, HF blog draft, model card, crisis statistics, and Space link explain the real-world working-capital gap.",
+    "reward_improvement_20": "Use Colab GRPO reward_curve.png plus this deterministic report; train medium before hard to avoid all-zero reward.",
+    "reward_pipeline_10": "TRL and Unsloth scripts use deterministic rewards, shaping, tool bonuses, curriculum, self-play hooks, and LoRA training."
+  },
+  "critical_recommendations": [
+    "Expose the advanced liquidity task through the hosted OpenEnv surface or explicitly tell judges the Space is legacy while Colab/TRL uses the advanced in-process environment.",
+    "Do not submit the 10-step hard-mode run as final evidence; use at least a 100-step medium run and a 300-step hard/curriculum run.",
+    "Commit reward_curve.png and this report artifact so judges do not need to rerun Colab to see progress.",
+    "Keep HF router credentials in environment variables only; never commit tokens."
+  ]
+}

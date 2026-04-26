@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="460" viewBox="0 0 860 460" role="img" aria-labelledby="title desc">
+  <title id="title">Illustrative Tiny GRPO Reward Curve</title>
+  <desc id="desc">An illustrative reward curve for a tiny in-process GRPO demo on the SME liquidity environment.</desc>
+  <rect width="860" height="460" fill="#f7f5ee"/>
+  <rect x="68" y="46" width="744" height="332" rx="16" fill="#fffdf7" stroke="#d6cfbe" stroke-width="2"/>
+  <text x="84" y="86" font-family="Georgia, serif" font-size="26" fill="#2d3a2f">Illustrative Tiny GRPO Demo Reward Curve</text>
+  <text x="84" y="112" font-family="Verdana, sans-serif" font-size="14" fill="#5b665d">Submission artifact only. This is a tiny demo-scale trajectory, not a benchmark claim.</text>
+
+  <line x1="120" y1="328" x2="772" y2="328" stroke="#7f8a76" stroke-width="2"/>
+  <line x1="120" y1="328" x2="120" y2="126" stroke="#7f8a76" stroke-width="2"/>
+
+  <g font-family="Verdana, sans-serif" font-size="12" fill="#617060">
+    <text x="114" y="344">0</text>
+    <text x="240" y="344">2</text>
+    <text x="366" y="344">4</text>
+    <text x="492" y="344">6</text>
+    <text x="618" y="344">8</text>
+    <text x="734" y="344">10</text>
+    <text x="84" y="330">0.10</text>
+    <text x="84" y="280">0.20</text>
+    <text x="84" y="230">0.30</text>
+    <text x="84" y="180">0.40</text>
+    <text x="84" y="130">0.50</text>
+  </g>
+
+  <g stroke="#d9d1c2" stroke-width="1">
+    <line x1="120" y1="278" x2="772" y2="278"/>
+    <line x1="120" y1="228" x2="772" y2="228"/>
+    <line x1="120" y1="178" x2="772" y2="178"/>
+    <line x1="120" y1="128" x2="772" y2="128"/>
+  </g>
+
+  <polyline
+    fill="none"
+    stroke="#207561"
+    stroke-width="4"
+    points="120,308 182,298 246,286 310,265 374,245 438,222 502,204 566,184 630,168 694,150 758,138"/>
+  <g fill="#207561" stroke="#fffdf7" stroke-width="3">
+    <circle cx="120" cy="308" r="6"/>
+    <circle cx="182" cy="298" r="6"/>
+    <circle cx="246" cy="286" r="6"/>
+    <circle cx="310" cy="265" r="6"/>
+    <circle cx="374" cy="245" r="6"/>
+    <circle cx="438" cy="222" r="6"/>
+    <circle cx="502" cy="204" r="6"/>
+    <circle cx="566" cy="184" r="6"/>
+    <circle cx="630" cy="168" r="6"/>
+    <circle cx="694" cy="150" r="6"/>
+    <circle cx="758" cy="138" r="6"/>
+  </g>
+
+  <text x="382" y="386" font-family="Verdana, sans-serif" font-size="14" fill="#435347">Training step</text>
+  <text x="18" y="250" transform="rotate(-90 18 250)" font-family="Verdana, sans-serif" font-size="14" fill="#435347">Average episode reward</text>
+</svg>

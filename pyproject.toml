@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.18.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "openenv-sme-negotiator"
+version = "0.1.0"
+description = "SME payment term negotiation OpenEnv environment"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn>=0.23.0",
+    "pydantic>=2.0.0",
+    "numpy>=1.24.0",
+    "httpx>=0.24.0",
+    "websockets>=11.0",
+    "python-multipart>=0.0.7",
+    "openai>=1.3.0",
+    "python-dotenv>=1.0.1",
+    "pyyaml>=6.0.1",
+    "gymnasium>=0.28.0",
+    "openenv-core>=0.2.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+rl = ["transformers>=5.2.0", "trl>=0.25.1", "datasets", "accelerate", "peft>=0.19.1"]
+rl-unsloth = [
+    "unsloth; platform_system != 'Windows'",
+    "vllm; platform_system != 'Windows'",
+]
+
+[project.scripts]
+server = "server.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["sme_negotiator_env", "server", "rl"]

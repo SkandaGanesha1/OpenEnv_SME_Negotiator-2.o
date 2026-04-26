@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pip install -e . -q)",
+      "Bash(python -m pip list)",
+      "Bash(python -m pytest tests/ -v --tb=short)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "Bash(python -m pytest tests/test_multi_agent_init.py tests/test_determinism.py tests/test_reward_monotonicity.py tests/test_demo_helper.py -v --tb=short)",
+      "Bash(uv run *)",
+      "WebFetch(domain:unsloth.ai)",
+      "Bash(grep -E \"\\\\.py$|\\\\.md$\")",
+      "Bash(python -c \"import ast,pathlib; ast.parse\\(pathlib.Path\\('app.py'\\).read_text\\(encoding='utf-8'\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
