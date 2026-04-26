@@ -1558,6 +1558,90 @@ def _compute_generated_logprobs(output_scores: Any, completion_ids: list[int]) -
     return values
 
 
+def _coerce_vllm_sampled_logprobs(raw_logprobs: Any, completion_ids: list[int]) -> list[float]:
+    if not raw_logprobs or not completion_ids:
+        return []
+
+    values: list[float] = []
+    for token_id, item in zip(completion_ids, raw_logprobs):
+        chosen = None
+        if isinstance(item, dict):
+            chosen = item.get(token_id)
+            if chosen is None:
+                chosen = item.get(str(token_id))
+            if chosen is None and item:
+                chosen = next(iter(item.values()))
+        else:
+            chosen = item
+
+        if hasattr(chosen, "logprob"):
+            values.append(float(getattr(chosen, "logprob")))
+        elif chosen is None:
+            values.append(0.0)
+        else:
+            try:
+                values.append(float(chosen))
+            except Exception:
+                values.append(0.0)
+    return values
+
+
+def _generate_completion_turn_with_vllm(
+    vllm_llm: Any,
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> dict[str, Any]:
+    from vllm import SamplingParams
+
+    prompt_text = _render_chat_prompt(tokenizer, messages)
+    tokenized = tokenizer(prompt_text, return_tensors="pt")
+    prompt_ids = _token_ids_to_list(tokenized.get("input_ids"))
+    use_sampling = float(temperature) > 0.0
+
+    sampling_params = SamplingParams(
+        n=1,
+        max_tokens=int(max_new_tokens),
+        temperature=float(temperature) if use_sampling else 0.0,
+        top_p=float(top_p) if use_sampling else 1.0,
+        logprobs=0,
+    )
+    outputs = vllm_llm.generate([prompt_text], sampling_params=sampling_params, use_tqdm=False)
+    if not outputs:
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": [],
+            "logprobs": [],
+            "text": "",
+        }
+
+    request_output = outputs[0]
+    request_prompt_ids = _token_ids_to_list(getattr(request_output, "prompt_token_ids", None))
+    if request_prompt_ids:
+        prompt_ids = request_prompt_ids
+    candidates = list(getattr(request_output, "outputs", []) or [])
+    if not candidates:
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": [],
+            "logprobs": [],
+            "text": "",
+        }
+    candidate = candidates[0]
+    completion_ids = _token_ids_to_list(getattr(candidate, "token_ids", None))
+    text = str(getattr(candidate, "text", "") or "")
+    logprobs = _coerce_vllm_sampled_logprobs(getattr(candidate, "logprobs", None), completion_ids)
+    return {
+        "prompt_ids": prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs": logprobs,
+        "text": text,
+    }
+
+
 def _generate_completion_turn(
     model: Any,
     tokenizer: Any,
@@ -1566,7 +1650,18 @@ def _generate_completion_turn(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    vllm_llm: Any = None,
 ) -> dict[str, Any]:
+    if vllm_llm is not None:
+        return _generate_completion_turn_with_vllm(
+            vllm_llm,
+            tokenizer,
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
     prompt_text = _render_chat_prompt(tokenizer, messages)
     tokenized = tokenizer(prompt_text, return_tensors="pt")
     tokenized = _move_inputs_to_model_device(tokenized, model)
@@ -1846,6 +1941,7 @@ def _run_single_rollout_sample(
     tokenizer: Any,
     rollout_args: Any,
     env_factory: Callable[[], Any],
+    vllm_llm: Any = None,
 ) -> dict[str, Any]:
     row = _extract_training_row_from_prompt(prompt, rollout_args)
     wrapper = env_factory()
@@ -1868,13 +1964,18 @@ def _run_single_rollout_sample(
 
     termination_reason = "rollout_step_cap"
     for _ in range(max_episode_steps):
+        turn_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if vllm_llm is not None:
+            turn_kwargs["vllm_llm"] = vllm_llm
         turn = _generate_completion_turn(
             model,
             tokenizer,
             messages,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            **turn_kwargs,
         )
         prompt_ids.extend(list(turn["prompt_ids"]))
         completion_ids.extend(list(turn["completion_ids"]))
@@ -2016,17 +2117,24 @@ def build_rollout_func(
             model = getattr(trainer, "model", model)
         if model is None:
             raise ValueError("rollout_func could not resolve the active model.")
+        vllm_generation = None if trainer is None else getattr(trainer, "vllm_generation", None)
+        vllm_llm = None if vllm_generation is None else getattr(vllm_generation, "llm", None)
 
         num_generations = int(getattr(rollout_args, "num_generations", 1) or 1)
         samples: list[dict[str, Any]] = []
         for prompt in prompts:
+            sample_kwargs = {
+                "model": model,
+                "tokenizer": processing_class,
+                "rollout_args": rollout_args,
+                "env_factory": env_factory,
+            }
+            if vllm_llm is not None:
+                sample_kwargs["vllm_llm"] = vllm_llm
             group = [
                 _run_single_rollout_sample(
                     prompt,
-                    model=model,
-                    tokenizer=processing_class,
-                    rollout_args=rollout_args,
-                    env_factory=env_factory,
+                    **sample_kwargs,
                 )
                 for _ in range(num_generations)
             ]

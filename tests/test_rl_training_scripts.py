@@ -24,6 +24,7 @@ from rl.episode_logging import EpisodeSummary
 from rl.train_grpo_trl import (
     _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
+    _generate_completion_turn,
     _render_chat_prompt,
     _run_single_rollout_sample,
     _score_prompt_completion_via_environment,
@@ -66,6 +67,14 @@ class _DummyTokenizer:
         self.padding_side = "right"
         self.pad_token = None
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+
+    def __call__(self, text: str, return_tensors: str = "pt") -> dict[str, Any]:
+        return {"input_ids": [[10, 11, 12]]}
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        return "decoded"
 
 
 class _DummyEnv:
@@ -101,6 +110,13 @@ class _DummyTokenizerSaver:
     def save_pretrained(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
         (path / "tokenizer.json").write_text("tokenizer", encoding="utf-8")
+
+
+class _NoGenerateModel:
+    device = None
+
+    def generate(self, **kwargs):
+        raise AssertionError("training model.generate should not be used when vLLM LLM is available")
 
 
 def _workspace_tmp_dir(name: str) -> Path:
@@ -204,6 +220,52 @@ def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
 def test_default_vllm_max_model_length_matches_small_grpo_recipe() -> None:
     assert _default_vllm_max_model_length(max_prompt_length=1024, max_completion_length=256) == 2048
     assert _default_vllm_max_model_length(max_prompt_length=2048, max_completion_length=512) == 2816
+
+
+def test_generate_completion_turn_uses_vllm_llm_when_available(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    class _FakeSamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _FakeVllmLLM:
+        def generate(self, prompts, sampling_params=None, use_tqdm=False):
+            assert prompts == ["user: hi"]
+            assert sampling_params.kwargs["max_tokens"] == 32
+            assert sampling_params.kwargs["temperature"] == 0.7
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=[10, 11, 12],
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[21, 22],
+                            text='{"action_type":"advance_period"}',
+                            logprobs=[{21: -0.2}, {22: -0.3}],
+                        )
+                    ],
+                )
+            ]
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.SamplingParams = _FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(trl_script, "_render_chat_prompt", lambda tokenizer, messages: "user: hi")
+
+    turn = _generate_completion_turn(
+        _NoGenerateModel(),
+        _DummyTokenizer(),
+        [{"role": "user", "content": "hi"}],
+        max_new_tokens=32,
+        temperature=0.7,
+        top_p=0.9,
+        vllm_llm=_FakeVllmLLM(),
+    )
+
+    assert turn["prompt_ids"] == [10, 11, 12]
+    assert turn["completion_ids"] == [21, 22]
+    assert turn["logprobs"] == [-0.2, -0.3]
+    assert turn["text"] == '{"action_type":"advance_period"}'
 
 
 def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
