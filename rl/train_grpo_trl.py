@@ -151,18 +151,31 @@ class EpisodeSummaryBuffer:
     items: list[EpisodeSummary] = field(default_factory=list)
     episode_logs: list[str] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    episode_records: list[dict[str, Any]] = field(default_factory=list)
+    episode_count: int = 0
 
     def append(
         self,
         summary: EpisodeSummary,
         episode_log: Optional[str] = None,
         diagnostics: Optional[dict[str, Any]] = None,
+        training_reward: Optional[float] = None,
     ) -> None:
         self.items.append(summary)
         if episode_log is not None:
             self.episode_logs.append(episode_log)
-        if diagnostics is not None:
-            self.diagnostics.append(dict(diagnostics))
+        diagnostics_copy = None if diagnostics is None else dict(diagnostics)
+        if diagnostics_copy is not None:
+            self.diagnostics.append(diagnostics_copy)
+        self.episode_count += 1
+        self.episode_records.append(
+            _build_episode_reward_record(
+                episode=self.episode_count,
+                summary=summary,
+                diagnostics=diagnostics_copy,
+                training_reward=training_reward,
+            )
+        )
 
     def drain(self) -> tuple[list[EpisodeSummary], list[str], list[dict[str, Any]]]:
         summaries = list(self.items)
@@ -172,6 +185,61 @@ class EpisodeSummaryBuffer:
         self.episode_logs.clear()
         self.diagnostics.clear()
         return summaries, episode_logs, diagnostics
+
+    def export_records(self) -> list[dict[str, Any]]:
+        """Return all persisted episode reward records collected during training."""
+        return [dict(record) for record in self.episode_records]
+
+
+def _build_episode_reward_record(
+    *,
+    episode: int,
+    summary: EpisodeSummary,
+    diagnostics: Optional[dict[str, Any]],
+    training_reward: Optional[float],
+) -> dict[str, Any]:
+    record = {
+        "episode": int(episode),
+        "step": int(episode),
+        "training_reward": float(
+            training_reward
+            if training_reward is not None
+            else getattr(summary, "total_reward", 0.0) or 0.0
+        ),
+        "total_reward": float(getattr(summary, "total_reward", 0.0) or 0.0),
+        "verifiable_reward": float(getattr(summary, "verifiable_reward", 0.0) or 0.0),
+        "base_rl_reward": float(getattr(summary, "base_rl_reward", 0.0) or 0.0),
+        "tool_bonus_total": float(getattr(summary, "tool_bonus_total", 0.0) or 0.0),
+        "env_reward_total": float(getattr(summary, "env_reward_total", 0.0) or 0.0),
+        "success_no_default_positive_npv": bool(
+            getattr(summary, "success_no_default_positive_npv", False)
+        ),
+        "average_final_payment_days": float(
+            getattr(summary, "average_final_payment_days", 0.0) or 0.0
+        ),
+        "tool_usage_count": int(getattr(summary, "tool_usage_count", 0) or 0),
+        "tool_call_count": int(getattr(summary, "tool_call_count", 0) or 0),
+        "tool_effective_count": int(getattr(summary, "tool_effective_count", 0) or 0),
+        "resolved_deal_count": int(getattr(summary, "resolved_deal_count", 0) or 0),
+        "defaulted_sme_count": int(getattr(summary, "defaulted_sme_count", 0) or 0),
+        "terminated_by_step_cap": bool(getattr(summary, "terminated_by_step_cap", False)),
+    }
+    if diagnostics:
+        for key in (
+            "reward_mean",
+            "reward_std",
+            "unique_action_count",
+            "unique_completion_count",
+            "invalid_parse_fraction",
+            "identical_terminal_fraction",
+            "contract_score",
+        ):
+            if key in diagnostics:
+                record[key] = float(diagnostics.get(key, 0.0) or 0.0)
+        termination_reason = str(diagnostics.get("termination_reason", "") or "").strip()
+        if termination_reason:
+            record["termination_reason"] = termination_reason
+    return record
 
 
 @dataclass
@@ -935,6 +1003,7 @@ def make_reward_function(
                         "contract_score": contract_score,
                         "sample_completion": texts[index],
                     },
+                    training_reward=final_reward,
                 )
         return rewards
 
@@ -1190,7 +1259,7 @@ def make_reward_function(
             rewards.append(round(final_reward, 6))
             if summary_buffer is not None:
                 try:
-                    summary_buffer.append(env.summarize_episode(), episode_log)
+                    summary_buffer.append(env.summarize_episode(), episode_log, training_reward=final_reward)
                 except Exception:
                     pass
         return rewards
@@ -2439,10 +2508,18 @@ def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
     trainer = create_trainer(session)
     trainer.train()
     checkpoint_path = save_training_session(session, trainer)
+    reward_func = session.get("reward_funcs")
+    bridge_diagnostics = dict(getattr(reward_func, "bridge_diagnostics", {}) or {})
+    summary_buffer = session.get("summary_buffer")
+    episode_reward_history = (
+        summary_buffer.export_records() if isinstance(summary_buffer, EpisodeSummaryBuffer) else []
+    )
     return {
         "session": session,
         "trainer": trainer,
         "checkpoint_path": checkpoint_path,
+        "bridge_diagnostics": bridge_diagnostics,
+        "episode_reward_history": episode_reward_history,
     }
 
 

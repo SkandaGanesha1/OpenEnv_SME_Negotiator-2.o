@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -1687,7 +1689,8 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
     tmp_path = _workspace_tmp_dir("simple_training_script")
     checkpoint_path = tmp_path / "final-grpo-model"
     reward_curve_path = tmp_path / "reward_curve.png"
-    reward_log_path = tmp_path / "reward_log.json"
+    trainer_reward_log_path = tmp_path / "reward_log.json"
+    episode_reward_log_path = tmp_path / "episode_reward_log.json"
     training_dashboard_path = tmp_path / "training_dashboard.png"
     manifest_path = tmp_path / "run_manifest.json"
 
@@ -1697,7 +1700,7 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
         lambda trainer, *, output_dir: {
             "training_dashboard_path": str(training_dashboard_path),
             "reward_curve_path": str(reward_curve_path),
-            "reward_log_path": str(reward_log_path),
+            "reward_log_path": str(trainer_reward_log_path),
             "history_points": 3,
             "zero_variance_warning": False,
         },
@@ -1708,6 +1711,22 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
         lambda args: {
             "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
             "checkpoint_path": checkpoint_path,
+            "episode_reward_history": [
+                {
+                    "episode": 1,
+                    "training_reward": 0.25,
+                    "total_reward": 0.2,
+                    "verifiable_reward": 0.2,
+                    "base_rl_reward": 0.2,
+                    "success_no_default_positive_npv": True,
+                }
+            ],
+            "bridge_diagnostics": {
+                "bridge_miss_count": 0,
+                "prompt_env_fallback_count": 0,
+                "signature_match_count": 4,
+                "fifo_fallback_count": 0,
+            },
         },
     )
     monkeypatch.setattr(liquidity_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
@@ -1722,5 +1741,49 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
     payload = json.loads(captured.out)
 
     assert payload["training"]["checkpoint_path"] == str(checkpoint_path.resolve())
-    assert payload["training"]["reward_log_path"] == str(reward_log_path.resolve())
+    assert payload["training"]["reward_log_path"] == str(episode_reward_log_path.resolve())
+    assert payload["training"]["episode_reward_log_path"] == str(episode_reward_log_path.resolve())
+    assert payload["training"]["trainer_reward_log_path"] == str(trainer_reward_log_path.resolve())
+    assert payload["training"]["strict_accuracy_bridge_valid"] is True
     assert payload["manifest_path"] == str(manifest_path)
+
+
+def test_simple_script_run_training_fails_loudly_on_bridge_miss(monkeypatch) -> None:
+    import rl.train_grpo_liquidity as liquidity_script
+
+    tmp_path = _workspace_tmp_dir("simple_training_bridge_failure")
+    checkpoint_path = tmp_path / "final-grpo-model"
+
+    monkeypatch.setattr(
+        liquidity_script,
+        "run_canonical_training_session",
+        lambda args: {
+            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
+            "checkpoint_path": checkpoint_path,
+            "episode_reward_history": [
+                {
+                    "episode": 1,
+                    "training_reward": -0.4,
+                    "total_reward": -0.47,
+                    "verifiable_reward": -0.47,
+                    "base_rl_reward": -0.47,
+                    "success_no_default_positive_npv": False,
+                }
+            ],
+            "bridge_diagnostics": {
+                "bridge_miss_count": 4,
+                "prompt_env_fallback_count": 4,
+                "signature_match_count": 0,
+                "fifo_fallback_count": 0,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Strict bridge validation failed"):
+        liquidity_script.run_training(
+            liquidity_script.make_training_args(
+                profile="tiny",
+                output_dir=str(tmp_path),
+                skip_smoke_test=True,
+            )
+        )

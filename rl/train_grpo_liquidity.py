@@ -189,12 +189,53 @@ def build_run_plan(args: argparse.Namespace, canonical_args: argparse.Namespace)
         "paths": {
             "output_dir": str(output_dir.resolve()),
             "final_checkpoint": str((output_dir / "final-grpo-model").resolve()),
-            "reward_log": str((output_dir / "reward_log.json").resolve()),
+            "reward_log": str((output_dir / "episode_reward_log.json").resolve()),
+            "episode_reward_log": str((output_dir / "episode_reward_log.json").resolve()),
+            "trainer_reward_log": str((output_dir / "reward_log.json").resolve()),
             "reward_curve": str((output_dir / "reward_curve.png").resolve()),
             "training_dashboard": str((output_dir / "training_dashboard.png").resolve()),
             "run_manifest": str((output_dir / "run_manifest.json").resolve()),
         },
     }
+
+
+def _write_episode_reward_log(records: list[dict[str, Any]], *, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    return output_path
+
+
+def _normalize_bridge_diagnostics(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    diagnostics = dict(payload or {})
+    for key in (
+        "bridge_miss_count",
+        "fifo_fallback_count",
+        "signature_match_count",
+        "prompt_env_fallback_count",
+    ):
+        diagnostics[key] = int(diagnostics.get(key, 0) or 0)
+    diagnostics["strict_accuracy_valid"] = bool(
+        diagnostics["bridge_miss_count"] <= 0 and diagnostics["prompt_env_fallback_count"] <= 0
+    )
+    return diagnostics
+
+
+def _raise_for_invalid_bridge(diagnostics: dict[str, Any], *, output_dir: Path) -> None:
+    if bool(diagnostics.get("strict_accuracy_valid", False)):
+        return
+
+    details: list[str] = []
+    if int(diagnostics.get("bridge_miss_count", 0) or 0) > 0:
+        details.append(f"bridge_miss_count={int(diagnostics['bridge_miss_count'])}")
+    if int(diagnostics.get("prompt_env_fallback_count", 0) or 0) > 0:
+        details.append(f"prompt_env_fallback_count={int(diagnostics['prompt_env_fallback_count'])}")
+    joined_details = ", ".join(details) if details else "unknown bridge mismatch"
+    raise RuntimeError(
+        "Strict bridge validation failed for notebook/simple liquidity training. "
+        "The reward curve would be inaccurate because TRL fell back to prompt-derived or unmatched rewards "
+        f"instead of matched rollout completions ({joined_details}). "
+        f"Inspect artifacts in {output_dir.resolve()} and fix the rollout bridge before trusting this curve."
+    )
 
 
 def smoke_test_environment(args: argparse.Namespace) -> dict[str, Any]:
@@ -250,10 +291,17 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
 
     smoke = None if args.skip_smoke_test else smoke_test_environment(canonical_args)
     result = run_canonical_training_session(canonical_args)
+    episode_reward_log_path = _write_episode_reward_log(
+        list(result.get("episode_reward_history", [])),
+        output_path=output_dir / "episode_reward_log.json",
+    )
+    bridge_diagnostics = _normalize_bridge_diagnostics(result.get("bridge_diagnostics"))
+    _raise_for_invalid_bridge(bridge_diagnostics, output_dir=output_dir)
+
     dashboard = save_training_dashboard(result["trainer"], output_dir=str(output_dir))
     reward_curve_path = Path(dashboard["reward_curve_path"])
-    reward_log_path = Path(dashboard["reward_log_path"])
-    plot_rewards(reward_log_path, reward_curve_path)
+    trainer_reward_log_path = Path(dashboard["reward_log_path"])
+    plot_rewards(episode_reward_log_path, reward_curve_path)
 
     manifest = {
         "run_type": "simple_grpo_training",
@@ -261,11 +309,15 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
         "smoke_test": smoke,
         "training": {
             "checkpoint_path": str(Path(result["checkpoint_path"]).resolve()),
-            "reward_log_path": str(reward_log_path.resolve()),
+            "reward_log_path": str(episode_reward_log_path.resolve()),
+            "episode_reward_log_path": str(episode_reward_log_path.resolve()),
+            "trainer_reward_log_path": str(trainer_reward_log_path.resolve()),
             "reward_curve_path": str(reward_curve_path.resolve()),
             "training_dashboard_path": str(Path(dashboard["training_dashboard_path"]).resolve()),
             "history_points": int(dashboard["history_points"]),
             "zero_variance_warning": bool(dashboard["zero_variance_warning"]),
+            "bridge_validation": bridge_diagnostics,
+            "strict_accuracy_bridge_valid": bool(bridge_diagnostics["strict_accuracy_valid"]),
         },
     }
     manifest_path = save_run_manifest(manifest, output_dir=str(output_dir))
