@@ -103,6 +103,62 @@ def build_exposed_environment_method_map(environment: Any) -> dict[str, Any]:
     return tools
 
 
+def get_final_reward(environment: Any) -> float:
+    """Return the deterministic final reward from the private or legacy helper surface."""
+    for method_name in ("_compute_final_reward", "compute_final_reward"):
+        try:
+            method = getattr(environment, method_name)
+        except Exception:
+            continue
+        if callable(method):
+            return float(method())
+    return float(getattr(environment, "reward", 0.0))
+
+
+def get_episode_log(environment: Any) -> str:
+    """Return a deterministic episode log from the private or legacy helper surface."""
+    for method_name in ("_build_episode_log", "build_episode_log"):
+        try:
+            method = getattr(environment, method_name)
+        except Exception:
+            continue
+        if callable(method):
+            return str(method())
+    return ""
+
+
+def get_episode_summary(environment: Any) -> EpisodeSummary:
+    """Return a deterministic episode summary from the private or legacy helper surface."""
+    for method_name in ("_summarize_episode", "summarize_episode"):
+        try:
+            method = getattr(environment, method_name)
+        except Exception:
+            continue
+        if callable(method):
+            return method()
+    fallback_reward = float(getattr(environment, "reward", 0.0) or 0.0)
+    return EpisodeSummary(
+        episode_completed=False,
+        base_rl_reward=0.0,
+        tool_bonus_total=0.0,
+        env_reward_total=fallback_reward,
+        success_no_default_positive_npv=False,
+        average_final_payment_days=0.0,
+        tool_usage_count=0,
+        resolved_deal_count=0,
+        defaulted_sme_count=0,
+        verifiable_reward=0.0,
+        total_reward=fallback_reward,
+        tool_call_count=0,
+        tool_effective_count=0,
+        duplicate_tool_count=0,
+        invalid_action_count=0,
+        stall_step_count=0,
+        terminated_by_step_cap=False,
+        tool_backend_mode=None,
+    )
+
+
 def format_observation(observation: Any, *, role: str = "sme", persona: Optional[str] = None) -> str:
     """Return a prompt-friendly string for a liquidity observation."""
     return format_observation_text(observation, role=role, persona=persona)
@@ -706,16 +762,16 @@ class InProcessEnvWrapper:
             final_payment_days,
         )
 
-    def compute_final_reward(self) -> float:
+    def _compute_final_reward(self) -> float:
         """Compute the final RL reward used by training-side reward functions."""
         base_reward, _, _ = self._weighted_deal_metrics()
         return round(float(base_reward) + float(self.tool_bonus_total), 6)
 
-    def build_episode_log(self) -> str:
+    def _build_episode_log(self) -> str:
         """Return a deterministic text log of the current episode."""
         return _build_episode_log(self)
 
-    def summarize_episode(self) -> EpisodeSummary:
+    def _summarize_episode(self) -> EpisodeSummary:
         """Summarize deterministic episode metrics for logging."""
         base_reward, weighted_npv_delta, final_payment_days = self._weighted_deal_metrics()
         _, verifiable_reward, _, _ = self._weighted_component_metrics()
@@ -823,7 +879,7 @@ class NegotiatorEnvFactory:
     @property
     def reward(self) -> float:
         """Accumulated per-step reward. Read by TRL reward functions."""
-        return self._wrapper.compute_final_reward()
+        return self._wrapper._compute_final_reward()
 
     @property
     def reward_breakdown(self) -> Any:
@@ -1031,13 +1087,13 @@ class NegotiatorEnvFactory:
         self._extract_and_cache_breakdown(obs_text)
         return obs_text
 
-    def summarize_episode(self) -> Any:
+    def _summarize_episode(self) -> Any:
         """Return a structured episode summary for logging and monitoring."""
-        return self._wrapper.summarize_episode()
+        return self._wrapper._summarize_episode()
 
-    def build_episode_log(self) -> str:
+    def _build_episode_log(self) -> str:
         """Return the deterministic episode text log."""
-        return self._wrapper.build_episode_log()
+        return self._wrapper._build_episode_log()
 
     @property
     def current_persona(self) -> Any:

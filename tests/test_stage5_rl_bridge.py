@@ -22,6 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from rl.bridge import (
     InProcessEnvWrapper,
     format_observation,
+    get_episode_log,
+    get_episode_summary,
+    get_final_reward,
     make_environment_factory,
     parse_action,
 )
@@ -225,7 +228,7 @@ def test_compute_final_reward_returns_float_after_episode() -> None:
     obs = wrapper.last_observation
     assert obs is not None
     wrapper.accept(price=float(obs.buyer_price), payment_days=int(obs.buyer_days))
-    final = wrapper.compute_final_reward()
+    final = get_final_reward(wrapper)
     assert isinstance(final, float)
     assert final >= 0.0
 
@@ -241,7 +244,7 @@ def test_summarize_episode_returns_correct_types() -> None:
     assert obs is not None
     wrapper.query_treds(invoice_id=obs.open_deal_ids[0])
     wrapper.accept(price=float(obs.buyer_price), payment_days=int(obs.buyer_days))
-    summary = wrapper.summarize_episode()
+    summary = get_episode_summary(wrapper)
     assert isinstance(summary, EpisodeSummary)
     assert isinstance(summary.episode_completed, bool)
     assert isinstance(summary.base_rl_reward, float)
@@ -258,10 +261,34 @@ def test_build_episode_log_returns_nonempty_string_with_config() -> None:
         price=float(wrapper.last_observation.buyer_price),
         payment_days=int(wrapper.last_observation.buyer_days),
     )
-    log = wrapper.build_episode_log()
+    log = get_episode_log(wrapper)
     assert isinstance(log, str)
     assert "seed=55" in log
     assert len(log) > 50
+
+
+def test_public_callable_surface_excludes_internal_logging_helpers() -> None:
+    wrapper = InProcessEnvWrapper()
+    public_callables = {
+        name
+        for name in dir(wrapper)
+        if not name.startswith("_") and callable(getattr(wrapper, name))
+    }
+
+    assert "compute_final_reward" not in public_callables
+    assert "build_episode_log" not in public_callables
+    assert "summarize_episode" not in public_callables
+    assert {
+        "reset",
+        "propose",
+        "accept",
+        "reject",
+        "advance_period",
+        "query_treds",
+        "check_compliance",
+        "run_cashflow_sim",
+        "simulate_plan",
+    }.issubset(public_callables)
 
 
 # ---------------------------------------------------------------------------

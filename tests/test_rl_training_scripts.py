@@ -1092,13 +1092,19 @@ def test_in_process_env_wrapper_public_tool_methods_are_typed_and_documented() -
         "check_compliance",
         "run_cashflow_sim",
         "simulate_plan",
-        "summarize_episode",
-        "build_episode_log",
     ):
         method = getattr(InProcessEnvWrapper, method_name)
         annotations = getattr(method, "__annotations__", {})
         assert annotations, f"{method_name} should expose type hints for tool/schema inference"
         assert method.__doc__, f"{method_name} should expose a docstring for tool/schema inference"
+
+
+def test_in_process_env_wrapper_internal_logging_helpers_are_private() -> None:
+    for method_name in ("_compute_final_reward", "_summarize_episode", "_build_episode_log"):
+        method = getattr(InProcessEnvWrapper, method_name)
+        annotations = getattr(method, "__annotations__", {})
+        assert annotations, f"{method_name} should remain typed for internal callers"
+        assert method.__doc__, f"{method_name} should remain documented for maintainers"
 
 
 def test_build_environment_tool_dicts_uses_canonical_allowlist_only() -> None:

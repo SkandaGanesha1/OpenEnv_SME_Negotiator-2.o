@@ -91,7 +91,9 @@ def build_episode_log(wrapper: object) -> str:
                 f"defaulted={sme.defaulted} missed_supplier_payment={sme.missed_supplier_payment}"
             )
 
-    summary = getattr(wrapper, "summarize_episode", None)
+    summary = getattr(wrapper, "_summarize_episode", None)
+    if not callable(summary):
+        summary = getattr(wrapper, "summarize_episode", None)
     if callable(summary):
         episode_summary = summary()
         lines.append(

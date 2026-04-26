@@ -17,6 +17,8 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Optional
 
+from .bridge import get_episode_log, get_episode_summary
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -109,7 +111,7 @@ class GenerationSampler:
         records = []
         for i, env in enumerate(samples):
             try:
-                episode_log = env.build_episode_log() if hasattr(env, "build_episode_log") else ""
+                episode_log = get_episode_log(env)
                 bd = None
                 if hasattr(env, "reward_breakdown"):
                     try:
@@ -118,15 +120,14 @@ class GenerationSampler:
                         bd = {"total": float(getattr(env, "reward", 0.0))}
 
                 summary = {}
-                if hasattr(env, "summarize_episode"):
-                    try:
-                        s = env.summarize_episode()
-                        if hasattr(s, "__dict__"):
-                            summary = vars(s)
-                        elif hasattr(s, "model_dump"):
-                            summary = s.model_dump()
-                    except Exception:
-                        pass
+                try:
+                    s = get_episode_summary(env)
+                    if hasattr(s, "__dict__"):
+                        summary = vars(s)
+                    elif hasattr(s, "model_dump"):
+                        summary = s.model_dump()
+                except Exception:
+                    pass
 
                 records.append({
                     "training_step": int(step),

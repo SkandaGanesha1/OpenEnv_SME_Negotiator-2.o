@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from rl.bridge import make_environment_factory
+from rl.bridge import get_episode_summary, get_final_reward, make_environment_factory
 from rl.episode_logging import combine_rewards
 from sme_negotiator_env.graders import compute_npv_delta_vs_baseline, compute_total_sme_reward
 
@@ -41,7 +41,7 @@ def test_weighted_final_reward_matches_manual_aggregation() -> None:
         total_weight += weight
     manual_reward = round((weighted / total_weight) + wrapper.tool_bonus_total, 6)
 
-    assert wrapper.compute_final_reward() == manual_reward
+    assert get_final_reward(wrapper) == manual_reward
 
 
 def test_compute_npv_delta_vs_baseline_is_deterministic() -> None:
@@ -65,11 +65,11 @@ def test_success_flag_flips_for_default_vs_positive_npv(monkeypatch) -> None:
     assert wrapper.env.state is not None
 
     monkeypatch.setattr(wrapper, "_weighted_deal_metrics", lambda: (0.2, 1.0, [30.0]))
-    summary = wrapper.summarize_episode()
+    summary = get_episode_summary(wrapper)
     assert summary.success_no_default_positive_npv is True
 
     wrapper.env.state.world_state.smes[0].defaulted = True
-    summary_after_default = wrapper.summarize_episode()
+    summary_after_default = get_episode_summary(wrapper)
     assert summary_after_default.success_no_default_positive_npv is False
 
 

@@ -32,7 +32,10 @@ from rl.bridge import (
     build_exposed_environment_method_map,
     execute_action,
     format_observation,
+    get_episode_log,
+    get_episode_summary,
     get_exposed_environment_method_names,
+    get_final_reward,
     make_environment_factory,
     parse_action,
 )
@@ -1463,8 +1466,11 @@ def make_reward_function(
             # instead of crashing, while our explicit rollout buffer path handles the
             # canonical environment-based signal.
             if not (
-                hasattr(env, "build_episode_log")
+                hasattr(env, "_build_episode_log")
+                or hasattr(env, "build_episode_log")
+                or hasattr(env, "_compute_final_reward")
                 or hasattr(env, "compute_final_reward")
+                or hasattr(env, "_summarize_episode")
                 or hasattr(env, "summarize_episode")
             ):
                 if not warned_non_environment_inputs:
@@ -1486,13 +1492,13 @@ def make_reward_function(
                     verifiable = None
             if verifiable is None:
                 try:
-                    base_reward = float(env.compute_final_reward())
+                    base_reward = get_final_reward(env)
                 except Exception:
                     base_reward = float(getattr(env, "reward", 0.0))
             else:
                 shaping_signal = 0.0
                 try:
-                    summary = env.summarize_episode()
+                    summary = get_episode_summary(env)
                     env_total = float(getattr(summary, "env_reward_total", 0.0) or 0.0)
                     shaping_signal = max(0.0, env_total - verifiable)
                 except Exception:
@@ -1517,8 +1523,8 @@ def make_reward_function(
                 base_reward += 0.1 * _completion_format_score(completion_text)
 
             final_reward = base_reward
-            episode_log = env.build_episode_log()
-            summary = env.summarize_episode()
+            episode_log = get_episode_log(env)
+            summary = get_episode_summary(env)
             metadata = getattr(getattr(env, "last_observation", None), "metadata", {}) or {}
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
                 rubric_scores = rubric_scorer(episode_log)
@@ -2142,8 +2148,8 @@ def _score_prompt_completion_via_environment(
             if metadata_reason:
                 final_reason = f"prompt_env_relaxed_{metadata_reason}"
         return {
-            "episode_summary": wrapper.summarize_episode(),
-            "episode_log": wrapper.build_episode_log(),
+            "episode_summary": get_episode_summary(wrapper),
+            "episode_log": get_episode_log(wrapper),
             "raw_completion_text": completion_text,
             "termination_reason": final_reason,
             "invalid_parse_fraction": 1.0,
@@ -2192,8 +2198,8 @@ def _score_prompt_completion_via_environment(
         termination_reason = "prompt_env_incomplete"
 
     return {
-        "episode_summary": wrapper.summarize_episode(),
-        "episode_log": wrapper.build_episode_log(),
+        "episode_summary": get_episode_summary(wrapper),
+        "episode_log": get_episode_log(wrapper),
         "raw_completion_text": completion_text,
         "termination_reason": termination_reason,
         "invalid_parse_fraction": 0.0 if was_valid_json else 1.0,
@@ -2273,8 +2279,8 @@ def _run_single_rollout_sample(
             break
         current_observation_text = format_observation(latest_observation)
 
-    summary = wrapper.summarize_episode()
-    episode_log = wrapper.build_episode_log()
+    summary = get_episode_summary(wrapper)
+    episode_log = get_episode_log(wrapper)
     last_observation = getattr(wrapper, "last_observation", None)
     reward_breakdown = {}
     if last_observation is not None:

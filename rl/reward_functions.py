@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
+from .bridge import get_episode_log, get_episode_summary, get_final_reward
+
 # ======================================================================= #
 # Internal helpers                                                         #
 # ======================================================================= #
@@ -80,14 +82,14 @@ def make_outcome_reward(
             # Fall back to compute_final_reward() if no terminal components set
             if base == 0.0 and not getattr(bd, "is_terminal", False):
                 try:
-                    base = float(env.compute_final_reward())
+                    base = get_final_reward(env)
                 except Exception:
                     base = float(getattr(env, "reward", 0.0))
 
             final = base
             if rubric_scorer is not None and rubric_weight > 0.0:
                 try:
-                    episode_log = env.build_episode_log()
+                    episode_log = get_episode_log(env)
                     rubric_scores = rubric_scorer(episode_log)
                     persona = getattr(env, "current_persona", None)
                     if persona is not None and hasattr(persona, "rubric_weights"):
@@ -102,7 +104,7 @@ def make_outcome_reward(
 
             if summary_buffer is not None:
                 try:
-                    summary_buffer.append(env.summarize_episode())
+                    summary_buffer.append(get_episode_summary(env))
                 except Exception:
                     pass
 

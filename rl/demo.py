@@ -17,6 +17,7 @@ from rl.bridge import (
     SUPPORTED_TOOL_NAMES,
     execute_action,
     format_observation,
+    get_episode_summary,
     make_environment_factory,
 )
 from rl.train_grpo_trl import (
@@ -414,7 +415,7 @@ def run_heuristic_episode(
         if observation.done:
             break
 
-    episode_summary = wrapper.summarize_episode()
+    episode_summary = get_episode_summary(wrapper)
     summary = _episode_summary_view(episode_summary)
 
     return _policy_episode_result(
@@ -957,7 +958,7 @@ def run_policy_episode_report(
             break
         messages.append({"role": "user", "content": _build_observation_message(format_observation(observation))})
 
-    summary = _episode_summary_view(wrapper.summarize_episode())
+    summary = _episode_summary_view(get_episode_summary(wrapper))
     return _policy_episode_result(
         seed=seed,
         transcript_lines=transcript_lines,

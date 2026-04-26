@@ -11,7 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from rl.bridge import format_observation, make_environment_factory, parse_action
+from rl.bridge import format_observation, get_final_reward, make_environment_factory, parse_action
 
 
 def test_format_observation_includes_macro_fields_and_tool_summaries() -> None:
@@ -97,7 +97,7 @@ def test_compute_final_reward_is_deterministic_for_fixed_seed() -> None:
     wrapper_a.reset(task_name="liquidity-correlation-hard", difficulty="hard", seed=1020, total_periods=1)
     wrapper_b.reset(task_name="liquidity-correlation-hard", difficulty="hard", seed=1020, total_periods=1)
 
-    assert wrapper_a.compute_final_reward() == wrapper_b.compute_final_reward()
+    assert get_final_reward(wrapper_a) == get_final_reward(wrapper_b)
 
 
 def test_bridge_smoke_episode_runs_in_process_without_model_download() -> None:
