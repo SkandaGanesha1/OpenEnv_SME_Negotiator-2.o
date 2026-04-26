@@ -1617,6 +1617,13 @@ def _coerce_vllm_sampled_logprobs(raw_logprobs: Any, completion_ids: list[int]) 
     return values
 
 
+def _format_rollout_logprobs_for_trl(logprobs: list[float], completion_ids: list[int]) -> list[list[float]]:
+    values = list(logprobs) if logprobs else [0.0 for _ in completion_ids]
+    if len(values) < len(completion_ids):
+        values.extend([0.0 for _ in range(len(completion_ids) - len(values))])
+    return [[float(value)] for value in values[: len(completion_ids)]]
+
+
 def _generate_completion_turn_with_vllm(
     vllm_llm: Any,
     tokenizer: Any,
@@ -2185,7 +2192,13 @@ def build_rollout_func(
         return {
             "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
             "completion_ids": [list(sample["completion_ids"]) for sample in samples],
-            "logprobs": [list(sample["logprobs"]) for sample in samples],
+            "logprobs": [
+                _format_rollout_logprobs_for_trl(
+                    list(sample["logprobs"]),
+                    list(sample["completion_ids"]),
+                )
+                for sample in samples
+            ],
             "episode_summaries": [sample["episode_summary"] for sample in samples],
             "episode_logs": [sample["episode_log"] for sample in samples],
             "reward_breakdowns": [sample["reward_breakdown"] for sample in samples],

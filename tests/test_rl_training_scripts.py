@@ -1207,6 +1207,7 @@ def test_build_rollout_func_duplicates_each_prompt_by_num_generations(monkeypatc
     assert len(result["prompt_ids"]) == 3
     assert len(result["completion_ids"]) == 3
     assert len(result["episode_summaries"]) == 3
+    assert result["logprobs"] == [[[-0.1]], [[-0.1]], [[-0.1]]]
     assert all(std > 0.0 for std in result["env_reward_std"])
     assert all(count >= 1.0 for count in result["unique_action_count"])
 
