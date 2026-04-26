@@ -9,6 +9,7 @@ for notebook orchestration and the simple CLI training entrypoint.
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import re
 from datetime import datetime
@@ -88,10 +89,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--logging-steps", type=int, default=1)
     parser.add_argument("--save-steps", type=int, default=1000)
     parser.add_argument("--rubric-weight", type=float, default=0.0)
-    parser.add_argument("--use-vllm", action="store_true")
+    parser.add_argument("--use-vllm", dest="use_vllm", action="store_true")
+    parser.add_argument("--no-vllm", dest="use_vllm", action="store_false")
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
     parser.add_argument("--skip-smoke-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.set_defaults(use_vllm=True)
     return parser
 
 
@@ -238,6 +241,27 @@ def _raise_for_invalid_bridge(diagnostics: dict[str, Any], *, output_dir: Path) 
     )
 
 
+def _require_vllm_for_rollout_training(args: argparse.Namespace) -> None:
+    if bool(getattr(args, "use_vllm", False)):
+        return
+    raise RuntimeError(
+        "This notebook-facing GRPO path requires `use_vllm=True` for accurate explicit rollouts with the pinned "
+        "TRL build. The installed trainer ignores `rollout_func` on the non-vLLM path, which leaves the pending "
+        "rollout buffer empty and forces fallback scoring. Set `USE_VLLM = True` in the notebook and rerun the "
+        "install/bootstrap cell so vLLM is available before starting training."
+    )
+
+
+def _require_vllm_installed() -> None:
+    try:
+        importlib.import_module("vllm")
+    except Exception as exc:
+        raise RuntimeError(
+            "This notebook-facing GRPO path requires the `vllm` package. Rerun the notebook install cell, which "
+            "should install `trl[vllm]` and `vllm`, then restart the runtime before training again."
+        ) from exc
+
+
 def smoke_test_environment(args: argparse.Namespace) -> dict[str, Any]:
     """Run a cheap reset-only smoke test against the in-process environment."""
     rows = build_training_rows(
@@ -274,7 +298,10 @@ def smoke_test_environment(args: argparse.Namespace) -> dict[str, Any]:
 
 def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     """Build a canonical liquidity GRPO session using notebook-friendly args."""
-    return build_canonical_training_session(build_canonical_training_args(args))
+    canonical_args = build_canonical_training_args(args)
+    _require_vllm_for_rollout_training(canonical_args)
+    _require_vllm_installed()
+    return build_canonical_training_session(canonical_args)
 
 
 def build_trainer(args: argparse.Namespace) -> tuple[dict[str, Any], Any]:
@@ -286,6 +313,8 @@ def build_trainer(args: argparse.Namespace) -> tuple[dict[str, Any], Any]:
 def run_training(args: argparse.Namespace) -> dict[str, Any]:
     """Run canonical liquidity GRPO training and save standard artifacts."""
     canonical_args = build_canonical_training_args(args)
+    _require_vllm_for_rollout_training(canonical_args)
+    _require_vllm_installed()
     output_dir = Path(canonical_args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

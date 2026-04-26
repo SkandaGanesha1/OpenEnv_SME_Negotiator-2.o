@@ -107,6 +107,9 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     assert 'REPO_BRANCH = "round1_baseline"' in source
     assert "ensure_liquidity_repo" in source
     assert '"git", "clone", "--branch", REPO_BRANCH' in source
+    assert '"trl[vllm]==0.29.0"' in source
+    assert '"vllm>=0.11.0"' in source
+    assert "USE_VLLM = True" in source
     assert "make_training_args" in source
     assert "build_canonical_training_args" in source
     assert "build_run_plan" in source
@@ -118,6 +121,7 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     assert "Smoke test passed. Environment is ready for training." in source
     assert 'outputs/grpo_sme_liquidity_simple' in source
     assert "smoke-sized run and will produce a sparse reward curve" in source
+    assert "rollout_func path is only wired through the vLLM backend" in source
     assert "Episode reward log path:" in source
     assert 'training_artifacts.get("episode_reward_log_path", training_artifacts["reward_log_path"])' in source
     assert "Trainer reward log path:" in source

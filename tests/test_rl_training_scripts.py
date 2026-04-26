@@ -194,6 +194,20 @@ def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
     assert canonical.max_episode_steps == 12
 
 
+def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
+    import rl.train_grpo_liquidity as liquidity_script
+
+    with pytest.raises(RuntimeError, match="requires `use_vllm=True`"):
+        liquidity_script.run_training(
+            liquidity_script.make_training_args(
+                profile="tiny",
+                output_dir=str(_workspace_tmp_dir("liquidity_no_vllm")),
+                skip_smoke_test=True,
+                use_vllm=False,
+            )
+        )
+
+
 def test_configure_tokenizer_enforces_left_padding_and_pad_token_fallback() -> None:
     tokenizer = configure_tokenizer(_DummyTokenizer())
     assert tokenizer.padding_side == "left"
@@ -1705,6 +1719,7 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
             "zero_variance_warning": False,
         },
     )
+    monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
     monkeypatch.setattr(
         liquidity_script,
         "run_canonical_training_session",
@@ -1754,6 +1769,7 @@ def test_simple_script_run_training_fails_loudly_on_bridge_miss(monkeypatch) -> 
     tmp_path = _workspace_tmp_dir("simple_training_bridge_failure")
     checkpoint_path = tmp_path / "final-grpo-model"
 
+    monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
     monkeypatch.setattr(
         liquidity_script,
         "run_canonical_training_session",
