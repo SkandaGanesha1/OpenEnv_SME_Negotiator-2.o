@@ -1662,6 +1662,10 @@ def _format_rollout_logprobs_for_trl(logprobs: list[float], completion_ids: list
     return [[float(value)] for value in values[: len(completion_ids)]]
 
 
+def _format_rollout_logprob_token_ids_for_trl(completion_ids: list[int]) -> list[list[int]]:
+    return [[int(token_id)] for token_id in completion_ids]
+
+
 def _generate_completion_turn_with_vllm(
     vllm_llm: Any,
     tokenizer: Any,
@@ -2236,6 +2240,12 @@ def build_rollout_func(
                 )
                 for sample in samples
             ],
+            "logprob_token_ids": [
+                _format_rollout_logprob_token_ids_for_trl(
+                    list(sample["completion_ids"]),
+                )
+                for sample in samples
+            ],
             "episode_summaries": [sample["episode_summary"] for sample in samples],
             "episode_logs": [sample["episode_log"] for sample in samples],
             "reward_breakdowns": [sample["reward_breakdown"] for sample in samples],
@@ -2409,6 +2419,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["max_steps"] = int(args.max_steps)
     if bool(args.use_vllm):
         kwargs["vllm_mode"] = args.vllm_mode
+        kwargs["vllm_importance_sampling_correction"] = False
         kwargs["vllm_gpu_memory_utilization"] = float(
             getattr(args, "vllm_gpu_memory_utilization", 0.5) or 0.5
         )

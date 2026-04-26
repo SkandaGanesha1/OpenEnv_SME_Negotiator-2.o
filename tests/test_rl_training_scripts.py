@@ -1058,6 +1058,7 @@ def test_build_grpo_config_kwargs_sets_notebook_safe_vllm_limits() -> None:
 
     assert kwargs["vllm_gpu_memory_utilization"] == 0.45
     assert kwargs["vllm_max_model_length"] == 2048
+    assert kwargs["vllm_importance_sampling_correction"] is False
 
 
 def test_make_training_args_applies_notebook_overrides_without_mutating_parser_defaults() -> None:
@@ -1244,6 +1245,7 @@ def test_build_rollout_func_duplicates_each_prompt_by_num_generations(monkeypatc
     assert len(result["completion_ids"]) == 3
     assert len(result["episode_summaries"]) == 3
     assert result["logprobs"] == [[[-0.1]], [[-0.1]], [[-0.1]]]
+    assert result["logprob_token_ids"] == [[[10]], [[11]], [[12]]]
     assert all(std > 0.0 for std in result["env_reward_std"])
     assert all(count >= 1.0 for count in result["unique_action_count"])
 
