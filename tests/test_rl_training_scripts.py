@@ -1149,6 +1149,42 @@ def test_patch_vllm_notebook_stdout_replaces_suppressors_and_sets_debug(monkeypa
         pass
 
 
+def test_patch_vllm_attention_backend_prefers_triton_on_pre_ampere(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda index=0: (7, 5),
+        )
+    )
+
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    trl_script._patch_vllm_attention_backend()
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+
+
+def test_patch_vllm_attention_backend_respects_existing_override(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda index=0: (7, 5),
+        )
+    )
+
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    trl_script._patch_vllm_attention_backend()
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
+
+
 def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:
     args = build_arg_parser().parse_args([])
 

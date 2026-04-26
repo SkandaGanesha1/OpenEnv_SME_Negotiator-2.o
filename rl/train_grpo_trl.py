@@ -209,6 +209,25 @@ def _patch_vllm_notebook_stdout() -> None:
         setattr(module, "suppress_stdout", _passthrough_suppress_stdout)
 
 
+def _patch_vllm_attention_backend() -> None:
+    """Prefer a non-FlashInfer backend on older notebook GPUs unless overridden."""
+
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        major, _minor = torch.cuda.get_device_capability(0)
+    except Exception:
+        return
+    if int(major) < 8:
+        os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -2744,6 +2763,7 @@ def create_trainer(session: dict[str, Any]) -> Any:
     """Instantiate GRPOTrainer from a freshly built training session."""
     os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
+        _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
