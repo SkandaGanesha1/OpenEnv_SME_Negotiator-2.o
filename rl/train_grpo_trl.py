@@ -112,6 +112,48 @@ def _training_log_backend(env: Optional[dict[str, str]] = None) -> str:
     return "none"
 
 
+def _patch_additional_chat_templates_404() -> None:
+    """Treat missing additional chat templates as an empty directory.
+
+    Some `transformers`/`huggingface_hub` runtime combinations raise
+    `RemoteEntryNotFoundError` when a model repo does not contain the optional
+    `additional_chat_templates/` directory. Tokenizer loading should interpret
+    that case as "no extra templates", not as a fatal error.
+    """
+
+    try:
+        import huggingface_hub.utils as hf_hub_utils
+        import transformers.tokenization_utils_base as tokenization_utils_base
+        import transformers.utils.hub as transformers_hub
+    except Exception:
+        return
+
+    original = getattr(transformers_hub.list_repo_templates, "__wrapped_original__", None)
+    if original is None:
+        original = transformers_hub.list_repo_templates
+
+    error_types = tuple(
+        error_type
+        for error_type in (
+            getattr(hf_hub_utils, "RemoteEntryNotFoundError", None),
+            getattr(hf_hub_utils, "EntryNotFoundError", None),
+        )
+        if error_type is not None
+    )
+    if not error_types:
+        return
+
+    def _safe_list_repo_templates(*args: Any, **kwargs: Any) -> list[str]:
+        try:
+            return original(*args, **kwargs)
+        except error_types:
+            return []
+
+    setattr(_safe_list_repo_templates, "__wrapped_original__", original)
+    transformers_hub.list_repo_templates = _safe_list_repo_templates
+    tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -566,6 +608,7 @@ def load_training_model_and_tokenizer(model_name: str) -> tuple[Any, Any]:
     """Load the canonical model/tokenizer pair for explicit rollout training."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    _patch_additional_chat_templates_404()
     tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(model_name))
     model_kwargs: dict[str, Any] = {"low_cpu_mem_usage": True}
     torch_dtype = _cuda_training_dtype()

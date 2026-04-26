@@ -977,6 +977,43 @@ def test_make_training_args_applies_notebook_overrides_without_mutating_parser_d
     assert updated.use_vllm is False
 
 
+def test_patch_additional_chat_templates_404_returns_empty_template_list(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    import huggingface_hub.utils as hf_hub_utils
+
+    error_type = getattr(hf_hub_utils, "RemoteEntryNotFoundError", None) or getattr(
+        hf_hub_utils, "EntryNotFoundError", None
+    )
+    assert error_type is not None
+
+    def _raising_list_repo_templates(*args, **kwargs):
+        raise error_type("missing additional_chat_templates")
+
+    fake_transformers_pkg = types.ModuleType("transformers")
+    fake_transformers_pkg.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_utils_pkg = types.ModuleType("transformers.utils")
+    fake_transformers_utils_pkg.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_hub = types.ModuleType("transformers.utils.hub")
+    fake_transformers_hub.list_repo_templates = _raising_list_repo_templates
+    fake_tokenization_utils_base = types.ModuleType("transformers.tokenization_utils_base")
+    fake_tokenization_utils_base.list_repo_templates = _raising_list_repo_templates
+
+    fake_transformers_pkg.utils = fake_transformers_utils_pkg
+    fake_transformers_pkg.tokenization_utils_base = fake_tokenization_utils_base
+    fake_transformers_utils_pkg.hub = fake_transformers_hub
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers_pkg)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_transformers_utils_pkg)
+    monkeypatch.setitem(sys.modules, "transformers.utils.hub", fake_transformers_hub)
+    monkeypatch.setitem(sys.modules, "transformers.tokenization_utils_base", fake_tokenization_utils_base)
+
+    trl_script._patch_additional_chat_templates_404()
+
+    assert fake_transformers_hub.list_repo_templates() == []
+    assert fake_tokenization_utils_base.list_repo_templates() == []
+
+
 def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:
     args = build_arg_parser().parse_args([])
 
