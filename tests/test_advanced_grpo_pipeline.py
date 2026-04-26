@@ -103,12 +103,13 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     source = _load_notebook_source("grpo_sme_liquidity.ipynb")
 
     assert 'RUN_PROFILE = "tiny"' in source
-    assert "from rl.train_grpo_simple import (" in source
+    assert "from rl.train_grpo_liquidity import (" in source
     assert "make_training_args" in source
     assert "build_canonical_training_args" in source
     assert "build_run_plan" in source
+    assert "build_training_session" in source
     assert "smoke_test_environment" in source
-    assert "run_simple_training" in source
+    assert "run_training" in source
     assert "plot_rewards" in source
     assert "Smoke test passed. Environment is ready for training." in source
     assert 'outputs/grpo_sme_liquidity_simple' in source

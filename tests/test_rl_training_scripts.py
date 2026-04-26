@@ -48,11 +48,11 @@ from rl.train_grpo_unsloth import (
     build_grpo_config_kwargs as unsloth_build_grpo_config_kwargs,
     main as unsloth_main,
 )
-from rl.train_grpo_simple import (
-    build_canonical_training_args as build_simple_canonical_training_args,
-    main as simple_main,
-    make_training_args as make_simple_training_args,
-    resolve_profile_config as resolve_simple_profile_config,
+from rl.train_grpo_liquidity import (
+    build_canonical_training_args as build_liquidity_canonical_training_args,
+    main as liquidity_main,
+    make_training_args as make_liquidity_training_args,
+    resolve_profile_config as resolve_liquidity_profile_config,
 )
 
 
@@ -121,7 +121,7 @@ def test_dry_run_works_for_trl_and_unsloth(capsys) -> None:
 
 
 def test_simple_script_dry_run_works(capsys) -> None:
-    assert simple_main(["--dry-run", "--profile", "tiny"]) == 0
+    assert liquidity_main(["--dry-run", "--profile", "tiny"]) == 0
     captured = capsys.readouterr()
     assert '"mode": "dry-run"' in captured.out
     assert '"smoke_test"' in captured.out
@@ -176,14 +176,14 @@ def test_dataset_builder_emits_expected_columns_and_seed_range() -> None:
 
 
 def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
-    defaults = make_simple_training_args()
-    resolved_defaults = resolve_simple_profile_config(defaults)
+    defaults = make_liquidity_training_args()
+    resolved_defaults = resolve_liquidity_profile_config(defaults)
     assert resolved_defaults["num_samples"] == 8
     assert resolved_defaults["max_steps"] == 4
 
-    updated = make_simple_training_args(profile="standard", num_samples=20, learning_rate=1e-5)
-    resolved_updated = resolve_simple_profile_config(updated)
-    canonical = build_simple_canonical_training_args(updated)
+    updated = make_liquidity_training_args(profile="standard", num_samples=20, learning_rate=1e-5)
+    resolved_updated = resolve_liquidity_profile_config(updated)
+    canonical = build_liquidity_canonical_training_args(updated)
 
     assert resolved_updated["num_samples"] == 20
     assert resolved_updated["learning_rate"] == 1e-5
@@ -1682,7 +1682,7 @@ def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
 
 
 def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, capsys) -> None:
-    import rl.train_grpo_simple as simple_script
+    import rl.train_grpo_liquidity as liquidity_script
 
     tmp_path = _workspace_tmp_dir("simple_training_script")
     checkpoint_path = tmp_path / "final-grpo-model"
@@ -1692,15 +1692,7 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
     manifest_path = tmp_path / "run_manifest.json"
 
     monkeypatch.setattr(
-        simple_script,
-        "run_training_session",
-        lambda args: {
-            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
-            "checkpoint_path": checkpoint_path,
-        },
-    )
-    monkeypatch.setattr(
-        simple_script,
+        liquidity_script,
         "save_training_dashboard",
         lambda trainer, *, output_dir: {
             "training_dashboard_path": str(training_dashboard_path),
@@ -1710,14 +1702,22 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
             "zero_variance_warning": False,
         },
     )
-    monkeypatch.setattr(simple_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
     monkeypatch.setattr(
-        simple_script,
+        liquidity_script,
+        "run_canonical_training_session",
+        lambda args: {
+            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
+            "checkpoint_path": checkpoint_path,
+        },
+    )
+    monkeypatch.setattr(liquidity_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
+    monkeypatch.setattr(
+        liquidity_script,
         "save_run_manifest",
         lambda manifest, *, output_dir, filename="run_manifest.json": str(manifest_path),
     )
 
-    assert simple_main(["--profile", "tiny", "--output-dir", str(tmp_path), "--skip-smoke-test"]) == 0
+    assert liquidity_main(["--profile", "tiny", "--output-dir", str(tmp_path), "--skip-smoke-test"]) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
