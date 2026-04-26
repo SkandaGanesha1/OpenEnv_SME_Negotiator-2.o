@@ -25,10 +25,7 @@ from rl.bridge import InProcessEnvWrapper, get_exposed_environment_method_names
 from rl.train_grpo_trl import (
     _align_trl_environment_batch,
     _build_environment_tool_dicts,
-    _ensure_trainer_vllm_aliases,
     _infer_expected_environment_batch_size,
-    _patch_trl_vllm_llm_alias,
-    _resolve_trainer_vllm_llm,
     _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
     _generate_completion_turn,
@@ -1359,77 +1356,6 @@ def test_patch_vllm_attention_backend_respects_existing_override(monkeypatch) ->
     trl_script._patch_vllm_attention_backend()
 
     assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
-
-
-def test_resolve_trainer_vllm_llm_prefers_vllm_generation_handle() -> None:
-    llm = object()
-    trainer = SimpleNamespace(
-        use_vllm=True,
-        llm=None,
-        vllm_generation=SimpleNamespace(llm=llm),
-    )
-
-    assert _resolve_trainer_vllm_llm(trainer) is llm
-
-
-def test_ensure_trainer_vllm_aliases_sets_llm_from_generation_handle() -> None:
-    llm = object()
-    trainer = SimpleNamespace(
-        use_vllm=True,
-        llm=None,
-        vllm_generation=SimpleNamespace(llm=llm),
-        args=SimpleNamespace(vllm_max_model_length=2048),
-    )
-
-    _ensure_trainer_vllm_aliases(trainer)
-
-    assert trainer.llm is llm
-
-
-def test_ensure_trainer_vllm_aliases_builds_length_proxy_when_only_args_exist() -> None:
-    trainer = SimpleNamespace(
-        use_vllm=True,
-        llm=None,
-        vllm_generation=None,
-        args=SimpleNamespace(vllm_max_model_length=3072),
-    )
-
-    _ensure_trainer_vllm_aliases(trainer)
-
-    assert trainer.llm.llm_engine.model_config.max_model_len == 3072
-
-
-def test_patch_trl_vllm_llm_alias_wraps_tool_call_loop(monkeypatch) -> None:
-    import rl.train_grpo_trl as trl_script
-
-    fake_trl = types.ModuleType("trl")
-    fake_trainer_pkg = types.ModuleType("trl.trainer")
-    fake_grpo_module = types.ModuleType("trl.trainer.grpo_trainer")
-    observed: dict[str, Any] = {}
-
-    class _FakeGRPOTrainer:
-        def __init__(self) -> None:
-            self.use_vllm = True
-            self.llm = None
-            self.vllm_generation = SimpleNamespace(llm=object())
-            self.args = SimpleNamespace(vllm_max_model_length=2048)
-
-        def _tool_call_loop(self, *args, **kwargs):
-            observed["llm"] = self.llm
-            return "ok"
-
-    fake_trainer_pkg.grpo_trainer = fake_grpo_module
-    fake_trl.trainer = fake_trainer_pkg
-    monkeypatch.setitem(sys.modules, "trl", fake_trl)
-    monkeypatch.setitem(sys.modules, "trl.trainer", fake_trainer_pkg)
-    fake_grpo_module.GRPOTrainer = _FakeGRPOTrainer
-    monkeypatch.setitem(sys.modules, "trl.trainer.grpo_trainer", fake_grpo_module)
-
-    trl_script._patch_trl_vllm_llm_alias()
-    trainer = _FakeGRPOTrainer()
-
-    assert trainer._tool_call_loop() == "ok"
-    assert observed["llm"] is trainer.vllm_generation.llm
 
 
 def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:

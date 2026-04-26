@@ -3219,7 +3219,6 @@ def create_trainer(session: dict[str, Any]) -> Any:
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
         _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
-        _patch_trl_vllm_llm_alias()
     runtime_backend = str(session.get("runtime_backend", "environment"))
     if runtime_backend == "legacy":
         _patch_trl_shuffle_sequence_dict()
@@ -3227,7 +3226,6 @@ def create_trainer(session: dict[str, Any]) -> Any:
         _patch_trl_environment_batch_alignment()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     trainer = GRPOTrainer(**dict(session["trainer_kwargs"]))
-    _ensure_trainer_vllm_aliases(trainer)
     if runtime_backend == "environment":
         setattr(trainer, "_canonical_environment_factory", session["trainer_kwargs"].get("environment_factory"))
     return trainer
