@@ -119,7 +119,7 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     assert 'outputs/grpo_sme_liquidity_simple' in source
     assert "smoke-sized run and will produce a sparse reward curve" in source
     assert "Episode reward log path:" in source
-    assert 'manifest["training"]["episode_reward_log_path"]' in source
+    assert 'training_artifacts.get("episode_reward_log_path", training_artifacts["reward_log_path"])' in source
     assert "Trainer reward log path:" in source
     assert "Checkpoint path:" in source
 
