@@ -47,8 +47,7 @@ DEFAULT_PROMPT = (
     "/no_think\n"
     "You are an SME treasury agent operating a deterministic long-horizon liquidity workflow. "
     "Maximize the final verifiable reward, preserve positive NPV, use tools only when they improve the current state, "
-    "and finish the episode without default. "
-    + build_action_contract_text()
+    "and finish the episode without default. Use the environment tools directly for each turn and avoid extra prose."
 )
 TRAINING_ROW_PREFIX = "[TRAINING_ROW]"
 ROLLOUT_SYSTEM_PROMPT = (
@@ -229,14 +228,7 @@ def _patch_vllm_attention_backend() -> None:
 
 
 def _patch_trl_shuffle_sequence_dict() -> None:
-    """Guard TRL's shuffle_sequence_dict against mismatched tensor first-dims.
-
-    TRL 0.29.0 computes n from the first value in the generation-batch dict and
-    applies torch.randperm(n) to every tensor.  If any tensor has first-dim != n
-    (e.g. because completion_ids are longer than max_completion_length) the CUDA
-    IndexKernel fires an async assertion that surfaces here as an AcceleratorError.
-    This wrapper detects size mismatches and skips shuffling rather than crashing.
-    """
+    """Turn legacy rollout shuffle mismatches into an actionable debug failure."""
     try:
         import trl.trainer.utils as _trl_utils
     except ImportError:
@@ -247,20 +239,18 @@ def _patch_trl_shuffle_sequence_dict() -> None:
         return
 
     def _safe_shuffle_sequence_dict(seq_dict: dict) -> dict:
-        first_dims: set[int] = set()
-        for v in seq_dict.values():
-            if isinstance(v, list) and v:
-                first_dims.add(len(v))
-            elif hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1:
-                first_dims.add(int(v.shape[0]))
-        if len(first_dims) != 1:
-            print(
-                f"[train_grpo_trl][WARN] shuffle_sequence_dict skipped: "
-                f"inconsistent tensor first dims {sorted(first_dims)}. "
-                "Verify rollout completion_ids are bounded to max_completion_length.",
-                flush=True,
+        shape_report: dict[str, int] = {}
+        for key, value in seq_dict.items():
+            if isinstance(value, list) and value:
+                shape_report[str(key)] = len(value)
+            elif hasattr(value, "shape") and getattr(value, "ndim", 0) >= 1:
+                shape_report[str(key)] = int(value.shape[0])
+        if len(set(shape_report.values())) > 1:
+            raise RuntimeError(
+                "TRL shuffle_sequence_dict saw inconsistent tensor first dimensions in legacy rollout mode: "
+                f"{shape_report}. "
+                "This indicates a malformed explicit-rollout batch and should be fixed at the rollout bridge."
             )
-            return seq_dict
         return original(seq_dict)
 
     setattr(_safe_shuffle_sequence_dict, "__wrapped_safe__", True)
@@ -1076,11 +1066,12 @@ def make_reward_function(
     rubric_scorer=None,
     rubric_weight: float = 0.0,
     summary_buffer: Optional[EpisodeSummaryBuffer] = None,
+    runtime_backend: str = "environment",
     pending_rollout_buffer: Optional[PendingRolloutBuffer] = None,
     prompt_env_factory: Optional[Callable[[], Any]] = None,
     prompt_env_args: Any = None,
 ) -> Callable[[list[Any]], list[float]]:
-    """Build the TRL reward function for both explicit rollouts and env wrappers."""
+    """Build the TRL reward function for environment-native and legacy backends."""
     warned_non_environment_inputs = False
     warned_pending_bridge_miss = False
     warned_pending_fifo_fallback = False
@@ -1214,8 +1205,10 @@ def make_reward_function(
                 contract_score_value=contract_score,
             )
 
-        batch_count = len(completions or prompts or inputs or kwargs.get("environments") or [])
-        if pending_rollout_buffer is not None and batch_count > 0:
+        batch_count = 0
+        if runtime_backend == "legacy":
+            batch_count = len(completions or prompts or inputs or kwargs.get("environments") or [])
+        if runtime_backend == "legacy" and pending_rollout_buffer is not None and batch_count > 0:
             bridge_debug_state["reward_calls"] = int(bridge_debug_state["reward_calls"]) + 1
             prompt_batch = prompts or kwargs.get("prompts") or kwargs.get("inputs")
             completion_batch = completions or kwargs.get("completions")
@@ -1342,9 +1335,9 @@ def make_reward_function(
                     ],
                 )
 
-        resolved_inputs = inputs
+        resolved_inputs = kwargs.get("environments")
         if resolved_inputs is None:
-            resolved_inputs = kwargs.get("environments")
+            resolved_inputs = inputs
         if resolved_inputs is None:
             resolved_inputs = kwargs.get("inputs")
         if resolved_inputs is None:
@@ -1422,6 +1415,8 @@ def make_reward_function(
 
             final_reward = base_reward
             episode_log = env.build_episode_log()
+            summary = env.summarize_episode()
+            metadata = getattr(getattr(env, "last_observation", None), "metadata", {}) or {}
             if rubric_scorer is not None and float(rubric_weight) > 0.0:
                 rubric_scores = rubric_scorer(episode_log)
                 if getattr(env, "current_persona", None) is not None:
@@ -1430,13 +1425,20 @@ def make_reward_function(
                     final_reward = combine_rewards(base_reward, rubric_scores, rubric_weight)
             rewards.append(round(final_reward, 6))
             if summary_buffer is not None:
-                try:
-                    summary_buffer.append(env.summarize_episode(), episode_log, training_reward=final_reward)
-                except Exception:
-                    pass
+                summary_buffer.append(
+                    summary,
+                    episode_log,
+                    diagnostics={
+                        "termination_reason": str(metadata.get("termination_reason", "")),
+                        "contract_score": _completion_format_score(completion_text),
+                        "sample_completion": completion_text,
+                    },
+                    training_reward=final_reward,
+                )
         return rewards
 
     setattr(reward_func, "bridge_diagnostics", bridge_diagnostics)
+    setattr(reward_func, "runtime_backend", str(runtime_backend))
     return reward_func
 
 
@@ -2452,10 +2454,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     per_device_train_batch_size = int(getattr(args, "per_device_train_batch_size", 1) or 1)
     gradient_accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 4) or 4)
     num_generations = int(getattr(args, "num_generations", 4) or 4)
-    # generation_batch_size must be divisible by num_generations (TRL constraint).
-    # Default to num_generations so TRL derives steps_per_generation automatically
-    # as generation_batch_size / (per_device × num_processes).
-    generation_batch_size = int(getattr(args, "generation_batch_size", 0) or num_generations)
+    generation_batch_size = getattr(args, "generation_batch_size", None)
     learning_rate = float(getattr(args, "learning_rate", 5e-6) or 5e-6)
     temperature = float(getattr(args, "temperature", 1.0) or 1.0)
     top_p = float(getattr(args, "top_p", 1.0) or 1.0)
@@ -2469,7 +2468,6 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "per_device_train_batch_size": per_device_train_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "num_generations": num_generations,
-        "generation_batch_size": generation_batch_size,
         "learning_rate": learning_rate,
         "temperature": temperature,
         "top_p": top_p,
@@ -2481,6 +2479,8 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
+    if generation_batch_size is not None:
+        kwargs["generation_batch_size"] = int(generation_batch_size)
     kwargs.update(resolve_training_precision_kwargs())
     if getattr(args, "max_steps", None) is not None:
         kwargs["max_steps"] = int(args.max_steps)
@@ -2516,6 +2516,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--num-generations", type=int, default=4)
     parser.add_argument("--generation-batch-size", type=int, default=None)
+    parser.add_argument("--runtime-backend", choices=("environment", "legacy"), default="environment")
     parser.add_argument("--learning-rate", type=float, default=5e-6)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -2745,19 +2746,139 @@ def _require_rollout_func_support(grpo_trainer_cls: Any) -> None:
     )
 
 
-def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
-    """Build the canonical explicit-rollout GRPO training bundle."""
-    print(
-        f"[train_grpo_trl] Bridge revision {TRAIN_GRPO_TRL_BRIDGE_REVISION} "
-        "(strict-contract-v2, reward-shaping-v2, bridge-debug-v1).",
-        flush=True,
+def _require_environment_factory_support(grpo_trainer_cls: Any) -> None:
+    """Fail fast when the installed TRL build does not support environment training."""
+    parameters = inspect.signature(grpo_trainer_cls.__init__).parameters
+    if "environment_factory" in parameters:
+        return
+
+    version = _trl_version() or "unknown"
+    raise ImportError(
+        "Installed TRL version does not support the canonical environment-native training path: "
+        f"GRPOTrainer.__init__ has no 'environment_factory' parameter (detected trl=={version}). "
+        "Install a TRL release with environment_factory support, then restart the runtime and rerun the install cell."
     )
-    components = _resolve_training_components(args)
 
-    from transformers import TrainerCallback
-    GRPOConfig, GRPOTrainer = _import_trl_grpo_symbols()
-    _require_rollout_func_support(GRPOTrainer)
 
+def _build_training_callbacks(
+    *,
+    args: argparse.Namespace,
+    summary_buffer: EpisodeSummaryBuffer,
+    components: dict[str, Any],
+    trainer_callback_base: type[Any],
+) -> list[Any]:
+    try:
+        from rl.monitoring import RewardMonitorCallback
+
+        monitoring_cb = RewardMonitorCallback(
+            log_every_n_steps=10,
+            generation_sample_every_n_steps=50,
+        )
+    except ImportError:
+        monitoring_cb = None
+
+    callbacks = [
+        build_metrics_callback(
+            summary_buffer,
+            trainer_callback_base,
+            curriculum=components["curriculum"],
+            build_preference_dataset=args.build_preference_dataset,
+            scorer=components["rubric_scorer"] or _default_fake_rubric_scorer,
+            output_dir=args.output_dir,
+        )
+    ]
+    if args.enable_self_play:
+        callbacks.append(
+            build_snapshot_callback(
+                trainer_callback_base,
+                opponent_manager=components["opponent_manager"],
+                interval=args.snapshot_interval,
+                output_dir=args.output_dir,
+            )
+        )
+    if monitoring_cb is not None:
+        callbacks.append(monitoring_cb)
+    return callbacks
+
+
+def _build_environment_training_session(
+    args: argparse.Namespace,
+    *,
+    components: dict[str, Any],
+    trainer_callback_base: type[Any],
+    grpo_config_cls: Any,
+    grpo_trainer_cls: Any,
+) -> dict[str, Any]:
+    dataset = build_dataset(components["rows"])
+    model, tokenizer = load_training_model_and_tokenizer(args.model_name)
+    summary_buffer = EpisodeSummaryBuffer()
+    reward_func = make_reward_function(
+        rubric_scorer=components["rubric_scorer"],
+        rubric_weight=args.rubric_weight,
+        summary_buffer=summary_buffer,
+        runtime_backend="environment",
+    )
+
+    grpo_kwargs = build_grpo_config_kwargs(args)
+    grpo_kwargs["reward_weights"] = [1.0]
+    grpo_kwargs["log_completions"] = True
+    config_kwargs, unsupported_config = _filter_kwargs_for_callable(grpo_config_cls.__init__, grpo_kwargs)
+    if unsupported_config:
+        print(
+            f"[train_grpo_trl] Dropping unsupported GRPOConfig args for this TRL version: {unsupported_config}",
+            flush=True,
+        )
+    training_args = grpo_config_cls(**config_kwargs)
+    callbacks = _build_training_callbacks(
+        args=args,
+        summary_buffer=summary_buffer,
+        components=components,
+        trainer_callback_base=trainer_callback_base,
+    )
+
+    trainer_kwargs = {
+        "model": model,
+        "processing_class": tokenizer,
+        "reward_funcs": reward_func,
+        "train_dataset": dataset,
+        "args": training_args,
+        "environment_factory": components["env_factory"],
+        "callbacks": callbacks,
+    }
+    filtered_trainer_kwargs, unsupported_trainer = _filter_kwargs_for_callable(grpo_trainer_cls.__init__, trainer_kwargs)
+    if unsupported_trainer:
+        raise TypeError(
+            "Installed TRL version does not support the canonical environment-native training path. "
+            f"Unsupported trainer args: {unsupported_trainer}"
+        )
+
+    final_checkpoint_path = Path(args.output_dir) / "final-grpo-model"
+    return {
+        **components,
+        "runtime_backend": "environment",
+        "model": model,
+        "tokenizer": tokenizer,
+        "dataset": dataset,
+        "training_args": training_args,
+        "reward_funcs": reward_func,
+        "rollout_func": None,
+        "callbacks": callbacks,
+        "summary_buffer": summary_buffer,
+        "pending_rollout_buffer": None,
+        "final_checkpoint_path": final_checkpoint_path,
+        "grpo_config_kwargs": config_kwargs,
+        "trainer_kwargs": filtered_trainer_kwargs,
+    }
+
+
+def _build_legacy_training_session(
+    args: argparse.Namespace,
+    *,
+    components: dict[str, Any],
+    trainer_callback_base: type[Any],
+    grpo_config_cls: Any,
+    grpo_trainer_cls: Any,
+) -> dict[str, Any]:
     dataset = build_dataset(components["rows"])
     model, tokenizer = load_training_model_and_tokenizer(args.model_name)
     summary_buffer = EpisodeSummaryBuffer()
@@ -2766,6 +2887,7 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
         rubric_scorer=components["rubric_scorer"],
         rubric_weight=args.rubric_weight,
         summary_buffer=summary_buffer,
+        runtime_backend="legacy",
         pending_rollout_buffer=pending_rollout_buffer,
         prompt_env_factory=components["env_factory"],
         prompt_env_args=args,
@@ -2781,45 +2903,19 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     grpo_kwargs = build_grpo_config_kwargs(args)
     grpo_kwargs["reward_weights"] = [1.0]
     grpo_kwargs["log_completions"] = True
-    config_kwargs, unsupported_config = _filter_kwargs_for_callable(GRPOConfig.__init__, grpo_kwargs)
+    config_kwargs, unsupported_config = _filter_kwargs_for_callable(grpo_config_cls.__init__, grpo_kwargs)
     if unsupported_config:
         print(
             f"[train_grpo_trl] Dropping unsupported GRPOConfig args for this TRL version: {unsupported_config}",
             flush=True,
         )
-    training_args = GRPOConfig(**config_kwargs)
-
-    try:
-        from rl.monitoring import RewardMonitorCallback
-
-        monitoring_cb = RewardMonitorCallback(
-            log_every_n_steps=10,
-            generation_sample_every_n_steps=50,
-        )
-    except ImportError:
-        monitoring_cb = None
-
-    callbacks = [
-        build_metrics_callback(
-            summary_buffer,
-            TrainerCallback,
-            curriculum=components["curriculum"],
-            build_preference_dataset=args.build_preference_dataset,
-            scorer=components["rubric_scorer"] or _default_fake_rubric_scorer,
-            output_dir=args.output_dir,
-        )
-    ]
-    if args.enable_self_play:
-        callbacks.append(
-            build_snapshot_callback(
-                TrainerCallback,
-                opponent_manager=components["opponent_manager"],
-                interval=args.snapshot_interval,
-                output_dir=args.output_dir,
-            )
-        )
-    if monitoring_cb is not None:
-        callbacks.append(monitoring_cb)
+    training_args = grpo_config_cls(**config_kwargs)
+    callbacks = _build_training_callbacks(
+        args=args,
+        summary_buffer=summary_buffer,
+        components=components,
+        trainer_callback_base=trainer_callback_base,
+    )
 
     trainer_kwargs = {
         "model": model,
@@ -2830,16 +2926,17 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
         "rollout_func": rollout_func,
         "callbacks": callbacks,
     }
-    filtered_trainer_kwargs, unsupported_trainer = _filter_kwargs_for_callable(GRPOTrainer.__init__, trainer_kwargs)
+    filtered_trainer_kwargs, unsupported_trainer = _filter_kwargs_for_callable(grpo_trainer_cls.__init__, trainer_kwargs)
     if unsupported_trainer:
         raise TypeError(
-            "Installed TRL version does not support the canonical explicit-rollout training path. "
+            "Installed TRL version does not support the legacy explicit-rollout training path. "
             f"Unsupported trainer args: {unsupported_trainer}"
         )
 
     final_checkpoint_path = Path(args.output_dir) / "final-grpo-model"
     return {
         **components,
+        "runtime_backend": "legacy",
         "model": model,
         "tokenizer": tokenizer,
         "dataset": dataset,
@@ -2855,13 +2952,52 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the canonical GRPO training bundle for the selected runtime backend."""
+    runtime_backend = str(getattr(args, "runtime_backend", "environment") or "environment").strip().lower()
+    components = _resolve_training_components(args)
+
+    from transformers import TrainerCallback
+
+    GRPOConfig, GRPOTrainer = _import_trl_grpo_symbols()
+    if runtime_backend == "environment":
+        print(
+            "[train_grpo_trl] Canonical runtime backend: environment "
+            "(trl-native env/tool training, reward-shaping-v2).",
+            flush=True,
+        )
+        _require_environment_factory_support(GRPOTrainer)
+        return _build_environment_training_session(
+            args,
+            components=components,
+            trainer_callback_base=TrainerCallback,
+            grpo_config_cls=GRPOConfig,
+            grpo_trainer_cls=GRPOTrainer,
+        )
+
+    print(
+        f"[train_grpo_trl] Bridge revision {TRAIN_GRPO_TRL_BRIDGE_REVISION} "
+        "(strict-contract-v2, reward-shaping-v2, bridge-debug-v1).",
+        flush=True,
+    )
+    _require_rollout_func_support(GRPOTrainer)
+    return _build_legacy_training_session(
+        args,
+        components=components,
+        trainer_callback_base=TrainerCallback,
+        grpo_config_cls=GRPOConfig,
+        grpo_trainer_cls=GRPOTrainer,
+    )
+
+
 def create_trainer(session: dict[str, Any]) -> Any:
     """Instantiate GRPOTrainer from a freshly built training session."""
     os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
         _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
-    _patch_trl_shuffle_sequence_dict()
+    if str(session.get("runtime_backend", "environment")) == "legacy":
+        _patch_trl_shuffle_sequence_dict()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
 
@@ -2885,7 +3021,10 @@ def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
     trainer.train()
     checkpoint_path = save_training_session(session, trainer)
     reward_func = session.get("reward_funcs")
-    bridge_diagnostics = dict(getattr(reward_func, "bridge_diagnostics", {}) or {})
+    runtime_backend = str(session.get("runtime_backend", getattr(args, "runtime_backend", "environment")) or "environment")
+    bridge_diagnostics = {}
+    if runtime_backend == "legacy":
+        bridge_diagnostics = dict(getattr(reward_func, "bridge_diagnostics", {}) or {})
     summary_buffer = session.get("summary_buffer")
     episode_reward_history = (
         summary_buffer.export_records() if isinstance(summary_buffer, EpisodeSummaryBuffer) else []
@@ -2894,6 +3033,7 @@ def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
         "session": session,
         "trainer": trainer,
         "checkpoint_path": checkpoint_path,
+        "runtime_backend": runtime_backend,
         "bridge_diagnostics": bridge_diagnostics,
         "episode_reward_history": episode_reward_history,
     }

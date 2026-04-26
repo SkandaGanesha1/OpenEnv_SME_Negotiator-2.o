@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from rl.curriculum import CurriculumManager
 from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
+from rl.bridge import InProcessEnvWrapper
 from rl.train_grpo_trl import (
     _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
@@ -46,6 +47,7 @@ from rl.train_grpo_trl import (
     make_training_args,
     make_reward_function,
     prepare_model_for_grpo,
+    _require_environment_factory_support,
     _require_rollout_func_support,
     run_training_session,
     save_training_session,
@@ -282,16 +284,16 @@ def test_strip_training_row_metadata_removes_embedded_row_lines() -> None:
     assert cleaned == [{"role": "user", "content": "/no_think\nUse JSON only."}]
 
 
-def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
+def test_liquidity_runner_rejects_legacy_backend_for_notebook_training() -> None:
     import rl.train_grpo_liquidity as liquidity_script
 
-    with pytest.raises(RuntimeError, match="requires `use_vllm=True`"):
+    with pytest.raises(RuntimeError, match="runtime_backend='environment'"):
         liquidity_script.run_training(
             liquidity_script.make_training_args(
                 profile="tiny",
-                output_dir=str(_workspace_tmp_dir("liquidity_no_vllm")),
+                output_dir=str(_workspace_tmp_dir("liquidity_legacy_backend")),
                 skip_smoke_test=True,
-                use_vllm=False,
+                runtime_backend="legacy",
             )
         )
 
@@ -329,12 +331,15 @@ def test_render_chat_prompt_disables_thinking_when_chat_template_supports_it() -
 
 
 def test_reward_function_reads_environments_and_returns_one_scalar_per_env() -> None:
+    summary_buffer = EpisodeSummaryBuffer()
     reward_func = make_reward_function(
         rubric_scorer=lambda episode_log: {"rubric": 0.5},
         rubric_weight=0.2,
+        summary_buffer=summary_buffer,
     )
     rewards = reward_func([_DummyEnv(), _DummyEnv()])
     assert rewards == [0.85, 0.85]
+    assert len(summary_buffer.export_records()) == 2
 
 
 def test_strict_json_payload_extracts_embedded_object_after_think_tags() -> None:
@@ -360,7 +365,7 @@ def test_reward_function_accepts_keyword_only_trl_call_shape() -> None:
 
 def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() -> None:
     pending_buffer = PendingRolloutBuffer()
-    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    reward_func = make_reward_function(runtime_backend="legacy", pending_rollout_buffer=pending_buffer)
 
     pending_buffer.extend(
         [
@@ -433,7 +438,7 @@ def test_reward_function_uses_pending_rollout_buffer_for_keyword_only_calls() ->
 
 def test_reward_function_matches_pending_rollouts_by_prompt_completion_signature_when_reordered() -> None:
     pending_buffer = PendingRolloutBuffer()
-    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    reward_func = make_reward_function(runtime_backend="legacy", pending_rollout_buffer=pending_buffer)
     pending_buffer.extend(
         [
             {
@@ -496,7 +501,7 @@ def test_reward_function_matches_pending_rollouts_by_prompt_completion_signature
 
 def test_reward_function_preserves_duplicate_signature_queue_order() -> None:
     pending_buffer = PendingRolloutBuffer()
-    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    reward_func = make_reward_function(runtime_backend="legacy", pending_rollout_buffer=pending_buffer)
     pending_buffer.extend(
         [
             {
@@ -556,7 +561,7 @@ def test_reward_function_preserves_duplicate_signature_queue_order() -> None:
 
 def test_reward_function_reports_bridge_miss_and_returns_strict_invalid_reward() -> None:
     pending_buffer = PendingRolloutBuffer()
-    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    reward_func = make_reward_function(runtime_backend="legacy", pending_rollout_buffer=pending_buffer)
     pending_buffer.extend(
         [
             {
@@ -597,7 +602,7 @@ def test_reward_function_reports_bridge_miss_and_returns_strict_invalid_reward()
 
 def test_reward_function_uses_fifo_compatibility_fallback_after_signature_miss() -> None:
     pending_buffer = PendingRolloutBuffer()
-    reward_func = make_reward_function(pending_rollout_buffer=pending_buffer)
+    reward_func = make_reward_function(runtime_backend="legacy", pending_rollout_buffer=pending_buffer)
     pending_buffer.extend(
         [
             {
@@ -687,6 +692,7 @@ def test_reward_function_uses_prompt_env_fallback_when_pending_buffer_is_empty(m
 
     monkeypatch.setattr(trl_script, "_score_prompt_completion_via_environment", _fake_score)
     reward_func = make_reward_function(
+        runtime_backend="legacy",
         pending_rollout_buffer=pending_buffer,
         prompt_env_factory=lambda: object(),
         prompt_env_args=make_training_args(),
@@ -1029,6 +1035,26 @@ def test_environment_factory_picks_up_curriculum_config_and_opponents() -> None:
     assert wrapper.opponent_manager is opponent_manager
 
 
+def test_in_process_env_wrapper_public_tool_methods_are_typed_and_documented() -> None:
+    for method_name in (
+        "reset",
+        "propose",
+        "accept",
+        "reject",
+        "advance_period",
+        "query_treds",
+        "check_compliance",
+        "run_cashflow_sim",
+        "simulate_plan",
+        "summarize_episode",
+        "build_episode_log",
+    ):
+        method = getattr(InProcessEnvWrapper, method_name)
+        annotations = getattr(method, "__annotations__", {})
+        assert annotations, f"{method_name} should expose type hints for tool/schema inference"
+        assert method.__doc__, f"{method_name} should expose a docstring for tool/schema inference"
+
+
 def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> None:
     args = build_arg_parser().parse_args([])
 
@@ -1037,12 +1063,20 @@ def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> 
     assert kwargs["report_to"] == "tensorboard"
     assert kwargs["temperature"] == 1.0
     assert kwargs["top_p"] == 1.0
-    assert kwargs["generation_batch_size"] == kwargs["num_generations"]
+    assert "generation_batch_size" not in kwargs
     assert kwargs["save_only_model"] is True
     assert kwargs["save_steps"] == 1000
 
     monkeypatch.setenv("TRAINING_LOG_BACKEND", "unsupported")
     assert build_grpo_config_kwargs(args)["report_to"] == "none"
+
+
+def test_build_grpo_config_kwargs_only_passes_generation_batch_size_when_explicit() -> None:
+    args = build_arg_parser().parse_args(["--generation-batch-size", "16"])
+
+    kwargs = build_grpo_config_kwargs(args)
+
+    assert kwargs["generation_batch_size"] == 16
 
 
 def test_build_grpo_config_kwargs_sets_notebook_safe_vllm_limits() -> None:
@@ -1079,6 +1113,14 @@ def test_make_training_args_applies_notebook_overrides_without_mutating_parser_d
     assert updated.num_samples == 32
     assert updated.max_episode_steps == 12
     assert updated.use_vllm is False
+
+
+def test_liquidity_canonical_args_force_environment_backend() -> None:
+    canonical_args = build_liquidity_canonical_training_args(
+        make_liquidity_training_args(runtime_backend="legacy")
+    )
+
+    assert canonical_args.runtime_backend == "environment"
 
 
 def test_patch_additional_chat_templates_404_returns_empty_template_list(monkeypatch) -> None:
@@ -1568,7 +1610,7 @@ def test_prepare_model_for_grpo_disables_incompatible_torchao_and_retries(monkey
     assert isinstance(model, dict)
 
 
-def test_trl_main_passes_rollout_func_and_not_environment_factory(monkeypatch) -> None:
+def test_trl_main_passes_environment_factory_and_not_rollout_func(monkeypatch) -> None:
     import rl.train_grpo_trl as trl_script
 
     captured: dict[str, object] = {}
@@ -1598,9 +1640,9 @@ def test_trl_main_passes_rollout_func_and_not_environment_factory(monkeypatch) -
             self.kwargs = kwargs
 
     class _FakeGRPOTrainer:
-        def __init__(self, rollout_func=None, **kwargs) -> None:
+        def __init__(self, environment_factory=None, **kwargs) -> None:
             captured.update(kwargs)
-            captured["rollout_func"] = rollout_func
+            captured["environment_factory"] = environment_factory
 
         def train(self) -> None:
             captured["trained"] = True
@@ -1615,12 +1657,12 @@ def test_trl_main_passes_rollout_func_and_not_environment_factory(monkeypatch) -
     monkeypatch.setitem(sys.modules, "trl", fake_trl)
 
     assert trl_main(["--num-samples", "1"]) == 0
-    assert callable(captured["rollout_func"])
-    assert "environment_factory" not in captured
+    assert callable(captured["environment_factory"])
+    assert "rollout_func" not in captured
     assert captured["trained"] is True
 
 
-def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkeypatch) -> None:
+def test_build_training_session_returns_canonical_environment_bundle(monkeypatch) -> None:
     import rl.train_grpo_trl as trl_script
 
     monkeypatch.setattr(trl_script, "build_curriculum_manager_from_args", lambda args: None)
@@ -1650,7 +1692,7 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
             self.kwargs = kwargs
 
     class _FakeGRPOTrainer:
-        def __init__(self, rollout_func=None, **kwargs) -> None:
+        def __init__(self, environment_factory=None, **kwargs) -> None:
             self.kwargs = kwargs
 
     fake_trl.GRPOConfig = _FakeGRPOConfig
@@ -1666,7 +1708,8 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
         )
     )
 
-    assert callable(session["rollout_func"])
+    assert session["runtime_backend"] == "environment"
+    assert session["rollout_func"] is None
     assert callable(session["reward_funcs"])
     assert session["summary_buffer"].__class__ is EpisodeSummaryBuffer
     assert session["training_args"].save_only_model is True
@@ -1678,7 +1721,7 @@ def test_build_training_session_returns_canonical_explicit_rollout_bundle(monkey
         "reward_funcs",
         "train_dataset",
         "args",
-        "rollout_func",
+        "environment_factory",
         "callbacks",
     }
 
@@ -1692,7 +1735,8 @@ def test_create_trainer_and_run_training_session_use_canonical_helper_path(monke
         trl_script,
         "build_training_session",
         lambda args: {
-            "trainer_kwargs": {"model": object(), "args": object(), "rollout_func": object()},
+            "runtime_backend": "environment",
+            "trainer_kwargs": {"model": object(), "args": object(), "environment_factory": object()},
             "tokenizer": _DummyTokenizerSaver(),
             "final_checkpoint_path": _workspace_tmp_dir("run_training_session") / "final-grpo-model",
         },
@@ -1714,6 +1758,7 @@ def test_create_trainer_and_run_training_session_use_canonical_helper_path(monke
 
     assert captured["trained"] is True
     assert "checkpoint_path" in result
+    assert result["runtime_backend"] == "environment"
     assert result["session"]["final_checkpoint_path"].name == "final-grpo-model"
 
 
@@ -1730,6 +1775,17 @@ def test_require_rollout_func_support_rejects_older_trl_signature() -> None:
         assert "rollout_func" in str(exc)
     else:
         raise AssertionError("Older TRL signatures should be rejected before model loading.")
+
+
+def test_require_environment_factory_support_rejects_older_trl_signature() -> None:
+    class _OldTrainer:
+        def __init__(self, model=None, args=None, callbacks=None) -> None:
+            self.model = model
+            self.args = args
+            self.callbacks = callbacks
+
+    with pytest.raises(ImportError, match="environment_factory"):
+        _require_environment_factory_support(_OldTrainer)
 
 
 def test_metrics_callback_saves_reward_curve_without_matplotlib_dependency(monkeypatch) -> None:
@@ -1791,11 +1847,12 @@ def test_colab_notebook_defaults_to_qwen3_thin_wrapper() -> None:
     assert 'trl==0.29.0' in source
 
 
-def test_colab_notebook_drops_legacy_generate_rollout_completions_and_environment_factory() -> None:
+def test_colab_notebook_describes_environment_native_training_path() -> None:
     source = _load_notebook_source()
 
     assert "generate_rollout_completions" not in source
-    assert "environment_factory=" not in source
+    assert "environment-native trainer" in source
+    assert "explicit-rollout trainer" not in source
 
 
 def test_colab_notebook_requires_peft_and_no_inline_training_loop_fallback() -> None:
@@ -1940,6 +1997,7 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
         lambda args: {
             "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
             "checkpoint_path": checkpoint_path,
+            "runtime_backend": "environment",
             "episode_reward_history": [
                 {
                     "episode": 1,
@@ -1950,12 +2008,6 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
                     "success_no_default_positive_npv": True,
                 }
             ],
-            "bridge_diagnostics": {
-                "bridge_miss_count": 0,
-                "prompt_env_fallback_count": 0,
-                "signature_match_count": 4,
-                "fifo_fallback_count": 0,
-            },
         },
     )
     monkeypatch.setattr(liquidity_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
@@ -1973,47 +2025,22 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
     assert payload["training"]["reward_log_path"] == str(episode_reward_log_path.resolve())
     assert payload["training"]["episode_reward_log_path"] == str(episode_reward_log_path.resolve())
     assert payload["training"]["trainer_reward_log_path"] == str(trainer_reward_log_path.resolve())
-    assert payload["training"]["strict_accuracy_bridge_valid"] is True
+    assert payload["training"]["runtime_backend"] == "environment"
+    assert payload["training"]["environment_backend_valid"] is True
     assert payload["manifest_path"] == str(manifest_path)
 
 
-def test_simple_script_run_training_fails_loudly_on_bridge_miss(monkeypatch) -> None:
+def test_simple_script_run_training_rejects_non_environment_backend(monkeypatch) -> None:
     import rl.train_grpo_liquidity as liquidity_script
 
-    tmp_path = _workspace_tmp_dir("simple_training_bridge_failure")
-    checkpoint_path = tmp_path / "final-grpo-model"
+    tmp_path = _workspace_tmp_dir("simple_training_backend_failure")
 
-    monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
-    monkeypatch.setattr(
-        liquidity_script,
-        "run_canonical_training_session",
-        lambda args: {
-            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
-            "checkpoint_path": checkpoint_path,
-            "episode_reward_history": [
-                {
-                    "episode": 1,
-                    "training_reward": -0.4,
-                    "total_reward": -0.47,
-                    "verifiable_reward": -0.47,
-                    "base_rl_reward": -0.47,
-                    "success_no_default_positive_npv": False,
-                }
-            ],
-            "bridge_diagnostics": {
-                "bridge_miss_count": 4,
-                "prompt_env_fallback_count": 4,
-                "signature_match_count": 0,
-                "fifo_fallback_count": 0,
-            },
-        },
-    )
-
-    with pytest.raises(RuntimeError, match="Strict bridge validation failed"):
+    with pytest.raises(RuntimeError, match="runtime_backend='environment'"):
         liquidity_script.run_training(
             liquidity_script.make_training_args(
                 profile="tiny",
                 output_dir=str(tmp_path),
                 skip_smoke_test=True,
+                runtime_backend="legacy",
             )
         )
