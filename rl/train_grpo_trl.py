@@ -51,11 +51,15 @@ DEFAULT_PROMPT = (
     + build_action_contract_text()
 )
 TRAINING_ROW_PREFIX = "[TRAINING_ROW]"
-ROLL_OUT_USER_TURN = (
-    "/no_think\n"
-    "Current observation:\n{observation}\n\n"
-    "Choose the single best next action for this exact state. "
+ROLLOUT_SYSTEM_PROMPT = (
+    "You are an SME treasury agent operating a deterministic long-horizon liquidity workflow. "
+    "Choose the single best next action for the exact current state. "
+    "Maximize the final verifiable reward, preserve positive NPV, use tools only when they improve the state, "
+    "and finish the episode without default. "
     + build_action_contract_text()
+)
+ROLL_OUT_USER_TURN = (
+    "Current observation:\n{observation}"
 )
 TRAIN_GRPO_TRL_BRIDGE_REVISION = "2026-04-26c"
 _CANONICAL_ACTION_KEYS = frozenset(
@@ -1463,6 +1467,33 @@ def _build_observation_message(observation_text: str) -> str:
     return ROLL_OUT_USER_TURN.format(observation=observation_text)
 
 
+def _strip_training_row_metadata(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    cleaned: list[dict[str, str]] = []
+    for message in messages:
+        content = str(message.get("content", "") or "")
+        kept_lines = [line for line in content.splitlines() if not line.startswith(TRAINING_ROW_PREFIX)]
+        cleaned_content = "\n".join(kept_lines).strip()
+        if not cleaned_content:
+            continue
+        cleaned.append(
+            {
+                "role": str(message.get("role", "user")),
+                "content": cleaned_content,
+            }
+        )
+    return cleaned
+
+
+def _build_rollout_turn_messages(
+    *,
+    observation_text: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": ROLLOUT_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_observation_message(observation_text)},
+    ]
+
+
 def _render_chat_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
@@ -1946,8 +1977,7 @@ def _run_single_rollout_sample(
     row = _extract_training_row_from_prompt(prompt, rollout_args)
     wrapper = env_factory()
     reset_text = wrapper.reset(**row)
-    messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
-    messages.append({"role": "user", "content": _build_observation_message(reset_text)})
+    current_observation_text = str(reset_text)
 
     prompt_ids: list[int] = []
     completion_ids: list[int] = []
@@ -1974,7 +2004,7 @@ def _run_single_rollout_sample(
         turn = _generate_completion_turn(
             model,
             tokenizer,
-            messages,
+            _build_rollout_turn_messages(observation_text=current_observation_text),
             **turn_kwargs,
         )
         prompt_ids.extend(list(turn["prompt_ids"]))
@@ -1989,8 +2019,6 @@ def _run_single_rollout_sample(
         if was_valid_json:
             valid_json_steps += 1
         parsed_actions.append(action.model_dump(exclude_none=True))
-
-        messages.append({"role": "assistant", "content": raw_text})
         try:
             execute_action(wrapper, action)
         except Exception as exc:
@@ -2006,7 +2034,7 @@ def _run_single_rollout_sample(
         if latest_observation is None:
             termination_reason = "missing_observation"
             break
-        messages.append({"role": "user", "content": _build_observation_message(format_observation(latest_observation))})
+        current_observation_text = format_observation(latest_observation)
 
     summary = wrapper.summarize_episode()
     episode_log = wrapper.build_episode_log()

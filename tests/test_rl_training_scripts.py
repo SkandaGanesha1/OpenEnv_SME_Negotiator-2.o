@@ -26,6 +26,7 @@ from rl.train_grpo_trl import (
     _ensure_grpo_response_schema,
     _generate_completion_turn,
     _render_chat_prompt,
+    _strip_training_row_metadata,
     _run_single_rollout_sample,
     _score_prompt_completion_via_environment,
     _strict_json_payload,
@@ -266,6 +267,19 @@ def test_generate_completion_turn_uses_vllm_llm_when_available(monkeypatch) -> N
     assert turn["completion_ids"] == [21, 22]
     assert turn["logprobs"] == [-0.2, -0.3]
     assert turn["text"] == '{"action_type":"advance_period"}'
+
+
+def test_strip_training_row_metadata_removes_embedded_row_lines() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": '[TRAINING_ROW] {"seed":1000}\n/no_think\nUse JSON only.',
+        }
+    ]
+
+    cleaned = _strip_training_row_metadata(messages)
+
+    assert cleaned == [{"role": "user", "content": "/no_think\nUse JSON only."}]
 
 
 def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
