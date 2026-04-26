@@ -104,6 +104,9 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
 
     assert 'RUN_PROFILE = "tiny"' in source
     assert "from rl.train_grpo_liquidity import (" in source
+    assert 'REPO_BRANCH = "round1_baseline"' in source
+    assert "ensure_liquidity_repo" in source
+    assert '"git", "clone", "--branch", REPO_BRANCH' in source
     assert "make_training_args" in source
     assert "build_canonical_training_args" in source
     assert "build_run_plan" in source
@@ -111,6 +114,7 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     assert "smoke_test_environment" in source
     assert "run_training" in source
     assert "plot_rewards" in source
+    assert "Could not import rl.train_grpo_liquidity." in source
     assert "Smoke test passed. Environment is ready for training." in source
     assert 'outputs/grpo_sme_liquidity_simple' in source
     assert "Checkpoint path:" in source
