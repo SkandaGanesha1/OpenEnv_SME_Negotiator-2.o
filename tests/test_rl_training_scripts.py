@@ -1246,8 +1246,8 @@ def test_build_rollout_func_duplicates_each_prompt_by_num_generations(monkeypatc
     assert len(result["episode_summaries"]) == 3
     assert result["logprobs"] == [[[-0.1]], [[-0.1]], [[-0.1]]]
     assert result["logprob_token_ids"] == [[[10]], [[11]], [[12]]]
-    assert all(std > 0.0 for std in result["env_reward_std"])
-    assert all(count >= 1.0 for count in result["unique_action_count"])
+    assert result["termination_reasons"] == ["done", "done", "done"]
+    assert len(result["raw_completion_texts"]) == 3
 
 
 def test_reward_function_uses_epsilon_tiebreaker_when_group_std_is_zero() -> None:

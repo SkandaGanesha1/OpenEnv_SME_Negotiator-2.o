@@ -2248,20 +2248,8 @@ def build_rollout_func(
             ],
             "episode_summaries": [sample["episode_summary"] for sample in samples],
             "episode_logs": [sample["episode_log"] for sample in samples],
-            "reward_breakdowns": [sample["reward_breakdown"] for sample in samples],
             "termination_reasons": [sample["termination_reason"] for sample in samples],
-            "parsed_actions": [sample["parsed_actions"] for sample in samples],
             "raw_completion_texts": [sample["raw_completion_text"] for sample in samples],
-            "reward_mean": [float(sample["reward_mean"]) for sample in samples],
-            "env_reward_std": [float(sample["reward_std"]) for sample in samples],
-            "unique_action_count": [float(sample["unique_action_count"]) for sample in samples],
-            "unique_completion_count": [float(sample["unique_completion_count"]) for sample in samples],
-            "invalid_parse_fraction": [float(sample["invalid_parse_fraction"]) for sample in samples],
-            "identical_terminal_fraction": [float(sample["identical_terminal_fraction"]) for sample in samples],
-            "contract_score": [
-                float(sample.get("contract_score", _completion_format_score(str(sample.get("raw_completion_text", "")))) or 0.0)
-                for sample in samples
-            ],
         }
 
     return rollout_func
