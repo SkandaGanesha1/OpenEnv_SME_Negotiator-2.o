@@ -20,8 +20,7 @@ pinned: false
 | Resource | Link |
 |---|---|
 | HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o) |
-| GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks\grpo_sme_liquidity.ipynb) |
-| Advanced GRPO notebook | [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb) |
+| GRPO Training Colab | [notebooks/grpo_sme_liquidity.ipynb](notebooks\grpo_sme_liquidity.ipynb) |
 | Submission training dashboard | [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png) |
 | Submission policy comparison | [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png) |
 | Submission eval summary | [outputs/grpo_sme_liquidity_colab/eval_summary.json](outputs/grpo_sme_liquidity_colab/eval_summary.json) |
@@ -38,7 +37,7 @@ pinned: false
 </p>
 
 <p align="center">
-  <a href="https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator">
+  <a href="https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o">
     <img src="https://img.shields.io/badge/Hugging%20Face-Space-FFD21E?style=for-the-badge&logo=huggingface&logoColor=black" alt="Hugging Face Space">
   </a>
   <a href="https://www.python.org/downloads/">
@@ -59,7 +58,7 @@ pinned: false
 
 If you want an environment where an agent must balance price, payment days, working-capital stress, TReDS, late-payment protection, and dynamic discounting under deterministic grading, this is it.
 
-[GitHub](https://github.com/SkandaGanesha1/ENV) · [Hugging Face Space](https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator) · [OpenEnv Docs](https://huggingface.co/docs/openenv) · [Setup](SETUP.md) · [Evaluation](EVALUATION.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Index](INDEX.md)
+[GitHub](https://github.com/SkandaGanesha1/OpenEnv_SME_Negotiator-2.o) · [Hugging Face Space](https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o) · [OpenEnv Docs](https://huggingface.co/docs/openenv) · [Setup](SETUP.md) · [Evaluation](EVALUATION.md) · [Troubleshooting](TROUBLESHOOTING.md) · [Index](INDEX.md)
 
 ---
 
@@ -83,10 +82,10 @@ If you want an environment where an agent must balance price, payment days, work
 </div>
 
 <p align="center">
-  <img src="EconomicTimes.png"
+  <img src="assets\EconomicTimes.png"
        alt="Economic Times headline: Rs 8.1 lakh crore stuck in delayed MSME payments"
        width="420">
-  <img src="Razorpay.png"
+  <img src="assets\Razorpay.png"
        alt="Razorpay Fix My Itch: SMEs struggling to negotiate fair payment terms"
        width="420">
 </p>
