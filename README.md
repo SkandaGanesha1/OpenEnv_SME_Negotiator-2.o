@@ -280,41 +280,41 @@ Jan 2026    ₹ 8.1  lakh crore            ▲ Eco Survey estimate remains massi
 <div align="center">
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        TASK DIFFICULTY LADDER                          │
-├──────────────────┬──────────────────────┬───────────────────────────────┤
-│  🟢 EASY         │  🟡 MEDIUM           │  🔴 HARD                      │
-│  payment-terms-  │  payment-terms-      │  payment-terms-hard          │
-│  easy            │  medium              │                               │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Opens: 100 INR   │ Opens: 100 INR       │ Opens: 96 INR / 100 days      │
-│        / 90 days │        / 60 days     │ Setting: hostile two-buyer    │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Goal: compress   │ Goal: tighten terms  │ Goal: maximize NPV via        │
-│ days ≤ 60        │ + add late-payment   │ dynamic discounting           │
-│                  │ penalty clause       │ (propose_dynamic_discounting) │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Levers: 1        │ Levers: 2            │ Levers: 4                     │
-│ (payment days)   │ (days + clause)      │ (price × days × TReDS ×      │
-│                  │                      │  discount rate)               │
-├──────────────────┼──────────────────────┼───────────────────────────────┤
-│ Terminal: 1.0 if │ Terminal: 1.0 if     │ Terminal: NPV-delta score     │
-│ days ≤ 60        │ days ≤ 45 + clause   │ vs status quo                 │
-│ Partial: yes     │ Partial: yes         │ TReDS changes floor, not      │
-│                  │                      │ the terminal score alone      │
-└──────────────────┴──────────────────────┴───────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                    LIQUIDITY ENVIRONMENT TASK LADDER                         │
+├───────────────────────┬────────────────────────┬─────────────────────────────┤
+│  🟢 EASY              │  🟡 MEDIUM             │  🔴 HARD                    │
+│  liquidity-stress-    │  liquidity-stress-     │  liquidity-correlation-     │
+│  medium               │  medium                │  hard                       │
+├───────────────────────┼────────────────────────┼─────────────────────────────┤
+│ Thin-cash SME         │ Same stress world,     │ Correlated buyer risk,      │
+│ primary slow payer +  │ stricter judge view:   │ tighter liquidity threshold,│
+│ secondary risky buyer │ preserve NPV and tools │ limited financier capacity  │
+├───────────────────────┼────────────────────────┼─────────────────────────────┤
+│ Goal: resolve deals   │ Goal: finish macro     │ Goal: survive all periods   │
+│ with no default and   │ horizon with positive  │ while maximizing solvency,  │
+│ payment days near 40  │ verifiable reward      │ liquidity, NPV, compliance  │
+├───────────────────────┼────────────────────────┼─────────────────────────────┤
+│ Levers: propose/      │ Levers: all easy       │ Levers: all medium levers   │
+│ accept, TReDS, clause │ levers + period timing │ + dynamic discounting,      │
+│ and advance_period    │ and cashflow planning  │ selective finance, tool use │
+├───────────────────────┼────────────────────────┼─────────────────────────────┤
+│ Reward: dense shaping │ Reward: same RLVR      │ Reward: terminal RLVR from  │
+│ + terminal RLVR       │ formula, judge bucket  │ solvency + liquidity + NPV  │
+│                       │ uses medium difficulty │ + legal compliance          │
+└───────────────────────┴────────────────────────┴─────────────────────────────┘
 ```
 
 </div>
 
-| Task | Opening state | What the agent must do | Full-credit signal |
-|------|---------------|------------------------|--------------------|
-| `payment-terms-easy` | Buyer opens at `100 INR / 90 days` | Compress terms toward the SME liquidity threshold | Reach a deal with agreed days `<= 60` |
-| `payment-terms-medium` | Buyer opens at `100 INR / 60 days` | Tighten terms and use a late-payment penalty clause | Reach a deal with agreed days `<= 45`, with stronger partial credit if the clause is included |
-| `payment-terms-hard` | Buyer opens at `96 INR / 100 days` in a hostile two-buyer setting | Negotiate dynamic discounting and manage financing tradeoffs | Improve NPV versus the status quo with `propose_dynamic_discounting=true` |
+| Inference bucket | Liquidity task | Opening state | What the agent must do | Current checked-in signal |
+|---|---|---|---|---|
+| `EASY` | `liquidity-stress-medium` | `99 INR / 75 days`, liquidity threshold `40`, supplier pay cycle `25`, two buyers, modest financing capacity | Use TReDS/tool evidence where useful, negotiate short-tenor deals, advance macro periods, and avoid SME default | `mean_final_score=0.8280`, `success_rate=1.0`, `avg_final_payment_days=40.0` in `inference_results.json` |
+| `MEDIUM` | `liquidity-stress-medium` | Same stress task, evaluated as the medium judge bucket | Preserve positive NPV while resolving all deals, keeping legal/payment terms tight, and using tools without spam | `mean_final_score=0.8280`, `success_rate=1.0`, `avg_verifiable_reward=0.8280` in `inference_results.json` |
+| `HARD` | `liquidity-correlation-hard` | `96 INR / 95 days`, liquidity threshold `35`, supplier pay cycle `20`, correlated risky buyers, limited financier capacity | Combine negotiation, TReDS, late-payment protection, dynamic discounting, cashflow planning, and `advance_period` over the macro horizon | `mean_final_score=0.8288`, `success_rate=1.0`, `avg_final_payment_days=30.0` in `inference_results.json` |
 
 > [!WARNING]
-> **Hard-mode trap for naive agents:** Setting `use_treds=true` modifies the simulation by lowering the buyer day floor, but the terminal score is **not** earned by TReDS alone. To earn hard-task credit, the agent must negotiate **dynamic discounting** with a coherent `dynamic_discount_annual_rate`. Agents that simply “accept + use_treds” will score close to 0 on the hard task.
+> **Liquidity-mode trap for naive agents:** A single good deal is not enough. The agent must resolve the open deals, advance macro periods, avoid default, preserve NPV, and use tools only when they improve the economic trajectory. Tool calls alone do not earn terminal reward; the canonical hard signal is the deterministic RLVR score from solvency, liquidity buffer, NPV uplift, and legal compliance.
 
 ---
 
