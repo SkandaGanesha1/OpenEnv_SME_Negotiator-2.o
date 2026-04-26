@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 import types
 from argparse import Namespace
@@ -1012,6 +1014,38 @@ def test_patch_additional_chat_templates_404_returns_empty_template_list(monkeyp
 
     assert fake_transformers_hub.list_repo_templates() == []
     assert fake_tokenization_utils_base.list_repo_templates() == []
+
+
+def test_patch_vllm_notebook_stdout_replaces_suppressors_and_sets_debug(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    class _StdoutWithoutFileno:
+        def fileno(self):
+            raise OSError("no fileno")
+
+    fake_system_utils = types.ModuleType("vllm.utils.system_utils")
+    fake_parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+
+    @contextlib.contextmanager
+    def _original_suppress_stdout():
+        raise AssertionError("original suppress_stdout should be replaced")
+        yield
+
+    fake_system_utils.suppress_stdout = _original_suppress_stdout
+    fake_parallel_state.suppress_stdout = _original_suppress_stdout
+
+    monkeypatch.setattr(sys, "stdout", _StdoutWithoutFileno())
+    monkeypatch.setitem(sys.modules, "vllm.utils.system_utils", fake_system_utils)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", fake_parallel_state)
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+
+    trl_script._patch_vllm_notebook_stdout()
+
+    assert os.environ["VLLM_LOGGING_LEVEL"] == "DEBUG"
+    with fake_system_utils.suppress_stdout():
+        pass
+    with fake_parallel_state.suppress_stdout():
+        pass
 
 
 def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:

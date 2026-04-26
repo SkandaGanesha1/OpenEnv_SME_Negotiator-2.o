@@ -8,6 +8,7 @@ Install with optional extras such as:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib
 import importlib.metadata
@@ -152,6 +153,43 @@ def _patch_additional_chat_templates_404() -> None:
     setattr(_safe_list_repo_templates, "__wrapped_original__", original)
     transformers_hub.list_repo_templates = _safe_list_repo_templates
     tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
+
+
+def _stdout_supports_fileno() -> bool:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return False
+    try:
+        stream.fileno()
+    except Exception:
+        return False
+    return True
+
+
+def _patch_vllm_notebook_stdout() -> None:
+    """Prevent vLLM stdout-suppression helpers from crashing in notebooks.
+
+    Some notebook runtimes expose `sys.stdout` as an object without a usable
+    `fileno()`, which breaks vLLM's `suppress_stdout()` helper during engine
+    initialization. In that environment we bypass the suppression context and
+    enable DEBUG logging so vLLM also avoids its own suppression fast path.
+    """
+
+    if _stdout_supports_fileno():
+        return
+
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
+
+    @contextlib.contextmanager
+    def _passthrough_suppress_stdout():
+        yield
+
+    for module_name in ("vllm.utils.system_utils", "vllm.distributed.parallel_state"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        setattr(module, "suppress_stdout", _passthrough_suppress_stdout)
 
 
 def _save_reward_curve_plot(
@@ -2529,6 +2567,8 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
 def create_trainer(session: dict[str, Any]) -> Any:
     """Instantiate GRPOTrainer from a freshly built training session."""
     os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+    if bool(getattr(session.get("training_args"), "use_vllm", False)):
+        _patch_vllm_notebook_stdout()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
 
