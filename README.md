@@ -32,7 +32,7 @@ pinned: false
     <img src="https://img.shields.io/badge/Open%20in-Colab-F9AB00?style=for-the-badge&logo=googlecolab&logoColor=white" alt="Open GRPO Training Colab">
   </a>
   <a href="https://www.python.org/downloads/">
-    <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.11+">
+    <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+">
   </a>
   <a href="https://fastapi.tiangolo.com/">
     <img src="https://img.shields.io/badge/FastAPI-API-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI">
@@ -405,7 +405,7 @@ The environment exposes:
 
 ## 🚀 Quick Start
 
-Runtime: **Python 3.11+**. `uv` is the fastest path.
+Runtime: **Python 3.10+**. `uv` is the fastest path.
 
 ### Install
 
