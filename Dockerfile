@@ -18,7 +18,7 @@ RUN uv sync --frozen --no-editable
 # Install Gradio for the interactive playground UI (not in pyproject.toml)
 RUN uv pip install "gradio>=4.40.0"
 
-COPY app.py ./
+COPY app.py config.py action_handler.py reward_engine.py session_store.py step_logger.py ./
 
 ENV PATH="/app/.venv/bin:${PATH}"
 
