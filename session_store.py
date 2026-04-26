@@ -32,8 +32,8 @@ class SessionStore:
         self.cum_rew: float = 0.0
         self.step_num: int = 0
 
-        # Chatbot message history  — list of [user_str, assistant_str] pairs
-        self.messages: list[list[str]] = []
+        # Chatbot message history
+        self.messages: list[dict[str, str]] = []
 
         # Last observation payload (for JSON viewer)
         self.last_payload: dict[str, Any] = {
@@ -76,7 +76,10 @@ class SessionStore:
         self.step_num += 1
         self.cum_rew += reward
         self._step_rewards.append(reward)
-        self.messages = self.messages + [[user_message, assistant_message]]
+        self.messages = self.messages + [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": assistant_message}
+        ]
         self.last_payload = {
             "reward": reward,
             "done": done,
