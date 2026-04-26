@@ -1,0 +1,9 @@
+{
+  "training_dashboard_png": "training_dashboard.png",
+  "policy_comparison_png": "policy_comparison.png",
+  "eval_summary_json": "eval_summary.json",
+  "captions": {
+    "training": "GRPO training run: reward and rollout diagnostics (place PNG here after training).",
+    "comparison": "Fixed-seed evaluation: base pretrained model vs trained checkpoint (from evaluate_before_after_policies)."
+  }
+}

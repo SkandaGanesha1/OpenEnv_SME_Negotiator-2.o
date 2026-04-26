@@ -13,6 +13,8 @@ COPY README.md ./
 COPY openenv.yaml ./
 COPY server ./server
 COPY sme_negotiator_env ./sme_negotiator_env
+COPY rl ./rl
+COPY outputs/judge_ui ./outputs/judge_ui
 RUN uv sync --frozen --no-editable
 
 ENV PATH="/app/.venv/bin:${PATH}"

@@ -67,6 +67,125 @@ _action_handler = ActionHandler()
 _reward_engine = RewardEngine()
 _logger = StepLogger()
 
+# Judge / competition demo assets (optional PNG + JSON under outputs/judge_ui/)
+JUDGE_UI_DIR = os.path.join(_ROOT, "outputs", "judge_ui")
+_JUDGE_METRICS_JSON = os.path.join(JUDGE_UI_DIR, "ui_judge_metrics.json")
+
+
+def _load_judge_metrics_config() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "training_dashboard_png": "training_dashboard.png",
+        "policy_comparison_png": "policy_comparison.png",
+        "eval_summary_json": "eval_summary.json",
+        "captions": {},
+    }
+    if not os.path.isfile(_JUDGE_METRICS_JSON):
+        return defaults
+    try:
+        with open(_JUDGE_METRICS_JSON, encoding="utf-8") as fp:
+            merged = {**defaults, **json.load(fp)}
+        return merged
+    except (json.JSONDecodeError, OSError):
+        return defaults
+
+
+def _judge_ui_file(filename: str) -> Optional[str]:
+    if not filename:
+        return None
+    path = os.path.join(JUDGE_UI_DIR, filename)
+    return path if os.path.isfile(path) else None
+
+
+def _format_eval_summary_markdown() -> str:
+    cfg = _load_judge_metrics_config()
+    name = cfg.get("eval_summary_json") or "eval_summary.json"
+    path = os.path.join(JUDGE_UI_DIR, name)
+    if not os.path.isfile(path):
+        return (
+            "*No evaluation JSON yet.* Copy `eval_summary.json` from "
+            "`evaluate_before_after_policies` output into `outputs/judge_ui/` "
+            "to show **base vs trained** numbers here. Training curves: add "
+            "`training_dashboard.png` and `policy_comparison.png` to the same folder "
+            "(see filenames in `ui_judge_metrics.json`)."
+        )
+    try:
+        with open(path, encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (json.JSONDecodeError, OSError):
+        return "*Could not parse eval_summary JSON.*"
+
+    meta = data.get("metadata") or {}
+    policies = data.get("policies") or {}
+    base = policies.get("base") or {}
+    trained = policies.get("trained") or {}
+
+    def _cell(v: Any) -> str:
+        if isinstance(v, (int, float)):
+            return f"{v:.6g}"
+        return str(v)
+
+    lines = [
+        "### Base vs trained checkpoint",
+        "",
+        "| Metric | Base | Trained |",
+        "|---|---:|---:|",
+    ]
+    for key, label in (
+        ("mean_verifiable_reward", "Mean verifiable reward"),
+        ("mean_total_reward", "Mean total reward"),
+        ("success_rate", "Success rate"),
+        ("mean_final_payment_days", "Mean final payment days"),
+    ):
+        lines.append(f"| {label} | {_cell(base.get(key, ''))} | {_cell(trained.get(key, ''))} |")
+
+    lines.append("")
+    if meta.get("trained_primary_wins") is not None and meta.get("submission_ready") is not None:
+        lines.append(
+            f"**Primary metric wins (trained vs base):** {meta.get('trained_primary_wins')} · "
+            f"**submission_ready:** {meta.get('submission_ready')}"
+        )
+        lines.append("")
+    seeds = meta.get("seeds")
+    if seeds:
+        lines.append(f"**Evaluation seeds:** {seeds}")
+        lines.append("")
+    ckpt = meta.get("checkpoint_path")
+    if ckpt:
+        lines.append(f"**Checkpoint:** `{ckpt}`")
+
+    return "\n".join(lines)
+
+
+def _heuristic_tab_bridge_markdown() -> str:
+    has_eval = os.path.isfile(
+        os.path.join(JUDGE_UI_DIR, _load_judge_metrics_config().get("eval_summary_json") or "eval_summary.json")
+    )
+    extra = (
+        " Loaded **eval_summary.json** appears in the **For judges** tab."
+        if has_eval
+        else " Drop **`eval_summary.json`** and **`policy_comparison.png`** into `outputs/judge_ui/` after `evaluate_before_after_policies` to show the same comparison in-app."
+    )
+    return (
+        "**How this relates to learning:** This greedy run is a **non-RL baseline** on one seed. "
+        "The main playground chart (right column) shows **one episode’s** reward curvature — not "
+        "multi-step GRPO training. For **training reward curves** and **base vs checkpoint** bars, "
+        "open the **For judges: Environment & results** tab below."
+        + extra
+    )
+
+
+FOR_JUDGES_INTRO_MARKDOWN = """
+### For judges — what you are looking at
+
+**Problem.** Small suppliers negotiate payment terms with large buyers. Long receivables strain **liquidity** and **solvency**; India-specific angles include **MSMED Act** payment-window expectations and optional **TReDS** / **dynamic discounting** levers on harder tasks.
+
+**Why this environment is different.** It is not a toy gridworld: each episode is a **multi-round negotiation** with a buyer model, verifiable **financial state** (thresholds, NPV-style pressure), and **structured actions** (propose / accept / reject plus financing flags). Hard tasks combine **multiple economic levers**, so policies must trade off days, price, and instruments — a stress test for credit and compliance-aware behavior.
+
+**How we score success.** The same **deterministic terminal grader** used in RL benchmarks appears in the UI (weights: solvency, liquidity, NPV improvement, compliance). Step rewards in \([-1,1]\) **shape** the negotiation; the terminal score is what evaluation reports.
+
+**What “learning” means here.** **GRPO** (and related trainers in `rl/`) improve the policy over **many rollouts**. The interactive chart in **Deal economics → RL Insights** tracks **one episode**; the panels below show **training-run** and **base vs trained** artifacts when you add files to `outputs/judge_ui/` (see `ui_judge_metrics.json`).
+"""
+
 # TASKS, UI_ACTION_CHOICES, QUICK_CONNECT_SNIPPET imported from config.py
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -421,8 +540,11 @@ def _empty_reward_chart():
             )),
         )
         .properties(height=240, title=alt.TitleParams(
-            "Reward curvature will appear here",
+            text="Episode reward curvature (placeholder)",
+            subtitle="Single negotiation — not GRPO training curve",
             color="#64748B", fontSize=12, anchor="middle",
+            subtitleColor="#64748B",
+            subtitleFontSize=11,
         ))
         .configure_view(stroke=None, fill="#111827")
         .configure(background="#111827")
@@ -502,6 +624,18 @@ def _reward_curve_chart(state: SessionStore):
 
     chart = (
         (zero_rule + area + lines + points)
+        .properties(
+            height=240,
+            title=alt.TitleParams(
+                text="Episode reward curvature",
+                subtitle="This episode only — training progress is under For judges",
+                color="#CBD5E1",
+                fontSize=13,
+                subtitleColor="#94A3B8",
+                subtitleFontSize=11,
+                anchor="start",
+            ),
+        )
         .configure_view(stroke=None, fill="#111827")
         .configure(background="#111827")
         .configure_axis(gridColor="#1E293B", domainColor="#334155")
@@ -2091,23 +2225,81 @@ with gr.Blocks(title="OpenEnv SME Negotiator") as demo:
             status_bar = gr.HTML(value=_status_html(round_number=0, last_price=0.0, done=False))
             contract_btn = gr.DownloadButton("📄 Download Legal Contract", visible=False, variant="secondary", elem_classes=["btn-contract"])
 
-            # Benchmark Artifacts
-            with gr.Accordion("🧠 AI Under the Hood: RL Insights", open=False):
-                gr.Markdown("<div style='font-size: 0.85rem; color: #94A3B8; margin-bottom: 8px;'>Transparency panel showing the mathematical reinforcement learning signals powering this negotiation.</div>")
+            # Benchmark Artifacts (open by default so judges see reward curvature immediately)
+            with gr.Accordion("🧠 AI Under the Hood: RL Insights", open=True):
+                gr.Markdown(
+                    "<div style='font-size: 0.85rem; color: #94A3B8; margin-bottom: 8px;'>"
+                    "Transparency panel: scenario context, per-step reward signal, and "
+                    "<strong>episode-level</strong> reward curvature. Multi-epoch GRPO curves live in "
+                    "<strong>For judges</strong> below.</div>"
+                )
                 scenario_box = gr.HTML()
                 reward_box = gr.HTML()
                 reward_plot = gr.Plot()
+                gr.HTML(
+                    "<div class='tab-intro' style='margin-top:6px;font-size:0.78rem;'>"
+                    "<strong>Chart scope:</strong> one live negotiation episode (step vs cumulative reward). "
+                    "Training improvement over GRPO steps is shown in the "
+                    "<strong>For judges: Environment &amp; results</strong> tab when you add dashboard PNGs."
+                    "</div>"
+                )
                 last_json = gr.JSON(label="System Observation JSON")
 
     # ── Bottom tabs ──────────────────────────────────────────────────────
-    gr.HTML("<div class='tabs-head' style='margin-top: 32px;'>Developer Tools & API</div>")
+    gr.HTML("<div class='tabs-head' style='margin-top: 32px;'>Competition demo, judges, &amp; developer tools</div>")
     with gr.Tabs(elem_classes=["bottom-tabs"]):
 
+        with gr.Tab("For judges: Environment & results", elem_classes=["tab-judges"]):
+            gr.Markdown(FOR_JUDGES_INTRO_MARKDOWN)
+            _judge_cfg = _load_judge_metrics_config()
+            _cap = _judge_cfg.get("captions") or {}
+            if not isinstance(_cap, dict):
+                _cap = {}
+            _train_png = _judge_ui_file(str(_judge_cfg.get("training_dashboard_png") or "training_dashboard.png"))
+            _compare_png = _judge_ui_file(str(_judge_cfg.get("policy_comparison_png") or "policy_comparison.png"))
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown(
+                        "#### Training run (GRPO)\n\n"
+                        + str(
+                            _cap.get("training")
+                            or "Reward and rollout diagnostics from a full training run. "
+                            "Add **`training_dashboard.png`** to **`outputs/judge_ui/`** (see `ui_judge_metrics.json`)."
+                        )
+                    )
+                    if _train_png:
+                        gr.Image(value=_train_png, show_label=False, container=True)
+                    else:
+                        gr.Markdown(
+                            "_No `training_dashboard.png` found — optional asset for judging "
+                            "criterion “showing improvement in rewards” over training._"
+                        )
+                with gr.Column():
+                    gr.Markdown(
+                        "#### Base vs trained checkpoint\n\n"
+                        + str(
+                            _cap.get("comparison")
+                            or "Bar comparison on fixed seeds: pretrained vs checkpoint. "
+                            "Add **`policy_comparison.png`** from `evaluate_before_after_policies`."
+                        )
+                    )
+                    if _compare_png:
+                        gr.Image(value=_compare_png, show_label=False, container=True)
+                    else:
+                        gr.Markdown(
+                            "_No `policy_comparison.png` found — run `rl.demo.evaluate_before_after_policies` "
+                            "and copy the figure here._"
+                        )
+
+            gr.Markdown("---")
+            gr.Markdown(_format_eval_summary_markdown())
+
         with gr.Tab("🤖 Heuristic Auto-Play", elem_classes=["tab-autoplay"]):
+            gr.Markdown(_heuristic_tab_bridge_markdown())
             gr.HTML("""
             <div class='tab-intro'>
               <strong>Greedy baseline policy:</strong> proposes the buyer's current days − 5 each round until it hits the liquidity threshold, then accepts.
-              Hard task adds dynamic discounting at 8%. Use this to see what a non-RL baseline scores.
+              Hard task adds dynamic discounting at 8%. Use this to see what a non-RL baseline scores on one seed — then compare to trained checkpoints in the <strong>For judges</strong> tab when evaluation artifacts are present.
             </div>
             """)
             with gr.Row():
@@ -2262,6 +2454,9 @@ score = 0.35 × solvency  +  0.20 × liquidity
         outputs=submit_outputs,
     )
 
+    # Hugging Face Spaces and other hosts: queue avoids worker timeouts on concurrent users.
+    demo.queue(default_concurrency_limit=int(os.getenv("GRADIO_QUEUE_CONCURRENCY", "8")))
+
 
 if __name__ == "__main__":
     # HF Spaces / Docker often inject PORT=7860. Local override: GRADIO_PORT.
@@ -2276,6 +2471,8 @@ if __name__ == "__main__":
                 print(f"[startup] Launching on port {port} (from PORT / GRADIO_PORT / default 7860)")
             else:
                 print(f"[startup] Port {requested_port} busy; trying fallback port {port}")
+            if os.getenv("SPACE_ID"):
+                print(f"[startup] Hugging Face Space detected (SPACE_ID={os.getenv('SPACE_ID')!r})")
             # 0.0.0.0 is bind-only; browsers need localhost / 127.0.0.1 (ERR_ADDRESS_INVALID for http://0.0.0.0/...).
             print(f"[startup] Open this in your browser: http://127.0.0.1:{port}/")
             demo.launch(

@@ -7,18 +7,20 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+# One `uv sync` after all Hatch package sources exist on disk (sme_negotiator_env, server, rl).
+# Explicit altair/pandas install is a safety net if the Space builds from a stale `uv.lock`.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-install-project --no-editable
 COPY README.md ./
 COPY openenv.yaml ./
 COPY server ./server
 COPY sme_negotiator_env ./sme_negotiator_env
-RUN uv sync --frozen --no-editable
-
-# Install Gradio for the interactive playground UI (not in pyproject.toml)
-RUN uv pip install "gradio>=4.40.0"
-
+COPY rl ./rl
+COPY outputs/judge_ui ./outputs/judge_ui
 COPY app.py config.py action_handler.py reward_engine.py session_store.py step_logger.py ./
+
+RUN uv sync --frozen --no-editable \
+    && uv pip install "altair>=5.0.0" "pandas>=2.0.0" \
+    && .venv/bin/python -c "import altair, pandas, gradio; print('Gradio UI deps OK')"
 
 ENV PATH="/app/.venv/bin:${PATH}"
 

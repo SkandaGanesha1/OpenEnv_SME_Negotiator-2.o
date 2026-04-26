@@ -42,6 +42,8 @@ make docker-run                 # http://127.0.0.1:7860
 | [README.md](README.md) | Full project overview + baseline section | 10 min |
 | [SETUP.md](SETUP.md) | Step-by-step installation guide | 5 min |
 | [EVALUATION.md](EVALUATION.md) | How to measure & optimize performance | 15 min |
+| [docs/JUDGE_ONE_PAGER.md](docs/JUDGE_ONE_PAGER.md) | One-page judge handout (problem, environment, evidence, links) | 1 min |
+| [docs/storytelling/](docs/storytelling/) | Demo script, video storyboard, slide outline, narrative spine | 10 min |
 | [docs/SELF_PLAY.md](docs/SELF_PLAY.md) | Stage 6 self-play and simulated experts | 8 min |
 
 ### Reference Documents

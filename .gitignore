@@ -122,6 +122,7 @@ saved_model/
 README_SPACES.md
 
 # Temporary files
+_uv_docker_sim/
 *.tmp
 temp/
 stdout.txt
