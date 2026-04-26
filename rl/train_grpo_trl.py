@@ -228,6 +228,51 @@ def _patch_vllm_attention_backend() -> None:
         os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
 
 
+def _patch_trl_shuffle_sequence_dict() -> None:
+    """Guard TRL's shuffle_sequence_dict against mismatched tensor first-dims.
+
+    TRL 0.29.0 computes n from the first value in the generation-batch dict and
+    applies torch.randperm(n) to every tensor.  If any tensor has first-dim != n
+    (e.g. because completion_ids are longer than max_completion_length) the CUDA
+    IndexKernel fires an async assertion that surfaces here as an AcceleratorError.
+    This wrapper detects size mismatches and skips shuffling rather than crashing.
+    """
+    try:
+        import trl.trainer.utils as _trl_utils
+    except ImportError:
+        return
+
+    original = getattr(_trl_utils, "shuffle_sequence_dict", None)
+    if original is None or getattr(original, "__wrapped_safe__", False):
+        return
+
+    def _safe_shuffle_sequence_dict(seq_dict: dict) -> dict:
+        first_dims: set[int] = set()
+        for v in seq_dict.values():
+            if isinstance(v, list) and v:
+                first_dims.add(len(v))
+            elif hasattr(v, "shape") and getattr(v, "ndim", 0) >= 1:
+                first_dims.add(int(v.shape[0]))
+        if len(first_dims) != 1:
+            print(
+                f"[train_grpo_trl][WARN] shuffle_sequence_dict skipped: "
+                f"inconsistent tensor first dims {sorted(first_dims)}. "
+                "Verify rollout completion_ids are bounded to max_completion_length.",
+                flush=True,
+            )
+            return seq_dict
+        return original(seq_dict)
+
+    setattr(_safe_shuffle_sequence_dict, "__wrapped_safe__", True)
+    _trl_utils.shuffle_sequence_dict = _safe_shuffle_sequence_dict
+    try:
+        import trl.trainer.grpo_trainer as _grpo_mod
+        if hasattr(_grpo_mod, "shuffle_sequence_dict"):
+            _grpo_mod.shuffle_sequence_dict = _safe_shuffle_sequence_dict
+    except ImportError:
+        pass
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -501,6 +546,16 @@ def configure_tokenizer(tokenizer: Any) -> Any:
     tokenizer.padding_side = "left"
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = getattr(tokenizer, "eos_token", None)
+    # Qwen3 and some other models report bos_token_id=None after transformers
+    # alignment.  A None bos_token_id can cause TypeError→silent 0 fallbacks in
+    # downstream embedding lookups.  Use EOS as a safe sentinel instead.
+    if getattr(tokenizer, "bos_token_id", None) is None:
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_id is not None:
+            try:
+                tokenizer.bos_token_id = int(eos_id)
+            except Exception:
+                pass
     return tokenizer
 
 
@@ -2100,6 +2155,16 @@ def _run_single_rollout_sample(
     if not completion_signature_text:
         completion_signature_text = "\n".join(raw_turn_texts)
     completion_ids = _tokenize_text_without_special_tokens(tokenizer, completion_signature_text)
+    # Bound completion_ids to max_completion_length so TRL's fixed-size reference-
+    # model buffers are never over-indexed (RC-1: multi-turn episodes produce up to
+    # max_episode_steps × max_completion_length tokens but TRL only allocates
+    # max_completion_length slots, causing async CUDA IndexKernel assertions).
+    _max_comp_len = int(getattr(rollout_args, "max_completion_length", 256) or 256)
+    _eos_id = int(getattr(tokenizer, "eos_token_id", None) or 0)
+    if not completion_ids:
+        completion_ids = [_eos_id]
+    else:
+        completion_ids = completion_ids[:_max_comp_len]
     return {
         "prompt_ids": training_prompt_ids,
         "completion_ids": completion_ids,
@@ -2176,6 +2241,10 @@ def build_rollout_func(
         rollout_args: Any = args
         processing_class = tokenizer
         model = kwargs.get("model")
+        # Resolved once per call after rollout_args may be updated from trainer.
+        # Actual truncation happens in _run_single_rollout_sample; this is a
+        # defense-in-depth guard so the TRL generation-batch dict is always
+        # consistent even if a future code path bypasses the inner truncation.
 
         if context:
             candidate = context[0]
@@ -2230,19 +2299,26 @@ def build_rollout_func(
                     flush=True,
                 )
 
+        _max_comp = int(getattr(rollout_args, "max_completion_length", 256) or 256)
+        _eos_fb = int(getattr(processing_class, "eos_token_id", None) or 0)
+
+        def _safe_comp_ids(raw: list[int]) -> list[int]:
+            bounded = list(raw)[:_max_comp]
+            return bounded if bounded else [_eos_fb]
+
         return {
             "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
-            "completion_ids": [list(sample["completion_ids"]) for sample in samples],
+            "completion_ids": [_safe_comp_ids(sample["completion_ids"]) for sample in samples],
             "logprobs": [
                 _format_rollout_logprobs_for_trl(
-                    list(sample["logprobs"]),
-                    list(sample["completion_ids"]),
+                    list(sample["logprobs"])[:_max_comp],
+                    _safe_comp_ids(sample["completion_ids"]),
                 )
                 for sample in samples
             ],
             "logprob_token_ids": [
                 _format_rollout_logprob_token_ids_for_trl(
-                    list(sample["completion_ids"]),
+                    _safe_comp_ids(sample["completion_ids"]),
                 )
                 for sample in samples
             ],
@@ -2391,6 +2467,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "num_generations": num_generations,
         "generation_batch_size": generation_batch_size,
+        "steps_per_generation": 1,
         "learning_rate": learning_rate,
         "temperature": temperature,
         "top_p": top_p,
@@ -2782,6 +2859,7 @@ def create_trainer(session: dict[str, Any]) -> Any:
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
         _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
+    _patch_trl_shuffle_sequence_dict()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
 
