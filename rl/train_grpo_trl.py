@@ -2452,6 +2452,10 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     per_device_train_batch_size = int(getattr(args, "per_device_train_batch_size", 1) or 1)
     gradient_accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 4) or 4)
     num_generations = int(getattr(args, "num_generations", 4) or 4)
+    # generation_batch_size must be divisible by num_generations (TRL constraint).
+    # Default to num_generations so TRL derives steps_per_generation automatically
+    # as generation_batch_size / (per_device × num_processes).
+    generation_batch_size = int(getattr(args, "generation_batch_size", 0) or num_generations)
     learning_rate = float(getattr(args, "learning_rate", 5e-6) or 5e-6)
     temperature = float(getattr(args, "temperature", 1.0) or 1.0)
     top_p = float(getattr(args, "top_p", 1.0) or 1.0)
@@ -2465,7 +2469,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "per_device_train_batch_size": per_device_train_batch_size,
         "gradient_accumulation_steps": gradient_accumulation_steps,
         "num_generations": num_generations,
-        "steps_per_generation": 1,
+        "generation_batch_size": generation_batch_size,
         "learning_rate": learning_rate,
         "temperature": temperature,
         "top_p": top_p,
