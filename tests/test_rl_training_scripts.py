@@ -286,6 +286,13 @@ def test_strip_training_row_metadata_removes_embedded_row_lines() -> None:
     assert cleaned == [{"role": "user", "content": "/no_think\nUse JSON only."}]
 
 
+def test_build_training_rows_can_skip_embedded_row_metadata() -> None:
+    rows = build_training_rows(num_samples=1, include_row_metadata=False)
+
+    assert rows[0]["prompt"][0]["content"] == rows[0]["prompt"][0]["content"].replace("[TRAINING_ROW]", "")
+    assert "[TRAINING_ROW]" not in rows[0]["prompt"][0]["content"]
+
+
 def test_infer_expected_environment_batch_size_handles_dict_and_list_inputs() -> None:
     assert _infer_expected_environment_batch_size({"prompt": ["a", "b", "c"]}) == 3
     assert _infer_expected_environment_batch_size([{"prompt": "a"}, {"prompt": "b"}]) == 2

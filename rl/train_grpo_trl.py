@@ -577,7 +577,10 @@ def _build_training_prompt_content(
     difficulty: str,
     seed: int,
     total_periods: int,
+    include_row_metadata: bool = True,
 ) -> str:
+    if not include_row_metadata:
+        return str(prompt)
     row_metadata = {
         "task_name": str(task_name),
         "difficulty": str(difficulty),
@@ -600,6 +603,7 @@ def build_training_rows(
     total_periods: int = 3,
     num_samples: int = 64,
     seed_base: int = 1000,
+    include_row_metadata: bool = True,
 ) -> list[dict[str, Any]]:
     """Build deterministic conversational rows for GRPO/OpenEnv training."""
     rows: list[dict[str, Any]] = []
@@ -616,6 +620,7 @@ def build_training_rows(
                             difficulty=difficulty,
                             seed=seed,
                             total_periods=total_periods,
+                            include_row_metadata=include_row_metadata,
                         ),
                     }
                 ],
@@ -2716,6 +2721,7 @@ def _resolve_training_components(args: argparse.Namespace) -> dict[str, Any]:
         total_periods=args.total_periods,
         num_samples=args.num_samples,
         seed_base=args.seed_base,
+        include_row_metadata=str(getattr(args, "runtime_backend", "environment")) == "legacy",
     )
     env_factory = build_environment_factory(
         args,
