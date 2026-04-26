@@ -52,6 +52,16 @@ from server.environment import SMENegotiatorEnvironment
 from sme_negotiator_env.models import NegotiationAction
 from sme_negotiator_env.task_config import TASK_REGISTRY, TaskConfig
 
+# ── Backend modules ────────────────────────────────────────────────────────────
+from action_handler import ActionHandler
+from reward_engine import RewardEngine
+from session_store import SessionStore
+from step_logger import StepLogger
+
+_action_handler = ActionHandler()
+_reward_engine = RewardEngine()
+_logger = StepLogger()
+
 # ─────────────────────────────────────────────────────────────────────────────
 TASKS = {
     "🟢 Easy  — compress days ≤ 60": "payment-terms-easy",
@@ -421,7 +431,7 @@ def _format_assistant_turn(obs_dict: dict[str, Any]) -> str:
 def reset_episode(
     task_label: str,
     seed: int,
-    state: dict[str, Any],
+    state: SessionStore,
 ) -> tuple[Any, ...]:
     """New episode: fresh env, empty chat/JSON, status + scenario card + price/days from first obs."""
     try:
@@ -429,15 +439,9 @@ def reset_episode(
         task_id = TASKS[task_label]
         cfg: TaskConfig = TASK_REGISTRY[task_id]
 
-        state = {
-            "env": env,
-            "messages": [],
-            "last_payload": {"reward": 0.0, "done": False, "info": {}},
-            "task_label": task_label,
-            "seed": int(seed),
-            "cum_rew": 0.0,
-            "step_num": 0,
-        }
+        store = SessionStore()
+        ep_id = store.start_episode(env=env, task_label=task_label, seed=int(seed))
+        _logger.log_reset(episode_id=ep_id, task_label=task_label, seed=int(seed))
 
         p_price = float(obs.get("buyer_price", 100.0))
         p_days = int(obs.get("buyer_days", 90))
@@ -451,7 +455,7 @@ def reset_episode(
         json_payload = _build_last_step_json(obs)
 
         return (
-            state,
+            store,
             status_html,
             scenario_html,
             reward_html,
@@ -463,11 +467,11 @@ def reset_episode(
         )
     except Exception as exc:
         err = str(exc)
-        state = {"env": None, "messages": [], "last_payload": {"reward": 0.0, "done": False, "info": {}}, "cum_rew": 0.0, "step_num": 0}
+        store = SessionStore()
         status_html = f'<div class="status-bar error">⚠ Reset failed: {err}</div>'
         empty_scenario = "<div class='scenario-card error-card'>⚠ Could not load scenario. Check task config.</div>"
         return (
-            state,
+            store,
             status_html,
             empty_scenario,
             _reward_html(0.0, 0.0, 0),
@@ -491,10 +495,11 @@ def submit_step(
     propose_clause: bool,
     propose_dd: bool,
     dd_rate: float,
-    state: dict[str, Any],
+    state: SessionStore,
 ) -> tuple[Any, ...]:
-    env: Optional[SMENegotiatorEnvironment] = state.get("env")
-    messages: list = list(state.get("messages") or [])
+    store: SessionStore = state if isinstance(state, SessionStore) else SessionStore()
+    env: Optional[SMENegotiatorEnvironment] = store.env
+    messages: list = list(store.messages or [])
 
     if env is None:
         err = "⚠️ No active episode — use **Reset Episode** first."
@@ -510,7 +515,7 @@ def submit_step(
             horizon=int(simulation_horizon) if simulation_horizon else None,
         ), err]]
         return (
-            state,
+            store,
             _status_html(round_number=0, last_price=0.0, done=False),
             _reward_html(0.0, 0.0, 0),
             messages,
@@ -520,7 +525,37 @@ def submit_step(
             gr.update(),
         )
 
-    wired = _map_ui_action_to_literal(ui_action or "propose")
+    wired = _action_handler.map_ui_action(ui_action or "propose")
+
+    # ── Pre-flight validation ────────────────────────────────────────────────
+    ok, val_err = _action_handler.validate(
+        price=float(price),
+        payment_days=int(payment_days),
+        use_treds=bool(use_treds),
+        propose_dynamic_discounting=bool(propose_dd),
+        dynamic_discount_annual_rate=float(dd_rate),
+        action_type=wired,
+    )
+    if not ok:
+        user_t = _format_user_turn(
+            ui_action=ui_action or "", wired_action=wired,
+            price=float(price), days=int(payment_days),
+            reason=reason or "", deal_id=deal_id or "",
+            use_treds=bool(use_treds), sim_plan_raw=simulation_plan_raw or "",
+            horizon=int(simulation_horizon) if simulation_horizon else None,
+        )
+        err_msg = _action_handler.format_error(val_err)
+        messages = messages + [[user_t, err_msg]]
+        _logger.log_validation_error(
+            episode_id=store.episode_id, step=store.step_num,
+            error=val_err, action_type=wired,
+            price=float(price), payment_days=int(payment_days),
+        )
+        return (
+            store, gr.update(), gr.update(), messages,
+            {"reward": 0.0, "done": False, "info": {"message": val_err}},
+            gr.update(), gr.update(), gr.update(),
+        )
 
     try:
         sim_plan = _parse_simulation_plan(simulation_plan_raw or "")
@@ -539,7 +574,7 @@ def submit_step(
         )
         messages = messages + [[user_t, f"**Parse error:** {err}"]]
         return (
-            state,
+            store,
             gr.update(),
             gr.update(),
             messages,
@@ -584,24 +619,10 @@ def submit_step(
             horizon=horizon_int,
         )
         messages = messages + [[user_t, err]]
-        return (state, gr.update(), gr.update(), messages, {"reward": 0.0, "done": False, "info": {"message": err}}, gr.update(), gr.update(), gr.update())
+        return (store, gr.update(), gr.update(), messages, {"reward": 0.0, "done": False, "info": {"message": err}}, gr.update(), gr.update(), gr.update())
 
     done = bool(obs_dict.get("done", obs_dict.get("negotiation_done", False)))
     step_reward = float(obs_dict.get("reward", obs_dict.get("step_reward", 0.0)))
-    cum = float(state.get("cum_rew", 0.0)) + step_reward
-    step_num = int(state.get("step_num", 0)) + 1
-    state = dict(state)
-    state["cum_rew"] = cum
-    state["step_num"] = step_num
-
-    last_price = float(obs_dict.get("buyer_price", 0.0))
-    rnd = int(obs_dict.get("round_number", 0))
-    accepted = bool(obs_dict.get("buyer_accepted", False))
-    status_html = _status_html(
-        round_number=rnd, last_price=last_price, done=done,
-        reward=step_reward, buyer_accepted=accepted,
-    )
-    rwd_html = _reward_html(step_reward, cum, step_num)
 
     user_t = _format_user_turn(
         ui_action=ui_action or "",
@@ -615,15 +636,52 @@ def submit_step(
         horizon=horizon_int,
     )
     assistant_t = _format_assistant_turn(obs_dict)
-    messages = messages + [[user_t, assistant_t]]
 
+    # ── Update session store ─────────────────────────────────────────────────
+    store.record_step(
+        user_message=user_t,
+        assistant_message=assistant_t,
+        reward=step_reward,
+        done=done,
+        obs_dict=obs_dict,
+    )
+    _logger.log_step(
+        episode_id=store.episode_id,
+        step=store.step_num,
+        action_type=wired,
+        price=float(price),
+        payment_days=int(payment_days),
+        use_treds=bool(use_treds),
+        reward=step_reward,
+        cum_reward=store.cum_rew,
+        done=done,
+        buyer_price=obs_dict.get("buyer_price"),
+        buyer_days=obs_dict.get("buyer_days"),
+        round_number=obs_dict.get("round_number"),
+    )
+    if done:
+        _logger.log_episode_end(
+            episode_id=store.episode_id,
+            task_label=store.task_label,
+            steps=store.step_num,
+            total_reward=store.cum_rew,
+        )
+
+    last_price = float(obs_dict.get("buyer_price", 0.0))
+    rnd = int(obs_dict.get("round_number", 0))
+    accepted = bool(obs_dict.get("buyer_accepted", False))
+    status_html = _status_html(
+        round_number=rnd, last_price=last_price, done=done,
+        reward=step_reward, buyer_accepted=accepted,
+    )
+    rwd_html = _reward_html(step_reward, store.cum_rew, store.step_num)
     json_payload = _build_last_step_json(obs_dict)
 
     return (
-        state,
+        store,
         status_html,
         rwd_html,
-        messages,
+        store.messages,
         json_payload,
         float(obs_dict.get("buyer_price", price)),
         int(obs_dict.get("buyer_days", payment_days)),
@@ -1693,10 +1751,7 @@ with gr.Blocks(title="OpenEnv SME Negotiator", css=CUSTOM_CSS) as demo:
     </div>
     """)
 
-    session_state = gr.State({
-        "env": None, "messages": [], "cum_rew": 0.0, "step_num": 0,
-        "last_payload": {"reward": 0.0, "done": False, "info": {}},
-    })
+    session_state = gr.State(SessionStore())
 
     with gr.Row(equal_height=False):
         # ── LEFT: Control Panel ──────────────────────────────────────────
