@@ -312,6 +312,8 @@ def test_save_training_dashboard_skips_empty_legends_and_saves_png() -> None:
     assert summary["metrics"]["episode/avg_total_reward"] == 0.4
     assert summary["metrics"]["rollout/reward_std"] is None
     assert summary["history_points"] == 2
+    assert summary["training_trustworthy"] is False
+    assert "median_reward_std_zero" in summary["trust_failures"]
 
 
 def test_plot_rewards_writes_png_from_saved_reward_log() -> None:
@@ -402,4 +404,6 @@ def test_evaluate_before_after_policies_writes_summary_and_plot(monkeypatch) -> 
     assert Path(result["eval_summary_path"]).exists()
     assert Path(result["policy_comparison_path"]).exists()
     assert result["summary"]["metadata"]["submission_ready"] is True
+    assert result["summary"]["metadata"]["trained_beats_base_without_extra_defaults"] is True
     assert result["summary"]["policies"]["trained"]["success_rate"] > result["summary"]["policies"]["base"]["success_rate"]
+    assert result["summary"]["policies"]["heuristic"]["success_rate"] == 1.0

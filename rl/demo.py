@@ -9,7 +9,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
-from statistics import mean
+from statistics import mean, median
 from typing import Any, Optional
 
 from rl.bridge import (
@@ -87,6 +87,68 @@ _SUSPICIOUS_COMPLETION_PATTERNS = (
     "import os",
     "import sys",
 )
+
+
+def _history_metric_values(history: list[dict[str, Any]], metric_name: str) -> list[float]:
+    return [float(entry.get(metric_name, 0.0) or 0.0) for entry in history if metric_name in entry]
+
+
+def _median_or_zero(values: list[float]) -> float:
+    return round(float(median(values)), 6) if values else 0.0
+
+
+def summarize_training_trustworthiness(history: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize rollout-collapse and shaping-risk signals from trainer logs."""
+    reward_std_values = _history_metric_values(history, "rollout/reward_std")
+    unique_completion_values = _history_metric_values(history, "rollout/unique_completion_count")
+    identical_terminal_values = _history_metric_values(history, "rollout/identical_terminal_fraction")
+    contract_score_values = _history_metric_values(history, "rollout/contract_score")
+    total_reward_values = _history_metric_values(history, "episode/avg_total_reward")
+    verifiable_reward_values = _history_metric_values(history, "episode/avg_verifiable_reward")
+
+    zero_variance_streak = 0
+    zero_variance_warning = False
+    for reward_std in reward_std_values:
+        if float(reward_std) <= 1e-8:
+            zero_variance_streak += 1
+        else:
+            zero_variance_streak = 0
+        if zero_variance_streak >= 2:
+            zero_variance_warning = True
+            break
+
+    median_reward_std = _median_or_zero(reward_std_values)
+    median_unique_completion_count = _median_or_zero(unique_completion_values)
+    median_identical_terminal_fraction = _median_or_zero(identical_terminal_values)
+    median_contract_score = _median_or_zero(contract_score_values)
+    mean_total_reward = round(mean(total_reward_values), 6) if total_reward_values else 0.0
+    mean_verifiable_reward = round(mean(verifiable_reward_values), 6) if verifiable_reward_values else 0.0
+    reward_shaping_gap = round(mean_total_reward - mean_verifiable_reward, 6)
+
+    trust_failures: list[str] = []
+    if zero_variance_warning:
+        trust_failures.append("zero_variance_warning")
+    if median_reward_std <= 1e-8:
+        trust_failures.append("median_reward_std_zero")
+    if unique_completion_values and median_unique_completion_count < 2.0:
+        trust_failures.append("low_completion_diversity")
+    if identical_terminal_values and median_identical_terminal_fraction >= 0.95:
+        trust_failures.append("identical_terminal_collapse")
+    if reward_shaping_gap > 0.25 and mean_verifiable_reward <= 0.0:
+        trust_failures.append("reward_shaping_dominates_verifiable_reward")
+
+    return {
+        "training_trustworthy": not trust_failures,
+        "trust_failures": trust_failures,
+        "median_reward_std": median_reward_std,
+        "median_unique_completion_count": median_unique_completion_count,
+        "median_identical_terminal_fraction": median_identical_terminal_fraction,
+        "mean_total_reward": mean_total_reward,
+        "mean_verifiable_reward": mean_verifiable_reward,
+        "reward_shaping_gap": reward_shaping_gap,
+        "median_contract_score": median_contract_score,
+        "zero_variance_warning": zero_variance_warning,
+    }
 
 
 def _cuda_training_dtype() -> Any:
@@ -700,6 +762,8 @@ def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict
             _, values = _metric_series(history, metric_name)
             metrics[metric_name] = values[-1] if values else None
 
+    trust_summary = summarize_training_trustworthiness(history)
+    trust_status = "PASS" if bool(trust_summary["training_trustworthy"]) else "FAIL"
     figure_path = output_path / "training_dashboard.png"
     try:
         import matplotlib.pyplot as plt
@@ -727,7 +791,7 @@ def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict
 
         for axis in axes:
             axis.set_xlabel("Training step")
-        fig.suptitle("SME Negotiator Training Dashboard")
+        fig.suptitle(f"SME Negotiator Training Dashboard - Trust {trust_status}")
         fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
         fig.savefig(figure_path, dpi=140, bbox_inches="tight")
         plt.close(fig)
@@ -739,25 +803,16 @@ def save_training_dashboard(trainer_or_history: Any, *, output_dir: str) -> dict
     except Exception:
         _write_placeholder_png(reward_curve_path)
 
-    zero_variance_streak = 0
-    zero_variance_warning = False
-    for entry in history:
-        reward_std = float(entry.get("rollout/reward_std", 0.0) or 0.0)
-        if reward_std <= 1e-8:
-            zero_variance_streak += 1
-        else:
-            zero_variance_streak = 0
-        if zero_variance_streak >= 2:
-            zero_variance_warning = True
-            break
-
     return {
         "training_dashboard_path": str(figure_path.resolve()),
         "reward_curve_path": str(reward_curve_path.resolve()),
         "reward_log_path": str(reward_log_path.resolve()),
         "metrics": metrics,
         "history_points": len(history),
-        "zero_variance_warning": zero_variance_warning,
+        "zero_variance_warning": bool(trust_summary["zero_variance_warning"]),
+        "training_trustworthy": bool(trust_summary["training_trustworthy"]),
+        "trust_failures": list(trust_summary["trust_failures"]),
+        "trust_metrics": trust_summary,
     }
 
 
@@ -1236,26 +1291,42 @@ def evaluate_before_after_policies(
         for seed in seeds
     ]
 
-    heuristic_reference = None
+    heuristic_runs: list[dict[str, Any]] = []
     if include_heuristic:
-        heuristic_reference = run_policy_episode_report(
-            policy="heuristic",
-            seed=seeds[0] if seeds else 0,
-            total_periods=total_periods,
-            task_name=task_name,
-            difficulty=difficulty,
-            max_steps=max_steps,
-        )
+        heuristic_runs = [
+            run_policy_episode_report(
+                policy="heuristic",
+                seed=seed,
+                total_periods=total_periods,
+                task_name=task_name,
+                difficulty=difficulty,
+                max_steps=max_steps,
+            )
+            for seed in seeds
+        ]
 
     comparison = {
         "base": _aggregate_policy_runs(base_runs),
         "trained": _aggregate_policy_runs(trained_runs),
     }
+    if heuristic_runs:
+        comparison["heuristic"] = _aggregate_policy_runs(heuristic_runs)
     primary_metrics = ("success_rate", "mean_verifiable_reward", "mean_total_reward")
     trained_primary_wins = sum(
         1 for metric_name in primary_metrics if comparison["trained"][metric_name] > comparison["base"][metric_name]
     )
     submission_ready = trained_primary_wins >= 2
+    trained_verifiable_improvement = round(
+        float(comparison["trained"]["mean_verifiable_reward"]) - float(comparison["base"]["mean_verifiable_reward"]),
+        6,
+    )
+    trained_default_delta = round(
+        float(comparison["trained"]["default_rate"]) - float(comparison["base"]["default_rate"]),
+        6,
+    )
+    trained_beats_base_without_extra_defaults = (
+        trained_verifiable_improvement > 0.0 and trained_default_delta <= 0.0
+    )
 
     figure_path = output_path / "policy_comparison.png"
     try:
@@ -1283,9 +1354,9 @@ def evaluate_before_after_policies(
     base_transcript_path.write_text(str(base_runs[0]["transcript"]) if base_runs else "", encoding="utf-8")
     trained_transcript_path.write_text(str(trained_runs[0]["transcript"]) if trained_runs else "", encoding="utf-8")
     heuristic_transcript_path = None
-    if heuristic_reference is not None:
+    if heuristic_runs:
         heuristic_transcript_path = output_path / "heuristic_reference_transcript.txt"
-        heuristic_transcript_path.write_text(str(heuristic_reference["transcript"]), encoding="utf-8")
+        heuristic_transcript_path.write_text(str(heuristic_runs[0]["transcript"]), encoding="utf-8")
 
     eval_summary = {
         "metadata": {
@@ -1298,6 +1369,9 @@ def evaluate_before_after_policies(
             "seeds": [int(seed) for seed in seeds],
             "submission_ready": submission_ready,
             "trained_primary_wins": int(trained_primary_wins),
+            "trained_verifiable_improvement": trained_verifiable_improvement,
+            "trained_default_delta": trained_default_delta,
+            "trained_beats_base_without_extra_defaults": trained_beats_base_without_extra_defaults,
         },
         "policies": comparison,
         "artifacts": {
@@ -1316,7 +1390,7 @@ def evaluate_before_after_policies(
         "policy_comparison_path": str(figure_path.resolve()),
         "base_transcript": str(base_runs[0]["transcript"]) if base_runs else "",
         "trained_transcript": str(trained_runs[0]["transcript"]) if trained_runs else "",
-        "heuristic_transcript": str(heuristic_reference["transcript"]) if heuristic_reference is not None else "",
+        "heuristic_transcript": str(heuristic_runs[0]["transcript"]) if heuristic_runs else "",
     }
 
 

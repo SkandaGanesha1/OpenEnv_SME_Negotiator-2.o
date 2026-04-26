@@ -59,6 +59,16 @@ SUPPORTED_TOOL_NAMES: tuple[str, ...] = (
     "CHECK_COMPLIANCE",
     "RUN_CASHFLOW_SIM",
 )
+EXPOSED_ENVIRONMENT_METHOD_NAMES: tuple[str, ...] = (
+    "propose",
+    "accept",
+    "reject",
+    "advance_period",
+    "query_treds",
+    "check_compliance",
+    "run_cashflow_sim",
+    "simulate_plan",
+)
 
 
 def build_action_contract_text() -> str:
@@ -73,6 +83,24 @@ def build_action_contract_text() -> str:
         "For simulate_plan include simulation_plan and optional simulation_horizon. "
         "Do not write markdown, prose, or multiple actions."
     )
+
+
+def get_exposed_environment_method_names() -> tuple[str, ...]:
+    """Return the canonical agent-facing environment method allowlist."""
+    return tuple(EXPOSED_ENVIRONMENT_METHOD_NAMES)
+
+
+def build_exposed_environment_method_map(environment: Any) -> dict[str, Any]:
+    """Return the canonical exposed methods for a wrapper/environment instance."""
+    tools: dict[str, Any] = {}
+    for name in EXPOSED_ENVIRONMENT_METHOD_NAMES:
+        try:
+            value = getattr(environment, name)
+        except Exception:
+            continue
+        if callable(value):
+            tools[name] = value
+    return tools
 
 
 def format_observation(observation: Any, *, role: str = "sme", persona: Optional[str] = None) -> str:

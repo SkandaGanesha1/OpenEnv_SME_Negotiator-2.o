@@ -16,7 +16,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from rl.demo import plot_rewards, save_run_manifest, save_training_dashboard
+from rl.bridge import get_exposed_environment_method_names
+from rl.demo import (
+    evaluate_before_after_policies,
+    plot_rewards,
+    save_run_manifest,
+    save_training_dashboard,
+    summarize_training_trustworthiness,
+)
 from rl.train_grpo_trl import (
     DEFAULT_MODEL_NAME,
     build_environment_factory,
@@ -95,6 +102,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-max-model-length", type=int, default=None)
+    parser.add_argument("--scale-rewards", default="none")
+    parser.add_argument(
+        "--mask-truncated-completions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--log-completions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--strict-trustworthiness", action="store_true")
+    parser.add_argument("--eval-num-seeds", type=int, default=4)
+    parser.add_argument("--eval-seed-offset", type=int, default=10000)
     parser.add_argument("--skip-smoke-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.set_defaults(use_vllm=True)
@@ -165,6 +186,9 @@ def build_canonical_training_args(args: argparse.Namespace) -> argparse.Namespac
         vllm_mode=args.vllm_mode,
         vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
         vllm_max_model_length=args.vllm_max_model_length,
+        scale_rewards=args.scale_rewards,
+        mask_truncated_completions=args.mask_truncated_completions,
+        log_completions=args.log_completions,
         rubric_weight=args.rubric_weight,
         runtime_backend="environment",
     )
@@ -198,7 +222,13 @@ def build_run_plan(args: argparse.Namespace, canonical_args: argparse.Namespace)
             "vllm_max_model_length": None
             if getattr(canonical_args, "vllm_max_model_length", None) is None
             else int(canonical_args.vllm_max_model_length),
+            "scale_rewards": getattr(canonical_args, "scale_rewards", None),
+            "mask_truncated_completions": getattr(canonical_args, "mask_truncated_completions", None),
+            "log_completions": bool(getattr(canonical_args, "log_completions", True)),
             "rubric_weight": float(canonical_args.rubric_weight),
+            "strict_trustworthiness": bool(args.strict_trustworthiness),
+            "eval_num_seeds": int(args.eval_num_seeds),
+            "eval_seed_offset": int(args.eval_seed_offset),
         },
         "paths": {
             "output_dir": str(output_dir.resolve()),
@@ -217,6 +247,120 @@ def _write_episode_reward_log(records: list[dict[str, Any]], *, output_path: Pat
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(records, indent=2), encoding="utf-8")
     return output_path
+
+
+def _held_out_eval_seeds(*, seed_offset: int, num_seeds: int) -> list[int]:
+    count = max(1, int(num_seeds))
+    base = int(seed_offset)
+    return [base + index for index in range(count)]
+
+
+def _run_trustworthiness_evaluations(
+    *,
+    output_dir: Path,
+    checkpoint_path: Path,
+    model_name: str,
+    eval_num_seeds: int,
+    eval_seed_offset: int,
+) -> dict[str, Any]:
+    panels = (
+        ("liquidity-stress-medium", "medium", 3),
+        ("liquidity-correlation-hard", "hard", 2),
+    )
+    by_task: dict[str, Any] = {}
+    seed_panels: dict[str, list[int]] = {}
+    all_passed = True
+    for index, (task_name, difficulty, total_periods) in enumerate(panels):
+        seeds = _held_out_eval_seeds(
+            seed_offset=eval_seed_offset + index * max(100, eval_num_seeds),
+            num_seeds=eval_num_seeds,
+        )
+        seed_panels[task_name] = seeds
+        result = evaluate_before_after_policies(
+            output_dir=str(output_dir / task_name),
+            seeds=seeds,
+            total_periods=total_periods,
+            task_name=task_name,
+            difficulty=difficulty,
+            checkpoint_path=str(checkpoint_path),
+            model_name=model_name,
+            max_steps=24,
+            include_heuristic=True,
+        )
+        summary = dict(result["summary"])
+        metadata = dict(summary.get("metadata", {}) or {})
+        panel_passed = bool(metadata.get("trained_beats_base_without_extra_defaults", False))
+        all_passed = all_passed and panel_passed
+        by_task[task_name] = {
+            "difficulty": difficulty,
+            "total_periods": total_periods,
+            "seeds": seeds,
+            "trained_beats_base_without_extra_defaults": panel_passed,
+            "summary": summary,
+            "eval_summary_path": result["eval_summary_path"],
+            "policy_comparison_path": result["policy_comparison_path"],
+        }
+    return {
+        "tasks": by_task,
+        "seed_panels": seed_panels,
+        "trained_beats_base_without_extra_defaults": all_passed,
+    }
+
+
+def _build_training_trust_report(
+    *,
+    runtime_backend: str,
+    dashboard: dict[str, Any],
+    episode_reward_history: list[dict[str, Any]],
+    exposed_tool_names: list[str],
+    eval_summary: dict[str, Any],
+) -> dict[str, Any]:
+    expected_tools = list(get_exposed_environment_method_names())
+    unexpected_tools = sorted(set(exposed_tool_names) - set(expected_tools))
+    missing_tools = sorted(set(expected_tools) - set(exposed_tool_names))
+    helper_tools = sorted(
+        tool_name
+        for tool_name in exposed_tool_names
+        if tool_name in {"build_episode_log", "compute_final_reward", "summarize_episode"}
+    )
+    trust_metrics = dict(dashboard.get("trust_metrics", {}) or {})
+    if not trust_metrics:
+        trust_metrics = summarize_training_trustworthiness([])
+    reward_shaping_gap = round(
+        trust_metrics.get("mean_total_reward", 0.0) - trust_metrics.get("mean_verifiable_reward", 0.0),
+        6,
+    )
+    trust_metrics["reward_shaping_gap"] = reward_shaping_gap
+    trust_metrics["exposed_tool_count"] = float(len(exposed_tool_names))
+    trust_metrics["episode_reward_history_count"] = float(len(episode_reward_history))
+    trust_metrics["held_out_eval_passed"] = 1.0 if bool(
+        eval_summary.get("trained_beats_base_without_extra_defaults", False)
+    ) else 0.0
+
+    trust_failures = list(dashboard.get("trust_failures", []) or [])
+    if runtime_backend != "environment":
+        trust_failures.append("runtime_backend_not_environment")
+    if helper_tools:
+        trust_failures.append("internal_helper_tools_exposed")
+    if unexpected_tools:
+        trust_failures.append("unexpected_tool_exposure")
+    if missing_tools:
+        trust_failures.append("missing_canonical_tools")
+    if not bool(eval_summary.get("trained_beats_base_without_extra_defaults", False)):
+        trust_failures.append("held_out_eval_no_improvement")
+    if reward_shaping_gap > 0.25 and trust_metrics.get("mean_verifiable_reward", 0.0) <= 0.0:
+        trust_failures.append("reward_shaping_dominates_verifiable_reward")
+
+    deduped_failures = list(dict.fromkeys(str(item) for item in trust_failures))
+    return {
+        "training_trustworthy": not deduped_failures,
+        "trust_failures": deduped_failures,
+        "trust_metrics": trust_metrics,
+        "unexpected_tools": unexpected_tools,
+        "missing_tools": missing_tools,
+        "helper_tools": helper_tools,
+        "expected_tools": expected_tools,
+    }
 
 
 def _validate_canonical_backend(args: argparse.Namespace) -> None:
@@ -309,6 +453,21 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
     reward_curve_path = Path(dashboard["reward_curve_path"])
     trainer_reward_log_path = Path(dashboard["reward_log_path"])
     plot_rewards(episode_reward_log_path, reward_curve_path)
+    eval_summary = _run_trustworthiness_evaluations(
+        output_dir=output_dir / "held_out_eval",
+        checkpoint_path=Path(result["checkpoint_path"]),
+        model_name=str(canonical_args.model_name),
+        eval_num_seeds=int(args.eval_num_seeds),
+        eval_seed_offset=int(args.eval_seed_offset),
+    )
+    exposed_tool_names = [str(name) for name in list(result.get("exposed_tool_names", []))]
+    trust_report = _build_training_trust_report(
+        runtime_backend=str(result.get("runtime_backend", canonical_args.runtime_backend)),
+        dashboard=dashboard,
+        episode_reward_history=list(result.get("episode_reward_history", [])),
+        exposed_tool_names=exposed_tool_names,
+        eval_summary=eval_summary,
+    )
 
     manifest = {
         "run_type": "simple_grpo_training",
@@ -327,7 +486,19 @@ def run_training(args: argparse.Namespace) -> dict[str, Any]:
             "training_dashboard_path": str(Path(dashboard["training_dashboard_path"]).resolve()),
             "history_points": int(dashboard["history_points"]),
             "zero_variance_warning": bool(dashboard["zero_variance_warning"]),
+            "training_trustworthy": bool(trust_report["training_trustworthy"]),
+            "trust_failures": list(trust_report["trust_failures"]),
+            "trust_metrics": dict(trust_report["trust_metrics"]),
+            "median_reward_std": float(trust_report["trust_metrics"].get("median_reward_std", 0.0) or 0.0),
+            "median_unique_completion_count": float(
+                trust_report["trust_metrics"].get("median_unique_completion_count", 0.0) or 0.0
+            ),
+            "median_identical_terminal_fraction": float(
+                trust_report["trust_metrics"].get("median_identical_terminal_fraction", 0.0) or 0.0
+            ),
+            "exposed_tool_names": exposed_tool_names,
         },
+        "eval_summary": eval_summary,
     }
     manifest_path = save_run_manifest(manifest, output_dir=str(output_dir))
     manifest["manifest_path"] = manifest_path
@@ -357,6 +528,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     manifest = run_training(args)
     print(json.dumps(manifest, indent=2, default=str))
+    if args.strict_trustworthiness and not bool(manifest["training"].get("training_trustworthy", False)):
+        return 2
     return 0
 
 

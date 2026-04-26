@@ -21,9 +21,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from rl.curriculum import CurriculumManager
 from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
-from rl.bridge import InProcessEnvWrapper
+from rl.bridge import InProcessEnvWrapper, get_exposed_environment_method_names
 from rl.train_grpo_trl import (
     _align_trl_environment_batch,
+    _build_environment_tool_dicts,
     _infer_expected_environment_batch_size,
     _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
@@ -1100,6 +1101,50 @@ def test_in_process_env_wrapper_public_tool_methods_are_typed_and_documented() -
         assert method.__doc__, f"{method_name} should expose a docstring for tool/schema inference"
 
 
+def test_build_environment_tool_dicts_uses_canonical_allowlist_only() -> None:
+    class _ExposedEnv:
+        def propose(self):  # pragma: no cover - invoked via reflection only
+            return "propose"
+
+        def accept(self):
+            return "accept"
+
+        def reject(self):
+            return "reject"
+
+        def advance_period(self):
+            return "advance"
+
+        def query_treds(self):
+            return "treds"
+
+        def check_compliance(self):
+            return "compliance"
+
+        def run_cashflow_sim(self):
+            return "sim"
+
+        def simulate_plan(self):
+            return "plan"
+
+        def build_episode_log(self):
+            return "helper"
+
+        def compute_final_reward(self):
+            return 0.5
+
+        def summarize_episode(self):
+            return {}
+
+    sync_tools, async_tools = _build_environment_tool_dicts(_ExposedEnv())
+
+    assert async_tools == {}
+    assert list(sync_tools) == list(get_exposed_environment_method_names())
+    assert "build_episode_log" not in sync_tools
+    assert "compute_final_reward" not in sync_tools
+    assert "summarize_episode" not in sync_tools
+
+
 def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> None:
     args = build_arg_parser().parse_args([])
 
@@ -1138,6 +1183,23 @@ def test_build_grpo_config_kwargs_sets_notebook_safe_vllm_limits() -> None:
     assert kwargs["vllm_gpu_memory_utilization"] == 0.45
     assert kwargs["vllm_max_model_length"] == 2048
     assert kwargs["vllm_importance_sampling_correction"] is False
+
+
+def test_build_grpo_config_kwargs_plumbs_scale_rewards_and_completion_flags() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--scale-rewards",
+            "none",
+            "--mask-truncated-completions",
+            "--no-log-completions",
+        ]
+    )
+
+    kwargs = build_grpo_config_kwargs(args)
+
+    assert kwargs["scale_rewards"] == "none"
+    assert kwargs["mask_truncated_completions"] is True
+    assert kwargs["log_completions"] is False
 
 
 def test_make_training_args_applies_notebook_overrides_without_mutating_parser_defaults() -> None:
@@ -2050,6 +2112,16 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
             "reward_log_path": str(trainer_reward_log_path),
             "history_points": 3,
             "zero_variance_warning": False,
+            "training_trustworthy": True,
+            "trust_failures": [],
+            "trust_metrics": {
+                "training_trustworthy": True,
+                "median_reward_std": 0.2,
+                "median_unique_completion_count": 3.0,
+                "median_identical_terminal_fraction": 0.5,
+                "mean_total_reward": 0.2,
+                "mean_verifiable_reward": 0.2,
+            },
         },
     )
     monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
@@ -2060,6 +2132,7 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
             "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
             "checkpoint_path": checkpoint_path,
             "runtime_backend": "environment",
+            "exposed_tool_names": list(get_exposed_environment_method_names()),
             "episode_reward_history": [
                 {
                     "episode": 1,
@@ -2070,6 +2143,25 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
                     "success_no_default_positive_npv": True,
                 }
             ],
+        },
+    )
+    monkeypatch.setattr(
+        liquidity_script,
+        "evaluate_before_after_policies",
+        lambda **kwargs: {
+            "summary": {
+                "metadata": {
+                    "trained_beats_base_without_extra_defaults": True,
+                    "submission_ready": True,
+                },
+                "policies": {
+                    "base": {"mean_verifiable_reward": 0.2, "default_rate": 0.1},
+                    "trained": {"mean_verifiable_reward": 0.3, "default_rate": 0.1},
+                    "heuristic": {"mean_verifiable_reward": 0.25, "default_rate": 0.1},
+                },
+            },
+            "eval_summary_path": str(tmp_path / "eval_summary.json"),
+            "policy_comparison_path": str(tmp_path / "policy_comparison.png"),
         },
     )
     monkeypatch.setattr(liquidity_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
@@ -2089,7 +2181,35 @@ def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, cap
     assert payload["training"]["trainer_reward_log_path"] == str(trainer_reward_log_path.resolve())
     assert payload["training"]["runtime_backend"] == "environment"
     assert payload["training"]["environment_backend_valid"] is True
+    assert payload["training"]["training_trustworthy"] is True
+    assert payload["training"]["trust_failures"] == []
+    assert payload["training"]["exposed_tool_names"] == list(get_exposed_environment_method_names())
+    assert payload["training"]["trust_metrics"]["median_reward_std"] == 0.2
+    assert payload["training"]["median_reward_std"] == 0.2
+    assert payload["training"]["median_unique_completion_count"] == 3.0
+    assert payload["eval_summary"]["trained_beats_base_without_extra_defaults"] is True
+    assert set(payload["eval_summary"]["tasks"]) == {
+        "liquidity-stress-medium",
+        "liquidity-correlation-hard",
+    }
     assert payload["manifest_path"] == str(manifest_path)
+
+
+def test_simple_script_main_strict_trustworthiness_returns_nonzero_on_failure(monkeypatch) -> None:
+    import rl.train_grpo_liquidity as liquidity_script
+
+    monkeypatch.setattr(
+        liquidity_script,
+        "run_training",
+        lambda args: {
+            "training": {
+                "training_trustworthy": False,
+                "trust_failures": ["zero_variance_warning"],
+            }
+        },
+    )
+
+    assert liquidity_main(["--strict-trustworthiness"]) == 2
 
 
 def test_simple_script_run_training_rejects_non_environment_backend(monkeypatch) -> None:

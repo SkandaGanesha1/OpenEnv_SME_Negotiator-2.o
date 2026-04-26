@@ -29,8 +29,10 @@ from rl.bridge import (
     SUPPORTED_ACTION_TYPES,
     SUPPORTED_TOOL_NAMES,
     build_action_contract_text,
+    build_exposed_environment_method_map,
     execute_action,
     format_observation,
+    get_exposed_environment_method_names,
     make_environment_factory,
     parse_action,
 )
@@ -287,15 +289,7 @@ def _build_environment_tool_dicts(environment: Any) -> tuple[dict[str, Any], dic
     """Build sync/async tool dictionaries for a TRL environment instance."""
     sync_tools: dict[str, Any] = {}
     async_tools: dict[str, Any] = {}
-    for name in dir(environment):
-        if name.startswith("_") or name == "reset":
-            continue
-        try:
-            value = getattr(environment, name)
-        except Exception:
-            continue
-        if not callable(value):
-            continue
+    for name, value in build_exposed_environment_method_map(environment).items():
         if inspect.iscoroutinefunction(value):
             async_tools[name] = value
         else:
@@ -2617,6 +2611,15 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
+    scale_rewards = getattr(args, "scale_rewards", None)
+    if scale_rewards is not None:
+        kwargs["scale_rewards"] = str(scale_rewards)
+    mask_truncated_completions = getattr(args, "mask_truncated_completions", None)
+    if mask_truncated_completions is not None:
+        kwargs["mask_truncated_completions"] = bool(mask_truncated_completions)
+    log_completions = getattr(args, "log_completions", None)
+    if log_completions is not None:
+        kwargs["log_completions"] = bool(log_completions)
     if generation_batch_size is None and implicit_generation_batch_size % num_generations != 0:
         raise ValueError(
             "TRL would infer an incompatible generation_batch_size from the current training batch settings: "
@@ -2677,6 +2680,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
     parser.add_argument("--vllm-max-model-length", type=int, default=None)
     parser.add_argument("--rubric-weight", type=float, default=0.0)
+    parser.add_argument("--scale-rewards", default=None)
+    parser.add_argument(
+        "--mask-truncated-completions",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    parser.add_argument(
+        "--log-completions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--enable-self-play", action="store_true")
     parser.add_argument("--snapshot-interval", type=int, default=100)
@@ -2969,7 +2983,6 @@ def _build_environment_training_session(
 
     grpo_kwargs = build_grpo_config_kwargs(args)
     grpo_kwargs["reward_weights"] = [1.0]
-    grpo_kwargs["log_completions"] = True
     config_kwargs, unsupported_config = _filter_kwargs_for_callable(grpo_config_cls.__init__, grpo_kwargs)
     if unsupported_config:
         print(
@@ -3016,6 +3029,7 @@ def _build_environment_training_session(
         "final_checkpoint_path": final_checkpoint_path,
         "grpo_config_kwargs": config_kwargs,
         "trainer_kwargs": filtered_trainer_kwargs,
+        "exposed_tool_names": list(get_exposed_environment_method_names()),
     }
 
 
@@ -3050,7 +3064,6 @@ def _build_legacy_training_session(
 
     grpo_kwargs = build_grpo_config_kwargs(args)
     grpo_kwargs["reward_weights"] = [1.0]
-    grpo_kwargs["log_completions"] = True
     config_kwargs, unsupported_config = _filter_kwargs_for_callable(grpo_config_cls.__init__, grpo_kwargs)
     if unsupported_config:
         print(
@@ -3097,6 +3110,7 @@ def _build_legacy_training_session(
         "final_checkpoint_path": final_checkpoint_path,
         "grpo_config_kwargs": config_kwargs,
         "trainer_kwargs": filtered_trainer_kwargs,
+        "exposed_tool_names": list(get_exposed_environment_method_names()),
     }
 
 
@@ -3190,6 +3204,7 @@ def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
         "runtime_backend": runtime_backend,
         "bridge_diagnostics": bridge_diagnostics,
         "episode_reward_history": episode_reward_history,
+        "exposed_tool_names": list(session.get("exposed_tool_names", [])),
     }
 
 
@@ -3220,6 +3235,7 @@ def print_dry_run_summary(
         "rollout": {
             "max_episode_steps": int(getattr(args, "max_episode_steps", 24) or 24),
             "strict_action_contract": build_action_contract_text(),
+            "exposed_tool_names": list(get_exposed_environment_method_names()),
         },
         "first_row": rows[0] if rows else None,
         "observation_preview": preview_text,
