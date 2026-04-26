@@ -113,6 +113,19 @@ def _training_log_backend(env: Optional[dict[str, str]] = None) -> str:
     return "none"
 
 
+def _default_vllm_max_model_length(*, max_prompt_length: int, max_completion_length: int) -> int:
+    """Return a notebook-safe vLLM context window for colocated GRPO runs.
+
+    vLLM defaults to the model's full configured context window when this is
+    unset, which is too large for small GPUs like a T4 in notebook runtimes.
+    The runtime only needs enough room for the prompt, the generated
+    completion, and a modest buffer.
+    """
+
+    required_tokens = int(max_prompt_length) + int(max_completion_length) + 256
+    return max(2048, required_tokens)
+
+
 def _patch_additional_chat_templates_404() -> None:
     """Treat missing additional chat templates as an empty directory.
 
@@ -2210,6 +2223,18 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["max_steps"] = int(args.max_steps)
     if bool(args.use_vllm):
         kwargs["vllm_mode"] = args.vllm_mode
+        kwargs["vllm_gpu_memory_utilization"] = float(
+            getattr(args, "vllm_gpu_memory_utilization", 0.5) or 0.5
+        )
+        vllm_max_model_length = getattr(args, "vllm_max_model_length", None)
+        kwargs["vllm_max_model_length"] = int(
+            vllm_max_model_length
+            if vllm_max_model_length is not None
+            else _default_vllm_max_model_length(
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+            )
+        )
     return kwargs
 
 
@@ -2237,6 +2262,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--use-vllm", action="store_true")
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-max-model-length", type=int, default=None)
     parser.add_argument("--rubric-weight", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--enable-self-play", action="store_true")

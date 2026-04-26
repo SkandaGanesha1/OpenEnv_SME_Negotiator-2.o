@@ -22,6 +22,7 @@ from rl.curriculum import CurriculumManager
 from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
 from rl.train_grpo_trl import (
+    _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
     _render_chat_prompt,
     _run_single_rollout_sample,
@@ -184,6 +185,10 @@ def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
     resolved_defaults = resolve_liquidity_profile_config(defaults)
     assert resolved_defaults["num_samples"] == 8
     assert resolved_defaults["max_steps"] == 4
+    canonical_defaults = build_liquidity_canonical_training_args(defaults)
+    assert canonical_defaults.use_vllm is True
+    assert canonical_defaults.vllm_gpu_memory_utilization == 0.5
+    assert canonical_defaults.vllm_max_model_length is None
 
     updated = make_liquidity_training_args(profile="standard", num_samples=20, learning_rate=1e-5)
     resolved_updated = resolve_liquidity_profile_config(updated)
@@ -194,6 +199,11 @@ def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
     assert canonical.num_samples == 20
     assert canonical.learning_rate == 1e-5
     assert canonical.max_episode_steps == 12
+
+
+def test_default_vllm_max_model_length_matches_small_grpo_recipe() -> None:
+    assert _default_vllm_max_model_length(max_prompt_length=1024, max_completion_length=256) == 2048
+    assert _default_vllm_max_model_length(max_prompt_length=2048, max_completion_length=512) == 2816
 
 
 def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
@@ -957,6 +967,21 @@ def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> 
 
     monkeypatch.setenv("TRAINING_LOG_BACKEND", "unsupported")
     assert build_grpo_config_kwargs(args)["report_to"] == "none"
+
+
+def test_build_grpo_config_kwargs_sets_notebook_safe_vllm_limits() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--use-vllm",
+            "--vllm-gpu-memory-utilization",
+            "0.45",
+        ]
+    )
+
+    kwargs = build_grpo_config_kwargs(args)
+
+    assert kwargs["vllm_gpu_memory_utilization"] == 0.45
+    assert kwargs["vllm_max_model_length"] == 2048
 
 
 def test_make_training_args_applies_notebook_overrides_without_mutating_parser_defaults() -> None:

@@ -110,6 +110,8 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     assert '"trl[vllm]==0.29.0"' in source
     assert '"vllm>=0.11.0"' in source
     assert "USE_VLLM = True" in source
+    assert "VLLM_GPU_MEMORY_UTILIZATION = 0.5" in source
+    assert "VLLM_MAX_MODEL_LENGTH = 2048" in source
     assert "make_training_args" in source
     assert "build_canonical_training_args" in source
     assert "build_run_plan" in source

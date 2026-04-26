@@ -92,6 +92,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-vllm", dest="use_vllm", action="store_true")
     parser.add_argument("--no-vllm", dest="use_vllm", action="store_false")
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-max-model-length", type=int, default=None)
     parser.add_argument("--skip-smoke-test", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.set_defaults(use_vllm=True)
@@ -160,6 +162,8 @@ def build_canonical_training_args(args: argparse.Namespace) -> argparse.Namespac
         save_steps=args.save_steps,
         use_vllm=bool(args.use_vllm),
         vllm_mode=args.vllm_mode,
+        vllm_gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+        vllm_max_model_length=args.vllm_max_model_length,
         rubric_weight=args.rubric_weight,
     )
 
@@ -187,6 +191,10 @@ def build_run_plan(args: argparse.Namespace, canonical_args: argparse.Namespace)
             "max_completion_length": int(canonical_args.max_completion_length),
             "use_vllm": bool(canonical_args.use_vllm),
             "vllm_mode": str(canonical_args.vllm_mode),
+            "vllm_gpu_memory_utilization": float(canonical_args.vllm_gpu_memory_utilization),
+            "vllm_max_model_length": None
+            if getattr(canonical_args, "vllm_max_model_length", None) is None
+            else int(canonical_args.vllm_max_model_length),
             "rubric_weight": float(canonical_args.rubric_weight),
         },
         "paths": {
