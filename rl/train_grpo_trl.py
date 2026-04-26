@@ -364,6 +364,61 @@ def _patch_trl_environment_batch_alignment() -> None:
     _grpo_mod.GRPOTrainer._generate_and_score_completions = _wrapped_generate_and_score_completions
 
 
+def _resolve_trainer_vllm_llm(trainer: Any) -> Any:
+    """Best-effort resolver for the active vLLM engine across TRL build variants."""
+    direct_llm = getattr(trainer, "llm", None)
+    if direct_llm is not None:
+        return direct_llm
+
+    vllm_generation = getattr(trainer, "vllm_generation", None)
+    llm_from_generation = getattr(vllm_generation, "llm", None)
+    if llm_from_generation is not None:
+        return llm_from_generation
+
+    for attr_name in ("_llm", "vllm_llm"):
+        candidate = getattr(trainer, attr_name, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _ensure_trainer_vllm_aliases(trainer: Any) -> None:
+    """Normalize TRL/vLLM trainer attributes so old and new builds both work."""
+    if trainer is None or not bool(getattr(trainer, "use_vllm", False)):
+        return
+
+    resolved_llm = _resolve_trainer_vllm_llm(trainer)
+    if resolved_llm is None:
+        max_model_len = getattr(getattr(trainer, "args", None), "vllm_max_model_length", None)
+        if max_model_len is not None:
+            resolved_llm = types.SimpleNamespace(
+                llm_engine=types.SimpleNamespace(
+                    model_config=types.SimpleNamespace(max_model_len=int(max_model_len))
+                )
+            )
+    if resolved_llm is not None and getattr(trainer, "llm", None) is None:
+        setattr(trainer, "llm", resolved_llm)
+
+
+def _patch_trl_vllm_llm_alias() -> None:
+    """Patch TRL's tool loop to tolerate builds that expose vLLM under a renamed attribute."""
+    try:
+        import trl.trainer.grpo_trainer as _grpo_mod
+    except ImportError:
+        return
+
+    original = getattr(_grpo_mod.GRPOTrainer, "_tool_call_loop", None)
+    if original is None or getattr(original, "__wrapped_vllm_llm_alias__", False):
+        return
+
+    def _wrapped_tool_call_loop(self, *args: Any, **kwargs: Any):
+        _ensure_trainer_vllm_aliases(self)
+        return original(self, *args, **kwargs)
+
+    setattr(_wrapped_tool_call_loop, "__wrapped_vllm_llm_alias__", True)
+    _grpo_mod.GRPOTrainer._tool_call_loop = _wrapped_tool_call_loop
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -3164,6 +3219,7 @@ def create_trainer(session: dict[str, Any]) -> Any:
     if bool(getattr(session.get("training_args"), "use_vllm", False)):
         _patch_vllm_attention_backend()
         _patch_vllm_notebook_stdout()
+        _patch_trl_vllm_llm_alias()
     runtime_backend = str(session.get("runtime_backend", "environment"))
     if runtime_backend == "legacy":
         _patch_trl_shuffle_sequence_dict()
@@ -3171,6 +3227,7 @@ def create_trainer(session: dict[str, Any]) -> Any:
         _patch_trl_environment_batch_alignment()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     trainer = GRPOTrainer(**dict(session["trainer_kwargs"]))
+    _ensure_trainer_vllm_aliases(trainer)
     if runtime_backend == "environment":
         setattr(trainer, "_canonical_environment_factory", session["trainer_kwargs"].get("environment_factory"))
     return trainer
