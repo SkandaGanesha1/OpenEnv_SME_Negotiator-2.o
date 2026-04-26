@@ -15,15 +15,20 @@ COPY server ./server
 COPY sme_negotiator_env ./sme_negotiator_env
 RUN uv sync --frozen --no-editable
 
+# Install Gradio for the interactive playground UI (not in pyproject.toml)
+RUN .venv/bin/pip install "gradio>=4.40.0"
+
+COPY app.py ./
+
 ENV PATH="/app/.venv/bin:${PATH}"
 
 ENV PORT=7860
 ENV ENABLE_WEB_INTERFACE=true
 ENV PYTHONPATH=/app
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://127.0.0.1:${PORT}/health || exit 1
+HEALTHCHECK --interval=30s --timeout=30s --start-period=60s --retries=3 \
+    CMD curl -f http://127.0.0.1:${PORT}/ || exit 1
 
 EXPOSE 7860
 
-CMD ["sh", "-c", "uvicorn server.app:app --host 0.0.0.0 --port ${PORT}"]
+CMD ["python", "app.py"]
