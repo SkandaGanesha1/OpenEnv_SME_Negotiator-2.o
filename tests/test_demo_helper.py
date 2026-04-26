@@ -332,6 +332,25 @@ def test_plot_rewards_writes_png_from_saved_reward_log() -> None:
     assert Path(figure_path).exists()
 
 
+def test_plot_rewards_writes_reference_style_png_from_episode_reward_log() -> None:
+    tmp_path = _workspace_tmp_dir("plot_episode_rewards")
+    reward_log_path = tmp_path / "episode_reward_log.json"
+    reward_log_path.write_text(
+        """
+[
+  {"episode": 1, "training_reward": -0.4, "total_reward": -0.5, "verifiable_reward": -0.6, "base_rl_reward": -0.5, "success_no_default_positive_npv": false},
+  {"episode": 2, "training_reward": 0.2, "total_reward": 0.1, "verifiable_reward": 0.0, "base_rl_reward": 0.1, "success_no_default_positive_npv": true},
+  {"episode": 3, "training_reward": 0.5, "total_reward": 0.4, "verifiable_reward": 0.3, "base_rl_reward": 0.4, "success_no_default_positive_npv": true}
+]
+""".strip(),
+        encoding="utf-8",
+    )
+
+    figure_path = plot_rewards(reward_log_path, tmp_path / "reward_curve.png")
+
+    assert Path(figure_path).exists()
+
+
 def test_evaluate_before_after_policies_writes_summary_and_plot(monkeypatch) -> None:
     tmp_path = _workspace_tmp_dir("before_after_eval")
     def _fake_run_policy_episode_report(**kwargs):

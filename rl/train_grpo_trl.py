@@ -8,6 +8,7 @@ Install with optional extras such as:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import importlib
 import importlib.metadata
@@ -50,11 +51,15 @@ DEFAULT_PROMPT = (
     + build_action_contract_text()
 )
 TRAINING_ROW_PREFIX = "[TRAINING_ROW]"
-ROLL_OUT_USER_TURN = (
-    "/no_think\n"
-    "Current observation:\n{observation}\n\n"
-    "Choose the single best next action for this exact state. "
+ROLLOUT_SYSTEM_PROMPT = (
+    "You are an SME treasury agent operating a deterministic long-horizon liquidity workflow. "
+    "Choose the single best next action for the exact current state. "
+    "Maximize the final verifiable reward, preserve positive NPV, use tools only when they improve the state, "
+    "and finish the episode without default. "
     + build_action_contract_text()
+)
+ROLL_OUT_USER_TURN = (
+    "Current observation:\n{observation}"
 )
 TRAIN_GRPO_TRL_BRIDGE_REVISION = "2026-04-26c"
 _CANONICAL_ACTION_KEYS = frozenset(
@@ -112,6 +117,117 @@ def _training_log_backend(env: Optional[dict[str, str]] = None) -> str:
     return "none"
 
 
+def _default_vllm_max_model_length(*, max_prompt_length: int, max_completion_length: int) -> int:
+    """Return a notebook-safe vLLM context window for colocated GRPO runs.
+
+    vLLM defaults to the model's full configured context window when this is
+    unset, which is too large for small GPUs like a T4 in notebook runtimes.
+    The runtime only needs enough room for the prompt, the generated
+    completion, and a modest buffer.
+    """
+
+    required_tokens = int(max_prompt_length) + int(max_completion_length) + 256
+    return max(2048, required_tokens)
+
+
+def _patch_additional_chat_templates_404() -> None:
+    """Treat missing additional chat templates as an empty directory.
+
+    Some `transformers`/`huggingface_hub` runtime combinations raise
+    `RemoteEntryNotFoundError` when a model repo does not contain the optional
+    `additional_chat_templates/` directory. Tokenizer loading should interpret
+    that case as "no extra templates", not as a fatal error.
+    """
+
+    try:
+        import huggingface_hub.utils as hf_hub_utils
+        import transformers.tokenization_utils_base as tokenization_utils_base
+        import transformers.utils.hub as transformers_hub
+    except Exception:
+        return
+
+    original = getattr(transformers_hub.list_repo_templates, "__wrapped_original__", None)
+    if original is None:
+        original = transformers_hub.list_repo_templates
+
+    error_types = tuple(
+        error_type
+        for error_type in (
+            getattr(hf_hub_utils, "RemoteEntryNotFoundError", None),
+            getattr(hf_hub_utils, "EntryNotFoundError", None),
+        )
+        if error_type is not None
+    )
+    if not error_types:
+        return
+
+    def _safe_list_repo_templates(*args: Any, **kwargs: Any) -> list[str]:
+        try:
+            return original(*args, **kwargs)
+        except error_types:
+            return []
+
+    setattr(_safe_list_repo_templates, "__wrapped_original__", original)
+    transformers_hub.list_repo_templates = _safe_list_repo_templates
+    tokenization_utils_base.list_repo_templates = _safe_list_repo_templates
+
+
+def _stdout_supports_fileno() -> bool:
+    stream = getattr(sys, "stdout", None)
+    if stream is None:
+        return False
+    try:
+        stream.fileno()
+    except Exception:
+        return False
+    return True
+
+
+def _patch_vllm_notebook_stdout() -> None:
+    """Prevent vLLM stdout-suppression helpers from crashing in notebooks.
+
+    Some notebook runtimes expose `sys.stdout` as an object without a usable
+    `fileno()`, which breaks vLLM's `suppress_stdout()` helper during engine
+    initialization. In that environment we bypass the suppression context and
+    enable DEBUG logging so vLLM also avoids its own suppression fast path.
+    """
+
+    if _stdout_supports_fileno():
+        return
+
+    os.environ.setdefault("VLLM_LOGGING_LEVEL", "DEBUG")
+
+    @contextlib.contextmanager
+    def _passthrough_suppress_stdout():
+        yield
+
+    for module_name in ("vllm.utils.system_utils", "vllm.distributed.parallel_state"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        setattr(module, "suppress_stdout", _passthrough_suppress_stdout)
+
+
+def _patch_vllm_attention_backend() -> None:
+    """Prefer a non-FlashInfer backend on older notebook GPUs unless overridden."""
+
+    if os.environ.get("VLLM_ATTENTION_BACKEND"):
+        return
+    try:
+        import torch
+    except Exception:
+        return
+    if not torch.cuda.is_available():
+        return
+    try:
+        major, _minor = torch.cuda.get_device_capability(0)
+    except Exception:
+        return
+    if int(major) < 8:
+        os.environ.setdefault("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+
+
 def _save_reward_curve_plot(
     reward_curve: list[float],
     success_curve: list[float],
@@ -151,18 +267,31 @@ class EpisodeSummaryBuffer:
     items: list[EpisodeSummary] = field(default_factory=list)
     episode_logs: list[str] = field(default_factory=list)
     diagnostics: list[dict[str, Any]] = field(default_factory=list)
+    episode_records: list[dict[str, Any]] = field(default_factory=list)
+    episode_count: int = 0
 
     def append(
         self,
         summary: EpisodeSummary,
         episode_log: Optional[str] = None,
         diagnostics: Optional[dict[str, Any]] = None,
+        training_reward: Optional[float] = None,
     ) -> None:
         self.items.append(summary)
         if episode_log is not None:
             self.episode_logs.append(episode_log)
-        if diagnostics is not None:
-            self.diagnostics.append(dict(diagnostics))
+        diagnostics_copy = None if diagnostics is None else dict(diagnostics)
+        if diagnostics_copy is not None:
+            self.diagnostics.append(diagnostics_copy)
+        self.episode_count += 1
+        self.episode_records.append(
+            _build_episode_reward_record(
+                episode=self.episode_count,
+                summary=summary,
+                diagnostics=diagnostics_copy,
+                training_reward=training_reward,
+            )
+        )
 
     def drain(self) -> tuple[list[EpisodeSummary], list[str], list[dict[str, Any]]]:
         summaries = list(self.items)
@@ -172,6 +301,61 @@ class EpisodeSummaryBuffer:
         self.episode_logs.clear()
         self.diagnostics.clear()
         return summaries, episode_logs, diagnostics
+
+    def export_records(self) -> list[dict[str, Any]]:
+        """Return all persisted episode reward records collected during training."""
+        return [dict(record) for record in self.episode_records]
+
+
+def _build_episode_reward_record(
+    *,
+    episode: int,
+    summary: EpisodeSummary,
+    diagnostics: Optional[dict[str, Any]],
+    training_reward: Optional[float],
+) -> dict[str, Any]:
+    record = {
+        "episode": int(episode),
+        "step": int(episode),
+        "training_reward": float(
+            training_reward
+            if training_reward is not None
+            else getattr(summary, "total_reward", 0.0) or 0.0
+        ),
+        "total_reward": float(getattr(summary, "total_reward", 0.0) or 0.0),
+        "verifiable_reward": float(getattr(summary, "verifiable_reward", 0.0) or 0.0),
+        "base_rl_reward": float(getattr(summary, "base_rl_reward", 0.0) or 0.0),
+        "tool_bonus_total": float(getattr(summary, "tool_bonus_total", 0.0) or 0.0),
+        "env_reward_total": float(getattr(summary, "env_reward_total", 0.0) or 0.0),
+        "success_no_default_positive_npv": bool(
+            getattr(summary, "success_no_default_positive_npv", False)
+        ),
+        "average_final_payment_days": float(
+            getattr(summary, "average_final_payment_days", 0.0) or 0.0
+        ),
+        "tool_usage_count": int(getattr(summary, "tool_usage_count", 0) or 0),
+        "tool_call_count": int(getattr(summary, "tool_call_count", 0) or 0),
+        "tool_effective_count": int(getattr(summary, "tool_effective_count", 0) or 0),
+        "resolved_deal_count": int(getattr(summary, "resolved_deal_count", 0) or 0),
+        "defaulted_sme_count": int(getattr(summary, "defaulted_sme_count", 0) or 0),
+        "terminated_by_step_cap": bool(getattr(summary, "terminated_by_step_cap", False)),
+    }
+    if diagnostics:
+        for key in (
+            "reward_mean",
+            "reward_std",
+            "unique_action_count",
+            "unique_completion_count",
+            "invalid_parse_fraction",
+            "identical_terminal_fraction",
+            "contract_score",
+        ):
+            if key in diagnostics:
+                record[key] = float(diagnostics.get(key, 0.0) or 0.0)
+        termination_reason = str(diagnostics.get("termination_reason", "") or "").strip()
+        if termination_reason:
+            record["termination_reason"] = termination_reason
+    return record
 
 
 @dataclass
@@ -498,6 +682,7 @@ def load_training_model_and_tokenizer(model_name: str) -> tuple[Any, Any]:
     """Load the canonical model/tokenizer pair for explicit rollout training."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    _patch_additional_chat_templates_404()
     tokenizer = configure_rollout_tokenizer(AutoTokenizer.from_pretrained(model_name))
     model_kwargs: dict[str, Any] = {"low_cpu_mem_usage": True}
     torch_dtype = _cuda_training_dtype()
@@ -935,6 +1120,7 @@ def make_reward_function(
                         "contract_score": contract_score,
                         "sample_completion": texts[index],
                     },
+                    training_reward=final_reward,
                 )
         return rewards
 
@@ -1190,7 +1376,7 @@ def make_reward_function(
             rewards.append(round(final_reward, 6))
             if summary_buffer is not None:
                 try:
-                    summary_buffer.append(env.summarize_episode(), episode_log)
+                    summary_buffer.append(env.summarize_episode(), episode_log, training_reward=final_reward)
                 except Exception:
                     pass
         return rewards
@@ -1300,6 +1486,33 @@ def _build_observation_message(observation_text: str) -> str:
     return ROLL_OUT_USER_TURN.format(observation=observation_text)
 
 
+def _strip_training_row_metadata(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    cleaned: list[dict[str, str]] = []
+    for message in messages:
+        content = str(message.get("content", "") or "")
+        kept_lines = [line for line in content.splitlines() if not line.startswith(TRAINING_ROW_PREFIX)]
+        cleaned_content = "\n".join(kept_lines).strip()
+        if not cleaned_content:
+            continue
+        cleaned.append(
+            {
+                "role": str(message.get("role", "user")),
+                "content": cleaned_content,
+            }
+        )
+    return cleaned
+
+
+def _build_rollout_turn_messages(
+    *,
+    observation_text: str,
+) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": ROLLOUT_SYSTEM_PROMPT},
+        {"role": "user", "content": _build_observation_message(observation_text)},
+    ]
+
+
 def _render_chat_prompt(tokenizer: Any, messages: list[dict[str, str]]) -> str:
     if hasattr(tokenizer, "apply_chat_template"):
         kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
@@ -1375,6 +1588,25 @@ def _token_ids_to_list(value: Any) -> list[int]:
     return []
 
 
+def _tokenize_text_without_special_tokens(tokenizer: Any, text: str) -> list[int]:
+    if not text:
+        return []
+    try:
+        tokenized = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    except TypeError:
+        tokenized = tokenizer(text, return_tensors="pt")
+    return _token_ids_to_list(tokenized.get("input_ids"))
+
+
+def _serialize_rollout_actions(parsed_actions: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for action in parsed_actions:
+        if not isinstance(action, dict):
+            continue
+        lines.append(json.dumps(action, sort_keys=True, ensure_ascii=True, separators=(",", ":")))
+    return "\n".join(lines)
+
+
 def _compute_generated_logprobs(output_scores: Any, completion_ids: list[int]) -> list[float]:
     if not output_scores or not completion_ids:
         return []
@@ -1395,6 +1627,101 @@ def _compute_generated_logprobs(output_scores: Any, completion_ids: list[int]) -
     return values
 
 
+def _coerce_vllm_sampled_logprobs(raw_logprobs: Any, completion_ids: list[int]) -> list[float]:
+    if not raw_logprobs or not completion_ids:
+        return []
+
+    values: list[float] = []
+    for token_id, item in zip(completion_ids, raw_logprobs):
+        chosen = None
+        if isinstance(item, dict):
+            chosen = item.get(token_id)
+            if chosen is None:
+                chosen = item.get(str(token_id))
+            if chosen is None and item:
+                chosen = next(iter(item.values()))
+        else:
+            chosen = item
+
+        if hasattr(chosen, "logprob"):
+            values.append(float(getattr(chosen, "logprob")))
+        elif chosen is None:
+            values.append(0.0)
+        else:
+            try:
+                values.append(float(chosen))
+            except Exception:
+                values.append(0.0)
+    return values
+
+
+def _format_rollout_logprobs_for_trl(logprobs: list[float], completion_ids: list[int]) -> list[list[float]]:
+    values = list(logprobs) if logprobs else [0.0 for _ in completion_ids]
+    if len(values) < len(completion_ids):
+        values.extend([0.0 for _ in range(len(completion_ids) - len(values))])
+    return [[float(value)] for value in values[: len(completion_ids)]]
+
+
+def _format_rollout_logprob_token_ids_for_trl(completion_ids: list[int]) -> list[list[int]]:
+    return [[int(token_id)] for token_id in completion_ids]
+
+
+def _generate_completion_turn_with_vllm(
+    vllm_llm: Any,
+    tokenizer: Any,
+    messages: list[dict[str, str]],
+    *,
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+) -> dict[str, Any]:
+    from vllm import SamplingParams
+
+    prompt_text = _render_chat_prompt(tokenizer, messages)
+    tokenized = tokenizer(prompt_text, return_tensors="pt")
+    prompt_ids = _token_ids_to_list(tokenized.get("input_ids"))
+    use_sampling = float(temperature) > 0.0
+
+    sampling_params = SamplingParams(
+        n=1,
+        max_tokens=int(max_new_tokens),
+        temperature=float(temperature) if use_sampling else 0.0,
+        top_p=float(top_p) if use_sampling else 1.0,
+        logprobs=0,
+    )
+    outputs = vllm_llm.generate([prompt_text], sampling_params=sampling_params, use_tqdm=False)
+    if not outputs:
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": [],
+            "logprobs": [],
+            "text": "",
+        }
+
+    request_output = outputs[0]
+    request_prompt_ids = _token_ids_to_list(getattr(request_output, "prompt_token_ids", None))
+    if request_prompt_ids:
+        prompt_ids = request_prompt_ids
+    candidates = list(getattr(request_output, "outputs", []) or [])
+    if not candidates:
+        return {
+            "prompt_ids": prompt_ids,
+            "completion_ids": [],
+            "logprobs": [],
+            "text": "",
+        }
+    candidate = candidates[0]
+    completion_ids = _token_ids_to_list(getattr(candidate, "token_ids", None))
+    text = str(getattr(candidate, "text", "") or "")
+    logprobs = _coerce_vllm_sampled_logprobs(getattr(candidate, "logprobs", None), completion_ids)
+    return {
+        "prompt_ids": prompt_ids,
+        "completion_ids": completion_ids,
+        "logprobs": logprobs,
+        "text": text,
+    }
+
+
 def _generate_completion_turn(
     model: Any,
     tokenizer: Any,
@@ -1403,7 +1730,18 @@ def _generate_completion_turn(
     max_new_tokens: int,
     temperature: float,
     top_p: float,
+    vllm_llm: Any = None,
 ) -> dict[str, Any]:
+    if vllm_llm is not None:
+        return _generate_completion_turn_with_vllm(
+            vllm_llm,
+            tokenizer,
+            messages,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
+
     prompt_text = _render_chat_prompt(tokenizer, messages)
     tokenized = tokenizer(prompt_text, return_tensors="pt")
     tokenized = _move_inputs_to_model_device(tokenized, model)
@@ -1683,16 +2021,19 @@ def _run_single_rollout_sample(
     tokenizer: Any,
     rollout_args: Any,
     env_factory: Callable[[], Any],
+    vllm_llm: Any = None,
 ) -> dict[str, Any]:
     row = _extract_training_row_from_prompt(prompt, rollout_args)
     wrapper = env_factory()
     reset_text = wrapper.reset(**row)
-    messages = copy.deepcopy(_coerce_prompt_messages(row["prompt"]))
-    messages.append({"role": "user", "content": _build_observation_message(reset_text)})
+    current_observation_text = str(reset_text)
+    training_prompt_messages = _build_rollout_turn_messages(observation_text=current_observation_text)
+    training_prompt_ids = _tokenize_text_without_special_tokens(
+        tokenizer,
+        _render_chat_prompt(tokenizer, training_prompt_messages),
+    )
 
-    prompt_ids: list[int] = []
     completion_ids: list[int] = []
-    logprobs: list[float] = []
     raw_turn_texts: list[str] = []
     parsed_actions: list[dict[str, Any]] = []
     valid_json_steps = 0
@@ -1705,17 +2046,19 @@ def _run_single_rollout_sample(
 
     termination_reason = "rollout_step_cap"
     for _ in range(max_episode_steps):
+        turn_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if vllm_llm is not None:
+            turn_kwargs["vllm_llm"] = vllm_llm
         turn = _generate_completion_turn(
             model,
             tokenizer,
-            messages,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_p=top_p,
+            _build_rollout_turn_messages(observation_text=current_observation_text),
+            **turn_kwargs,
         )
-        prompt_ids.extend(list(turn["prompt_ids"]))
-        completion_ids.extend(list(turn["completion_ids"]))
-        logprobs.extend(list(turn["logprobs"]))
         raw_text = str(turn["text"])
         raw_turn_texts.append(raw_text)
 
@@ -1725,8 +2068,6 @@ def _run_single_rollout_sample(
         if was_valid_json:
             valid_json_steps += 1
         parsed_actions.append(action.model_dump(exclude_none=True))
-
-        messages.append({"role": "assistant", "content": raw_text})
         try:
             execute_action(wrapper, action)
         except Exception as exc:
@@ -1742,7 +2083,7 @@ def _run_single_rollout_sample(
         if latest_observation is None:
             termination_reason = "missing_observation"
             break
-        messages.append({"role": "user", "content": _build_observation_message(format_observation(latest_observation))})
+        current_observation_text = format_observation(latest_observation)
 
     summary = wrapper.summarize_episode()
     episode_log = wrapper.build_episode_log()
@@ -1755,15 +2096,14 @@ def _run_single_rollout_sample(
             termination_reason = metadata_reason
 
     strict_json_fraction = valid_json_steps / max(1, len(raw_turn_texts))
-    completion_signature_text = (
-        str(tokenizer.decode(completion_ids, skip_special_tokens=True))
-        if completion_ids and hasattr(tokenizer, "decode")
-        else "\n".join(raw_turn_texts)
-    )
+    completion_signature_text = _serialize_rollout_actions(parsed_actions)
+    if not completion_signature_text:
+        completion_signature_text = "\n".join(raw_turn_texts)
+    completion_ids = _tokenize_text_without_special_tokens(tokenizer, completion_signature_text)
     return {
-        "prompt_ids": prompt_ids,
+        "prompt_ids": training_prompt_ids,
         "completion_ids": completion_ids,
-        "logprobs": logprobs or [0.0 for _ in completion_ids],
+        "logprobs": [0.0 for _ in completion_ids],
         "episode_summary": summary,
         "episode_log": episode_log,
         "reward_breakdown": reward_breakdown,
@@ -1853,17 +2193,24 @@ def build_rollout_func(
             model = getattr(trainer, "model", model)
         if model is None:
             raise ValueError("rollout_func could not resolve the active model.")
+        vllm_generation = None if trainer is None else getattr(trainer, "vllm_generation", None)
+        vllm_llm = None if vllm_generation is None else getattr(vllm_generation, "llm", None)
 
         num_generations = int(getattr(rollout_args, "num_generations", 1) or 1)
         samples: list[dict[str, Any]] = []
         for prompt in prompts:
+            sample_kwargs = {
+                "model": model,
+                "tokenizer": processing_class,
+                "rollout_args": rollout_args,
+                "env_factory": env_factory,
+            }
+            if vllm_llm is not None:
+                sample_kwargs["vllm_llm"] = vllm_llm
             group = [
                 _run_single_rollout_sample(
                     prompt,
-                    model=model,
-                    tokenizer=processing_class,
-                    rollout_args=rollout_args,
-                    env_factory=env_factory,
+                    **sample_kwargs,
                 )
                 for _ in range(num_generations)
             ]
@@ -1886,23 +2233,23 @@ def build_rollout_func(
         return {
             "prompt_ids": [list(sample["prompt_ids"]) for sample in samples],
             "completion_ids": [list(sample["completion_ids"]) for sample in samples],
-            "logprobs": [list(sample["logprobs"]) for sample in samples],
-            "episode_summaries": [sample["episode_summary"] for sample in samples],
-            "episode_logs": [sample["episode_log"] for sample in samples],
-            "reward_breakdowns": [sample["reward_breakdown"] for sample in samples],
-            "termination_reasons": [sample["termination_reason"] for sample in samples],
-            "parsed_actions": [sample["parsed_actions"] for sample in samples],
-            "raw_completion_texts": [sample["raw_completion_text"] for sample in samples],
-            "reward_mean": [float(sample["reward_mean"]) for sample in samples],
-            "env_reward_std": [float(sample["reward_std"]) for sample in samples],
-            "unique_action_count": [float(sample["unique_action_count"]) for sample in samples],
-            "unique_completion_count": [float(sample["unique_completion_count"]) for sample in samples],
-            "invalid_parse_fraction": [float(sample["invalid_parse_fraction"]) for sample in samples],
-            "identical_terminal_fraction": [float(sample["identical_terminal_fraction"]) for sample in samples],
-            "contract_score": [
-                float(sample.get("contract_score", _completion_format_score(str(sample.get("raw_completion_text", "")))) or 0.0)
+            "logprobs": [
+                _format_rollout_logprobs_for_trl(
+                    list(sample["logprobs"]),
+                    list(sample["completion_ids"]),
+                )
                 for sample in samples
             ],
+            "logprob_token_ids": [
+                _format_rollout_logprob_token_ids_for_trl(
+                    list(sample["completion_ids"]),
+                )
+                for sample in samples
+            ],
+            "episode_summaries": [sample["episode_summary"] for sample in samples],
+            "episode_logs": [sample["episode_log"] for sample in samples],
+            "termination_reasons": [sample["termination_reason"] for sample in samples],
+            "raw_completion_texts": [sample["raw_completion_text"] for sample in samples],
         }
 
     return rollout_func
@@ -2060,6 +2407,19 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs["max_steps"] = int(args.max_steps)
     if bool(args.use_vllm):
         kwargs["vllm_mode"] = args.vllm_mode
+        kwargs["vllm_importance_sampling_correction"] = False
+        kwargs["vllm_gpu_memory_utilization"] = float(
+            getattr(args, "vllm_gpu_memory_utilization", 0.5) or 0.5
+        )
+        vllm_max_model_length = getattr(args, "vllm_max_model_length", None)
+        kwargs["vllm_max_model_length"] = int(
+            vllm_max_model_length
+            if vllm_max_model_length is not None
+            else _default_vllm_max_model_length(
+                max_prompt_length=max_prompt_length,
+                max_completion_length=max_completion_length,
+            )
+        )
     return kwargs
 
 
@@ -2087,6 +2447,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--use-vllm", action="store_true")
     parser.add_argument("--vllm-mode", choices=("colocate", "server"), default="colocate")
+    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=0.5)
+    parser.add_argument("--vllm-max-model-length", type=int, default=None)
     parser.add_argument("--rubric-weight", type=float, default=0.0)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--enable-self-play", action="store_true")
@@ -2417,6 +2779,9 @@ def build_training_session(args: argparse.Namespace) -> dict[str, Any]:
 def create_trainer(session: dict[str, Any]) -> Any:
     """Instantiate GRPOTrainer from a freshly built training session."""
     os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+    if bool(getattr(session.get("training_args"), "use_vllm", False)):
+        _patch_vllm_attention_backend()
+        _patch_vllm_notebook_stdout()
     _, GRPOTrainer = _import_trl_grpo_symbols()
     return GRPOTrainer(**dict(session["trainer_kwargs"]))
 
@@ -2439,10 +2804,18 @@ def run_training_session(args: argparse.Namespace) -> dict[str, Any]:
     trainer = create_trainer(session)
     trainer.train()
     checkpoint_path = save_training_session(session, trainer)
+    reward_func = session.get("reward_funcs")
+    bridge_diagnostics = dict(getattr(reward_func, "bridge_diagnostics", {}) or {})
+    summary_buffer = session.get("summary_buffer")
+    episode_reward_history = (
+        summary_buffer.export_records() if isinstance(summary_buffer, EpisodeSummaryBuffer) else []
+    )
     return {
         "session": session,
         "trainer": trainer,
         "checkpoint_path": checkpoint_path,
+        "bridge_diagnostics": bridge_diagnostics,
+        "episode_reward_history": episode_reward_history,
     }
 
 

@@ -510,20 +510,142 @@ def _write_reward_log(history: list[dict[str, Any]], *, output_path: Path) -> Pa
     return output_path
 
 
+def _load_reward_log_entries(reward_log: Path) -> Optional[list[dict[str, Any]]]:
+    try:
+        payload = json.loads(reward_log.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+
+    try:
+        import csv
+
+        with reward_log.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames:
+                return [dict(row) for row in reader if isinstance(row, dict)]
+    except Exception:
+        return None
+    return None
+
+
+def _episode_reward_series(entries: list[dict[str, Any]]) -> tuple[list[int], list[float], str]:
+    episodes: list[int] = []
+    rewards: list[float] = []
+    reward_field = "training_reward"
+    for entry in entries:
+        if "episode" not in entry:
+            continue
+        reward_value = None
+        for candidate in ("training_reward", "total_reward", "reward", "base_rl_reward"):
+            if candidate in entry and entry.get(candidate) not in {None, ""}:
+                reward_value = entry.get(candidate)
+                reward_field = candidate
+                break
+        if reward_value is None:
+            continue
+        try:
+            episodes.append(int(float(entry["episode"])))
+            rewards.append(float(reward_value))
+        except Exception:
+            continue
+    return episodes, rewards, reward_field
+
+
+def _rolling_average(values: list[float], *, window: int) -> list[float]:
+    if not values:
+        return []
+    averaged: list[float] = []
+    for index in range(len(values)):
+        start = max(0, index - window + 1)
+        slice_values = values[start : index + 1]
+        averaged.append(sum(slice_values) / len(slice_values))
+    return averaged
+
+
+def _linear_trend(steps: list[int], values: list[float]) -> tuple[list[float], float]:
+    if len(steps) < 2 or len(values) < 2:
+        slope = 0.0
+        return [float(values[0]) for _ in values] if values else [], slope
+
+    x_mean = mean(float(step) for step in steps)
+    y_mean = mean(values)
+    denominator = sum((float(step) - x_mean) ** 2 for step in steps)
+    if denominator <= 1e-12:
+        slope = 0.0
+    else:
+        slope = sum((float(step) - x_mean) * (value - y_mean) for step, value in zip(steps, values)) / denominator
+    intercept = y_mean - slope * x_mean
+    return [intercept + slope * float(step) for step in steps], slope
+
+
+def _plot_episode_rewards(entries: list[dict[str, Any]], destination: Path) -> bool:
+    episodes, rewards, _ = _episode_reward_series(entries)
+    if not rewards:
+        return False
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        _write_placeholder_png(destination)
+        return True
+
+    window = min(10, len(episodes))
+    rolling = _rolling_average(rewards, window=window)
+    trend_values, slope = _linear_trend(episodes, rewards)
+    if abs(slope) <= 1e-9:
+        arrow = "flat"
+    else:
+        arrow = "up" if slope > 0 else "down"
+
+    fig, ax = plt.subplots(1, 1, figsize=(12, 6))
+    ax.plot(episodes, rewards, alpha=0.3, color="blue", marker="o", markersize=3, label="Per episode")
+    ax.plot(episodes, rolling, color="blue", linewidth=2.5, label=f"Rolling avg ({window})")
+    if trend_values:
+        ax.plot(
+            episodes,
+            trend_values,
+            color="red",
+            linewidth=1.5,
+            linestyle="--",
+            label=f"Trend ({arrow} {abs(slope):.3f}/ep)",
+        )
+
+    ax.set_ylabel("Reward")
+    ax.set_xlabel("Episode")
+    ax.set_title("SME Negotiator - GRPO Training Reward Curve")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0.0, color="gray", linestyle="--", alpha=0.5)
+    ax.text(
+        0.02,
+        0.02,
+        f"Episodes: {len(episodes)} | Final avg: {rolling[-1]:.2f} | Best: {max(rewards):.2f}",
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="bottom",
+        bbox={"boxstyle": "round", "facecolor": "wheat", "alpha": 0.5},
+    )
+
+    fig.tight_layout()
+    fig.savefig(destination, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def plot_rewards(reward_log_path: str | Path, output_path: str | Path) -> Path:
-    """Render reward and success curves from a saved trainer log history file."""
+    """Render a reward curve from either episode-level rewards or trainer log history."""
     reward_log = Path(reward_log_path)
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
-    try:
-        history = json.loads(reward_log.read_text(encoding="utf-8"))
-    except Exception:
+    history = _load_reward_log_entries(reward_log)
+    if history is None:
         _write_placeholder_png(destination)
         return destination
 
-    if not isinstance(history, list):
-        _write_placeholder_png(destination)
+    if _plot_episode_rewards(history, destination):
         return destination
 
     reward_steps, reward_values = _metric_series(history, "episode/avg_total_reward")

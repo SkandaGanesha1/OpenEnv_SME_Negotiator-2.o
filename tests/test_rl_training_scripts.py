@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import sys
 import types
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
+
+import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -18,8 +22,11 @@ from rl.curriculum import CurriculumManager
 from rl.opponents import OpponentPolicyManager
 from rl.episode_logging import EpisodeSummary
 from rl.train_grpo_trl import (
+    _default_vllm_max_model_length,
     _ensure_grpo_response_schema,
+    _generate_completion_turn,
     _render_chat_prompt,
+    _strip_training_row_metadata,
     _run_single_rollout_sample,
     _score_prompt_completion_via_environment,
     _strict_json_payload,
@@ -48,11 +55,11 @@ from rl.train_grpo_unsloth import (
     build_grpo_config_kwargs as unsloth_build_grpo_config_kwargs,
     main as unsloth_main,
 )
-from rl.train_grpo_simple import (
-    build_canonical_training_args as build_simple_canonical_training_args,
-    main as simple_main,
-    make_training_args as make_simple_training_args,
-    resolve_profile_config as resolve_simple_profile_config,
+from rl.train_grpo_liquidity import (
+    build_canonical_training_args as build_liquidity_canonical_training_args,
+    main as liquidity_main,
+    make_training_args as make_liquidity_training_args,
+    resolve_profile_config as resolve_liquidity_profile_config,
 )
 
 
@@ -61,6 +68,14 @@ class _DummyTokenizer:
         self.padding_side = "right"
         self.pad_token = None
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+
+    def __call__(self, text: str, return_tensors: str = "pt") -> dict[str, Any]:
+        return {"input_ids": [[10, 11, 12]]}
+
+    def decode(self, token_ids, skip_special_tokens: bool = True) -> str:
+        return "decoded"
 
 
 class _DummyEnv:
@@ -98,6 +113,13 @@ class _DummyTokenizerSaver:
         (path / "tokenizer.json").write_text("tokenizer", encoding="utf-8")
 
 
+class _NoGenerateModel:
+    device = None
+
+    def generate(self, **kwargs):
+        raise AssertionError("training model.generate should not be used when vLLM LLM is available")
+
+
 def _workspace_tmp_dir(name: str) -> Path:
     path = PROJECT_ROOT / ".test_tmp" / f"{name}_{uuid4().hex}"
     path.mkdir(parents=True, exist_ok=True)
@@ -121,7 +143,7 @@ def test_dry_run_works_for_trl_and_unsloth(capsys) -> None:
 
 
 def test_simple_script_dry_run_works(capsys) -> None:
-    assert simple_main(["--dry-run", "--profile", "tiny"]) == 0
+    assert liquidity_main(["--dry-run", "--profile", "tiny"]) == 0
     captured = capsys.readouterr()
     assert '"mode": "dry-run"' in captured.out
     assert '"smoke_test"' in captured.out
@@ -176,20 +198,102 @@ def test_dataset_builder_emits_expected_columns_and_seed_range() -> None:
 
 
 def test_simple_script_profile_defaults_and_overrides_resolve_cleanly() -> None:
-    defaults = make_simple_training_args()
-    resolved_defaults = resolve_simple_profile_config(defaults)
+    defaults = make_liquidity_training_args()
+    resolved_defaults = resolve_liquidity_profile_config(defaults)
     assert resolved_defaults["num_samples"] == 8
     assert resolved_defaults["max_steps"] == 4
+    canonical_defaults = build_liquidity_canonical_training_args(defaults)
+    assert canonical_defaults.use_vllm is True
+    assert canonical_defaults.vllm_gpu_memory_utilization == 0.5
+    assert canonical_defaults.vllm_max_model_length is None
 
-    updated = make_simple_training_args(profile="standard", num_samples=20, learning_rate=1e-5)
-    resolved_updated = resolve_simple_profile_config(updated)
-    canonical = build_simple_canonical_training_args(updated)
+    updated = make_liquidity_training_args(profile="standard", num_samples=20, learning_rate=1e-5)
+    resolved_updated = resolve_liquidity_profile_config(updated)
+    canonical = build_liquidity_canonical_training_args(updated)
 
     assert resolved_updated["num_samples"] == 20
     assert resolved_updated["learning_rate"] == 1e-5
     assert canonical.num_samples == 20
     assert canonical.learning_rate == 1e-5
     assert canonical.max_episode_steps == 12
+
+
+def test_default_vllm_max_model_length_matches_small_grpo_recipe() -> None:
+    assert _default_vllm_max_model_length(max_prompt_length=1024, max_completion_length=256) == 2048
+    assert _default_vllm_max_model_length(max_prompt_length=2048, max_completion_length=512) == 2816
+
+
+def test_generate_completion_turn_uses_vllm_llm_when_available(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    class _FakeSamplingParams:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _FakeVllmLLM:
+        def generate(self, prompts, sampling_params=None, use_tqdm=False):
+            assert prompts == ["user: hi"]
+            assert sampling_params.kwargs["max_tokens"] == 32
+            assert sampling_params.kwargs["temperature"] == 0.7
+            return [
+                SimpleNamespace(
+                    prompt_token_ids=[10, 11, 12],
+                    outputs=[
+                        SimpleNamespace(
+                            token_ids=[21, 22],
+                            text='{"action_type":"advance_period"}',
+                            logprobs=[{21: -0.2}, {22: -0.3}],
+                        )
+                    ],
+                )
+            ]
+
+    fake_vllm = types.ModuleType("vllm")
+    fake_vllm.SamplingParams = _FakeSamplingParams
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setattr(trl_script, "_render_chat_prompt", lambda tokenizer, messages: "user: hi")
+
+    turn = _generate_completion_turn(
+        _NoGenerateModel(),
+        _DummyTokenizer(),
+        [{"role": "user", "content": "hi"}],
+        max_new_tokens=32,
+        temperature=0.7,
+        top_p=0.9,
+        vllm_llm=_FakeVllmLLM(),
+    )
+
+    assert turn["prompt_ids"] == [10, 11, 12]
+    assert turn["completion_ids"] == [21, 22]
+    assert turn["logprobs"] == [-0.2, -0.3]
+    assert turn["text"] == '{"action_type":"advance_period"}'
+
+
+def test_strip_training_row_metadata_removes_embedded_row_lines() -> None:
+    messages = [
+        {
+            "role": "user",
+            "content": '[TRAINING_ROW] {"seed":1000}\n/no_think\nUse JSON only.',
+        }
+    ]
+
+    cleaned = _strip_training_row_metadata(messages)
+
+    assert cleaned == [{"role": "user", "content": "/no_think\nUse JSON only."}]
+
+
+def test_liquidity_runner_requires_vllm_for_notebook_training() -> None:
+    import rl.train_grpo_liquidity as liquidity_script
+
+    with pytest.raises(RuntimeError, match="requires `use_vllm=True`"):
+        liquidity_script.run_training(
+            liquidity_script.make_training_args(
+                profile="tiny",
+                output_dir=str(_workspace_tmp_dir("liquidity_no_vllm")),
+                skip_smoke_test=True,
+                use_vllm=False,
+            )
+        )
 
 
 def test_configure_tokenizer_enforces_left_padding_and_pad_token_fallback() -> None:
@@ -941,6 +1045,22 @@ def test_build_grpo_config_kwargs_uses_training_log_backend_env(monkeypatch) -> 
     assert build_grpo_config_kwargs(args)["report_to"] == "none"
 
 
+def test_build_grpo_config_kwargs_sets_notebook_safe_vllm_limits() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--use-vllm",
+            "--vllm-gpu-memory-utilization",
+            "0.45",
+        ]
+    )
+
+    kwargs = build_grpo_config_kwargs(args)
+
+    assert kwargs["vllm_gpu_memory_utilization"] == 0.45
+    assert kwargs["vllm_max_model_length"] == 2048
+    assert kwargs["vllm_importance_sampling_correction"] is False
+
+
 def test_make_training_args_applies_notebook_overrides_without_mutating_parser_defaults() -> None:
     defaults = make_training_args()
     updated = make_training_args(
@@ -959,6 +1079,111 @@ def test_make_training_args_applies_notebook_overrides_without_mutating_parser_d
     assert updated.num_samples == 32
     assert updated.max_episode_steps == 12
     assert updated.use_vllm is False
+
+
+def test_patch_additional_chat_templates_404_returns_empty_template_list(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    import huggingface_hub.utils as hf_hub_utils
+
+    error_type = getattr(hf_hub_utils, "RemoteEntryNotFoundError", None) or getattr(
+        hf_hub_utils, "EntryNotFoundError", None
+    )
+    assert error_type is not None
+
+    def _raising_list_repo_templates(*args, **kwargs):
+        raise error_type("missing additional_chat_templates")
+
+    fake_transformers_pkg = types.ModuleType("transformers")
+    fake_transformers_pkg.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_utils_pkg = types.ModuleType("transformers.utils")
+    fake_transformers_utils_pkg.__path__ = []  # type: ignore[attr-defined]
+    fake_transformers_hub = types.ModuleType("transformers.utils.hub")
+    fake_transformers_hub.list_repo_templates = _raising_list_repo_templates
+    fake_tokenization_utils_base = types.ModuleType("transformers.tokenization_utils_base")
+    fake_tokenization_utils_base.list_repo_templates = _raising_list_repo_templates
+
+    fake_transformers_pkg.utils = fake_transformers_utils_pkg
+    fake_transformers_pkg.tokenization_utils_base = fake_tokenization_utils_base
+    fake_transformers_utils_pkg.hub = fake_transformers_hub
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers_pkg)
+    monkeypatch.setitem(sys.modules, "transformers.utils", fake_transformers_utils_pkg)
+    monkeypatch.setitem(sys.modules, "transformers.utils.hub", fake_transformers_hub)
+    monkeypatch.setitem(sys.modules, "transformers.tokenization_utils_base", fake_tokenization_utils_base)
+
+    trl_script._patch_additional_chat_templates_404()
+
+    assert fake_transformers_hub.list_repo_templates() == []
+    assert fake_tokenization_utils_base.list_repo_templates() == []
+
+
+def test_patch_vllm_notebook_stdout_replaces_suppressors_and_sets_debug(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    class _StdoutWithoutFileno:
+        def fileno(self):
+            raise OSError("no fileno")
+
+    fake_system_utils = types.ModuleType("vllm.utils.system_utils")
+    fake_parallel_state = types.ModuleType("vllm.distributed.parallel_state")
+
+    @contextlib.contextmanager
+    def _original_suppress_stdout():
+        raise AssertionError("original suppress_stdout should be replaced")
+        yield
+
+    fake_system_utils.suppress_stdout = _original_suppress_stdout
+    fake_parallel_state.suppress_stdout = _original_suppress_stdout
+
+    monkeypatch.setattr(sys, "stdout", _StdoutWithoutFileno())
+    monkeypatch.setitem(sys.modules, "vllm.utils.system_utils", fake_system_utils)
+    monkeypatch.setitem(sys.modules, "vllm.distributed.parallel_state", fake_parallel_state)
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+
+    trl_script._patch_vllm_notebook_stdout()
+
+    assert os.environ["VLLM_LOGGING_LEVEL"] == "DEBUG"
+    with fake_system_utils.suppress_stdout():
+        pass
+    with fake_parallel_state.suppress_stdout():
+        pass
+
+
+def test_patch_vllm_attention_backend_prefers_triton_on_pre_ampere(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda index=0: (7, 5),
+        )
+    )
+
+    monkeypatch.delenv("VLLM_ATTENTION_BACKEND", raising=False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    trl_script._patch_vllm_attention_backend()
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "TRITON_ATTN"
+
+
+def test_patch_vllm_attention_backend_respects_existing_override(monkeypatch) -> None:
+    import rl.train_grpo_trl as trl_script
+
+    fake_torch = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(
+            is_available=lambda: True,
+            get_device_capability=lambda index=0: (7, 5),
+        )
+    )
+
+    monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    trl_script._patch_vllm_attention_backend()
+
+    assert os.environ["VLLM_ATTENTION_BACKEND"] == "FLASHINFER"
 
 
 def test_unsloth_config_uses_training_log_backend_env(monkeypatch) -> None:
@@ -1019,8 +1244,10 @@ def test_build_rollout_func_duplicates_each_prompt_by_num_generations(monkeypatc
     assert len(result["prompt_ids"]) == 3
     assert len(result["completion_ids"]) == 3
     assert len(result["episode_summaries"]) == 3
-    assert all(std > 0.0 for std in result["env_reward_std"])
-    assert all(count >= 1.0 for count in result["unique_action_count"])
+    assert result["logprobs"] == [[[-0.1]], [[-0.1]], [[-0.1]]]
+    assert result["logprob_token_ids"] == [[[10]], [[11]], [[12]]]
+    assert result["termination_reasons"] == ["done", "done", "done"]
+    assert len(result["raw_completion_texts"]) == 3
 
 
 def test_reward_function_uses_epsilon_tiebreaker_when_group_std_is_zero() -> None:
@@ -1192,7 +1419,10 @@ def test_run_single_rollout_sample_steps_environment_with_structured_actions(mon
 
     assert result["episode_summary"].episode_completed is True
     assert result["parsed_actions"]
-    assert '"action_type"' in result["raw_completion_text"]
+    assert result["prompt_ids"] == [10, 11, 12]
+    assert result["completion_ids"] == [10, 11, 12]
+    assert '"action_type":"accept"' in result["completion_signature_text"]
+    assert '"action_type":"advance_period"' in result["completion_signature_text"]
     assert result["termination_reason"]
 
 
@@ -1682,45 +1912,108 @@ def test_metrics_callback_plot_failures_do_not_raise(monkeypatch) -> None:
 
 
 def test_simple_script_main_writes_manifest_with_artifact_paths(monkeypatch, capsys) -> None:
-    import rl.train_grpo_simple as simple_script
+    import rl.train_grpo_liquidity as liquidity_script
 
     tmp_path = _workspace_tmp_dir("simple_training_script")
     checkpoint_path = tmp_path / "final-grpo-model"
     reward_curve_path = tmp_path / "reward_curve.png"
-    reward_log_path = tmp_path / "reward_log.json"
+    trainer_reward_log_path = tmp_path / "reward_log.json"
+    episode_reward_log_path = tmp_path / "episode_reward_log.json"
     training_dashboard_path = tmp_path / "training_dashboard.png"
     manifest_path = tmp_path / "run_manifest.json"
 
     monkeypatch.setattr(
-        simple_script,
-        "run_training_session",
-        lambda args: {
-            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
-            "checkpoint_path": checkpoint_path,
-        },
-    )
-    monkeypatch.setattr(
-        simple_script,
+        liquidity_script,
         "save_training_dashboard",
         lambda trainer, *, output_dir: {
             "training_dashboard_path": str(training_dashboard_path),
             "reward_curve_path": str(reward_curve_path),
-            "reward_log_path": str(reward_log_path),
+            "reward_log_path": str(trainer_reward_log_path),
             "history_points": 3,
             "zero_variance_warning": False,
         },
     )
-    monkeypatch.setattr(simple_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
+    monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
     monkeypatch.setattr(
-        simple_script,
+        liquidity_script,
+        "run_canonical_training_session",
+        lambda args: {
+            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
+            "checkpoint_path": checkpoint_path,
+            "episode_reward_history": [
+                {
+                    "episode": 1,
+                    "training_reward": 0.25,
+                    "total_reward": 0.2,
+                    "verifiable_reward": 0.2,
+                    "base_rl_reward": 0.2,
+                    "success_no_default_positive_npv": True,
+                }
+            ],
+            "bridge_diagnostics": {
+                "bridge_miss_count": 0,
+                "prompt_env_fallback_count": 0,
+                "signature_match_count": 4,
+                "fifo_fallback_count": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(liquidity_script, "plot_rewards", lambda reward_log, output_path: Path(output_path))
+    monkeypatch.setattr(
+        liquidity_script,
         "save_run_manifest",
         lambda manifest, *, output_dir, filename="run_manifest.json": str(manifest_path),
     )
 
-    assert simple_main(["--profile", "tiny", "--output-dir", str(tmp_path), "--skip-smoke-test"]) == 0
+    assert liquidity_main(["--profile", "tiny", "--output-dir", str(tmp_path), "--skip-smoke-test"]) == 0
     captured = capsys.readouterr()
     payload = json.loads(captured.out)
 
     assert payload["training"]["checkpoint_path"] == str(checkpoint_path.resolve())
-    assert payload["training"]["reward_log_path"] == str(reward_log_path.resolve())
+    assert payload["training"]["reward_log_path"] == str(episode_reward_log_path.resolve())
+    assert payload["training"]["episode_reward_log_path"] == str(episode_reward_log_path.resolve())
+    assert payload["training"]["trainer_reward_log_path"] == str(trainer_reward_log_path.resolve())
+    assert payload["training"]["strict_accuracy_bridge_valid"] is True
     assert payload["manifest_path"] == str(manifest_path)
+
+
+def test_simple_script_run_training_fails_loudly_on_bridge_miss(monkeypatch) -> None:
+    import rl.train_grpo_liquidity as liquidity_script
+
+    tmp_path = _workspace_tmp_dir("simple_training_bridge_failure")
+    checkpoint_path = tmp_path / "final-grpo-model"
+
+    monkeypatch.setattr(liquidity_script, "_require_vllm_installed", lambda: None)
+    monkeypatch.setattr(
+        liquidity_script,
+        "run_canonical_training_session",
+        lambda args: {
+            "trainer": SimpleNamespace(state=SimpleNamespace(log_history=[])),
+            "checkpoint_path": checkpoint_path,
+            "episode_reward_history": [
+                {
+                    "episode": 1,
+                    "training_reward": -0.4,
+                    "total_reward": -0.47,
+                    "verifiable_reward": -0.47,
+                    "base_rl_reward": -0.47,
+                    "success_no_default_positive_npv": False,
+                }
+            ],
+            "bridge_diagnostics": {
+                "bridge_miss_count": 4,
+                "prompt_env_fallback_count": 4,
+                "signature_match_count": 0,
+                "fifo_fallback_count": 0,
+            },
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Strict bridge validation failed"):
+        liquidity_script.run_training(
+            liquidity_script.make_training_args(
+                profile="tiny",
+                output_dir=str(tmp_path),
+                skip_smoke_test=True,
+            )
+        )

@@ -103,14 +103,29 @@ def test_liquidity_notebook_uses_simple_package_driven_training_flow() -> None:
     source = _load_notebook_source("grpo_sme_liquidity.ipynb")
 
     assert 'RUN_PROFILE = "tiny"' in source
-    assert "from rl.train_grpo_simple import (" in source
+    assert "from rl.train_grpo_liquidity import (" in source
+    assert 'REPO_BRANCH = "round1_baseline"' in source
+    assert "ensure_liquidity_repo" in source
+    assert '"git", "clone", "--branch", REPO_BRANCH' in source
+    assert '"trl[vllm]==0.29.0"' in source
+    assert '"vllm>=0.11.0"' in source
+    assert "USE_VLLM = True" in source
+    assert "VLLM_GPU_MEMORY_UTILIZATION = 0.5" in source
+    assert "VLLM_MAX_MODEL_LENGTH = 2048" in source
     assert "make_training_args" in source
     assert "build_canonical_training_args" in source
     assert "build_run_plan" in source
+    assert "build_training_session" in source
     assert "smoke_test_environment" in source
-    assert "run_simple_training" in source
+    assert "run_training" in source
     assert "plot_rewards" in source
+    assert "Could not import rl.train_grpo_liquidity." in source
     assert "Smoke test passed. Environment is ready for training." in source
     assert 'outputs/grpo_sme_liquidity_simple' in source
+    assert "smoke-sized run and will produce a sparse reward curve" in source
+    assert "rollout_func path is only wired through the vLLM backend" in source
+    assert "Episode reward log path:" in source
+    assert 'training_artifacts.get("episode_reward_log_path", training_artifacts["reward_log_path"])' in source
+    assert "Trainer reward log path:" in source
     assert "Checkpoint path:" in source
 
