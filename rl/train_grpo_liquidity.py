@@ -38,7 +38,7 @@ _PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "max_steps": 4,
         "max_episode_steps": 8,
         "num_generations": 4,
-        "gradient_accumulation_steps": 2,
+        "gradient_accumulation_steps": 4,
         "learning_rate": 5e-6,
     },
     "small": {

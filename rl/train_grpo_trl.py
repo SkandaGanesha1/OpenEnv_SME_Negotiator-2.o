@@ -2455,6 +2455,7 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     gradient_accumulation_steps = int(getattr(args, "gradient_accumulation_steps", 4) or 4)
     num_generations = int(getattr(args, "num_generations", 4) or 4)
     generation_batch_size = getattr(args, "generation_batch_size", None)
+    implicit_generation_batch_size = per_device_train_batch_size * gradient_accumulation_steps
     learning_rate = float(getattr(args, "learning_rate", 5e-6) or 5e-6)
     temperature = float(getattr(args, "temperature", 1.0) or 1.0)
     top_p = float(getattr(args, "top_p", 1.0) or 1.0)
@@ -2479,6 +2480,15 @@ def build_grpo_config_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "report_to": _training_log_backend(),
         "use_vllm": bool(args.use_vllm),
     }
+    if generation_batch_size is None and implicit_generation_batch_size % num_generations != 0:
+        raise ValueError(
+            "TRL would infer an incompatible generation_batch_size from the current training batch settings: "
+            f"per_device_train_batch_size ({per_device_train_batch_size}) * gradient_accumulation_steps "
+            f"({gradient_accumulation_steps}) = {implicit_generation_batch_size}, which is not divisible by "
+            f"num_generations ({num_generations}). "
+            "Increase gradient_accumulation_steps, lower num_generations, or explicitly set "
+            "`generation_batch_size` to a divisible value."
+        )
     if generation_batch_size is not None:
         kwargs["generation_batch_size"] = int(generation_batch_size)
     kwargs.update(resolve_training_precision_kwargs())

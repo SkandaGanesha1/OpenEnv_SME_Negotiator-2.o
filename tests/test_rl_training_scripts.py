@@ -1121,6 +1121,23 @@ def test_liquidity_canonical_args_force_environment_backend() -> None:
     )
 
     assert canonical_args.runtime_backend == "environment"
+    assert canonical_args.gradient_accumulation_steps == 4
+
+
+def test_build_grpo_config_kwargs_rejects_invalid_implicit_generation_batch_size() -> None:
+    args = build_arg_parser().parse_args(
+        [
+            "--num-generations",
+            "4",
+            "--gradient-accumulation-steps",
+            "2",
+            "--per-device-train-batch-size",
+            "1",
+        ]
+    )
+
+    with pytest.raises(ValueError, match="incompatible generation_batch_size"):
+        build_grpo_config_kwargs(args)
 
 
 def test_patch_additional_chat_templates_404_returns_empty_template_list(monkeypatch) -> None:

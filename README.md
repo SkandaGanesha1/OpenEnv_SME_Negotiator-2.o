@@ -19,8 +19,8 @@ pinned: false
 
 | Resource | Link |
 |---|---|
-| HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/Omkarchaithanya/sme-negotiator) |
-| GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks/colab_grpo_sme_liquidity.ipynb) |
+| HF Space (live legacy environment) | [SME Negotiator Space](https://huggingface.co/spaces/skandaganesha24/OpenEnv_SME_Negotiator_2.o) |
+| GRPO Training Colab | [notebooks/colab_grpo_sme_liquidity.ipynb](notebooks\grpo_sme_liquidity.ipynb) |
 | Advanced GRPO notebook | [notebooks/grpo_sme_liquidity.ipynb](notebooks/grpo_sme_liquidity.ipynb) |
 | Submission training dashboard | [outputs/grpo_sme_liquidity_colab/training_dashboard.png](outputs/grpo_sme_liquidity_colab/training_dashboard.png) |
 | Submission policy comparison | [outputs/grpo_sme_liquidity_colab/policy_comparison.png](outputs/grpo_sme_liquidity_colab/policy_comparison.png) |
