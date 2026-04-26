@@ -16,7 +16,7 @@ COPY sme_negotiator_env ./sme_negotiator_env
 RUN uv sync --frozen --no-editable
 
 # Install Gradio for the interactive playground UI (not in pyproject.toml)
-RUN .venv/bin/pip install "gradio>=4.40.0"
+RUN uv pip install "gradio>=4.40.0"
 
 COPY app.py ./
 
