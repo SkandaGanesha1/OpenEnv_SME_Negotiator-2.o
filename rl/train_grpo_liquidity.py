@@ -377,6 +377,13 @@ def _require_vllm_installed() -> None:
     try:
         importlib.import_module("vllm")
     except Exception as exc:
+        error_text = str(exc)
+        if "numpy.dtype size changed" in error_text:
+            raise RuntimeError(
+                "The notebook runtime has a mixed NumPy / binary-extension state after package reinstall "
+                "(detected `numpy.dtype size changed`). Restart the runtime, rerun the install cell once, "
+                "and then continue from the configuration/import cells without rerunning training in the old kernel."
+            ) from exc
         raise RuntimeError(
             "This notebook-facing GRPO path requires the `vllm` package. Rerun the notebook install cell, which "
             "should install `trl[vllm]` and `vllm`, then restart the runtime before training again."
